@@ -118,7 +118,7 @@ class RDTTrainer:
         # 1. 인코더 Forward (문맥 파악)
         hidden, gate_pred = self.model(
             input_tokens,
-            pos_ids=pos_ids[:, 0, :], # Pos IDs는 고정이므로 첫번째 것 사용
+            pos_ids=pos_ids,
             attention_mask=attention_mask,
             is_first_step=True
         )
