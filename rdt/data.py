@@ -5,82 +5,88 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer
 import random
-from typing import List, Dict, Tuple
 import numpy as np
+from typing import List, Dict, Tuple
 
 
-class MaskingStrategy:
-    """Generate progressively masked sequences"""
+class ShuffleIndexMasking:
+    """Index-shuffling based masking strategy (memory efficient)"""
     
     def __init__(
         self,
         total_steps: int = 10,
-        mask_token_id: int = 103,  # [MASK] for BERT
-        strategy: str = 'linear'
+        mask_token_id: int = 103,
+        visible_loss_ratio: float = 0.15
     ):
         self.total_steps = total_steps
         self.mask_token_id = mask_token_id
-        self.strategy = strategy
+        self.visible_loss_ratio = visible_loss_ratio
     
-    def generate_masked_sequence(
+    def generate_shuffle_order(self, seq_len: int) -> np.ndarray:
+        """Generate random shuffle order for restoration"""
+        indices = np.arange(seq_len)
+        np.random.shuffle(indices)
+        return indices
+    
+    def create_step_data(
         self,
         tokens: torch.Tensor,
+        shuffle_order: np.ndarray,
         step: int
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Generate masked sequence for a given step
+        Create input and targets for a given step using index slicing
         
         Args:
-            tokens: (seq_len,) original token ids
-            step: current step (0 = original, total_steps = fully masked)
+            tokens: (seq_len,) original clean tokens
+            shuffle_order: (seq_len,) shuffled restoration order
+            step: current step (0 = clean, total_steps = fully masked)
         
         Returns:
-            masked_tokens: (seq_len,)
+            input_tokens: (seq_len,) with some positions masked
+            target_tokens: (seq_len,) targets
+            loss_mask: (seq_len,) bool mask indicating where to compute loss
         """
-        if step == 0:
-            return tokens.clone()
-        
-        # Calculate masking ratio
-        if self.strategy == 'linear':
-            mask_ratio = step / self.total_steps
-        else:
-            raise ValueError(f"Unknown strategy: {self.strategy}")
-        
-        # Random masking
         seq_len = len(tokens)
-        num_mask = int(seq_len * mask_ratio)
         
-        if num_mask == 0:
-            return tokens.clone()
+        # Calculate how many tokens to reveal at this step
+        # step 0 → all visible, step N → all masked
+        num_visible = int(seq_len * (1 - step / self.total_steps))
         
-        # Randomly select positions to mask
-        mask_positions = random.sample(range(seq_len), num_mask)
+        # Slice indices
+        visible_idx = shuffle_order[:num_visible]
+        masked_idx = shuffle_order[num_visible:]
         
-        masked_tokens = tokens.clone()
-        masked_tokens[mask_positions] = self.mask_token_id
+        # Create input (masked version)
+        input_tokens = tokens.clone()
+        input_tokens[masked_idx] = self.mask_token_id
         
-        return masked_tokens
-    
-    def generate_chain(self, tokens: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Generate full denoising chain: [a_0, a_1, ..., a_N]
+        # Create target (always original)
+        target_tokens = tokens.clone()
         
-        Args:
-            tokens: (seq_len,) original tokens
+        # Create loss mask
+        # - Always compute loss on newly revealed (delta)
+        # - Randomly sample from visible for stability
+        loss_mask = torch.zeros(seq_len, dtype=torch.bool)
         
-        Returns:
-            chain: list of masked sequences from step 0 to total_steps
-        """
-        chain = []
-        for step in range(self.total_steps + 1):
-            masked = self.generate_masked_sequence(tokens, step)
-            chain.append(masked)
+        # Mark masked positions for loss (delta region)
+        loss_mask[masked_idx] = True
         
-        return chain
+        # Additionally sample from visible
+        if num_visible > 0:
+            num_visible_loss = max(1, int(num_visible * self.visible_loss_ratio))
+            visible_loss_idx = np.random.choice(
+                visible_idx,
+                size=min(num_visible_loss, len(visible_idx)),
+                replace=False
+            )
+            loss_mask[visible_loss_idx] = True
+        
+        return input_tokens, target_tokens, loss_mask
 
 
 class WikiTextDataset(Dataset):
-    """WikiText dataset with progressive masking"""
+    """WikiText dataset with shuffle-index based progressive masking"""
     
     def __init__(
         self,
@@ -90,7 +96,7 @@ class WikiTextDataset(Dataset):
         max_seq_length: int = 512,
         total_steps: int = 10,
         max_chain_length: int = 5,
-        masking_strategy: str = 'linear'
+        visible_loss_ratio: float = 0.15
     ):
         self.split = split
         self.max_seq_length = max_seq_length
@@ -102,10 +108,10 @@ class WikiTextDataset(Dataset):
         self.mask_token_id = self.tokenizer.mask_token_id
         
         # Masking strategy
-        self.masking = MaskingStrategy(
+        self.masking = ShuffleIndexMasking(
             total_steps=total_steps,
             mask_token_id=self.mask_token_id,
-            strategy=masking_strategy
+            visible_loss_ratio=visible_loss_ratio
         )
         
         # Load dataset
@@ -151,54 +157,60 @@ class WikiTextDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get training sample with random chain segment
+        Get training sample with shuffle-index based masking
         
         Returns:
             {
-                'input': (seq_len,) - masked input at step i
-                'targets': (L, seq_len) - target sequences [a_{i-1}, ..., a_{i-L}]
+                'input': (L, seq_len) - masked inputs for L steps
+                'targets': (L, seq_len) - target tokens (always clean)
+                'loss_masks': (L, seq_len) - where to compute loss
                 'gate_targets': (L,) - normalized step indices
                 'chain_length': int
             }
         """
         tokens = self.tokenized_data[idx]
+        seq_len = len(tokens)
         
-        # Generate full chain
-        chain = self.masking.generate_chain(tokens)
+        # Generate shuffle order (restoration order)
+        shuffle_order = self.masking.generate_shuffle_order(seq_len)
         
-        # Random sampling: pick starting step i and length L
-        # i must be >= L so we can go backwards
+        # Random starting step
         max_start = self.total_steps
-        min_start = 1  # At least step 1
-        
-        if max_start < min_start:
-            max_start = min_start
-        
+        min_start = 1
         start_step = random.randint(min_start, max_start)
         
-        # Chain length: min(max_chain_length, start_step)
+        # Chain length
         chain_length = min(self.max_chain_length, start_step)
         
-        # Input: a_i (most masked)
-        input_tokens = chain[start_step]
-        
-        # Targets: [a_{i-1}, a_{i-2}, ..., a_{i-L}]
-        target_sequences = []
+        # Generate L consecutive steps
+        inputs = []
+        targets = []
+        loss_masks = []
         gate_targets = []
         
-        for k in range(1, chain_length + 1):
-            target_step = start_step - k
-            target_sequences.append(chain[target_step])
-            # Normalize gate target: remaining_steps / total_steps
-            gate_targets.append(target_step / self.total_steps)
+        for offset in range(chain_length):
+            step = start_step - offset
+            
+            # Create data for this step
+            input_tokens, target_tokens, loss_mask = self.masking.create_step_data(
+                tokens, shuffle_order, step
+            )
+            
+            inputs.append(input_tokens)
+            targets.append(target_tokens)
+            loss_masks.append(loss_mask)
+            gate_targets.append(step / self.total_steps)  # Normalized
         
         # Stack
-        targets = torch.stack(target_sequences)  # (L, seq_len)
+        inputs = torch.stack(inputs)  # (L, seq_len)
+        targets = torch.stack(targets)  # (L, seq_len)
+        loss_masks = torch.stack(loss_masks)  # (L, seq_len)
         gate_targets = torch.tensor(gate_targets, dtype=torch.float)  # (L,)
         
         return {
-            'input': input_tokens,
+            'input': inputs[0],  # First step input
             'targets': targets,
+            'loss_masks': loss_masks,
             'gate_targets': gate_targets,
             'chain_length': chain_length
         }
@@ -220,6 +232,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     # Initialize tensors
     inputs = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long)
     targets = torch.full((batch_size, max_chain_len, max_seq_len), pad_token_id, dtype=torch.long)
+    loss_masks = torch.zeros((batch_size, max_chain_len, max_seq_len), dtype=torch.bool)
     gate_targets = torch.zeros((batch_size, max_chain_len), dtype=torch.float)
     chain_lengths = torch.zeros(batch_size, dtype=torch.long)
     
@@ -229,12 +242,14 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         
         inputs[i, :seq_len] = item['input']
         targets[i, :chain_len, :seq_len] = item['targets']
+        loss_masks[i, :chain_len, :seq_len] = item['loss_masks']
         gate_targets[i, :chain_len] = item['gate_targets']
         chain_lengths[i] = chain_len
     
     return {
         'input': inputs,
         'targets': targets,
+        'loss_masks': loss_masks,
         'gate_targets': gate_targets,
         'chain_lengths': chain_lengths
     }
@@ -254,7 +269,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         max_seq_length=data_config['max_seq_length'],
         total_steps=training_config['total_steps'],
         max_chain_length=training_config['max_chain_length'],
-        masking_strategy=training_config['masking_strategy']
+        visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15)
     )
     
     # Validation dataset
@@ -265,7 +280,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         max_seq_length=data_config['max_seq_length'],
         total_steps=training_config['total_steps'],
         max_chain_length=training_config['max_chain_length'],
-        masking_strategy=training_config['masking_strategy']
+        visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15)
     )
     
     # Create dataloaders

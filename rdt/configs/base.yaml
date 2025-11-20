@@ -18,16 +18,17 @@ model:
 # Training Strategy
 training:
   # Chain & Masking
-  max_chain_length: 5 # L: length of training segment
+  max_chain_length: 10 # L: length of training segment
   total_steps: 10 # N: total denoising steps (100% → 0%)
-  masking_strategy: "linear" # Linear decay of mask ratio
+  masking_strategy: "shuffle" # 'shuffle' (index-based)
+  visible_loss_ratio: 0.15 # Visible 중에서도 loss 계산할 비율 (안정화)
 
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
   loss_weight_gate: 1.0 # Gate prediction loss weight
 
   # Optimization
-  batch_size: 2
+  batch_size: 1
   num_epochs: 10
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01

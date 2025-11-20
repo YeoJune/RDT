@@ -99,7 +99,7 @@ class RDTTrainer:
         Single training step with memory-efficient recursive forward pass
         
         Args:
-            batch: dictionary with 'input', 'targets', 'gate_targets', 'chain_lengths'
+            batch: dictionary with 'input', 'targets', 'loss_masks', 'gate_targets', 'chain_lengths'
         
         Returns:
             total_loss, recon_loss, gate_loss
@@ -109,6 +109,7 @@ class RDTTrainer:
         # Move to device
         input_tokens = batch['input'].to(self.device)  # (B, seq_len)
         targets = batch['targets'].to(self.device)  # (B, L, seq_len)
+        loss_masks = batch['loss_masks'].to(self.device)  # (B, L, seq_len)
         gate_targets = batch['gate_targets'].to(self.device)  # (B, L)
         chain_lengths = batch['chain_lengths']  # (B,)
         
@@ -131,14 +132,23 @@ class RDTTrainer:
             if valid_mask.sum() == 0:
                 break
             
-            # Get target for this step
+            # Get target and loss mask for this step
             step_targets = targets[:, step_idx, :]  # (B, seq_len)
+            step_loss_mask = loss_masks[:, step_idx, :]  # (B, seq_len)
             step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)  # (B, 1)
             
-            # Reconstruction loss
-            logits_flat = logits.reshape(-1, logits.size(-1))
-            targets_flat = step_targets.reshape(-1)
-            recon_loss = self.recon_criterion(logits_flat, targets_flat)
+            # Reconstruction loss (only on positions where loss_mask=True)
+            logits_flat = logits.reshape(-1, logits.size(-1))  # (B*seq_len, vocab_size)
+            targets_flat = step_targets.reshape(-1)  # (B*seq_len,)
+            loss_mask_flat = step_loss_mask.reshape(-1)  # (B*seq_len,)
+            
+            # Filter by loss mask
+            if loss_mask_flat.sum() > 0:
+                logits_masked = logits_flat[loss_mask_flat]
+                targets_masked = targets_flat[loss_mask_flat]
+                recon_loss = self.recon_criterion(logits_masked, targets_masked)
+            else:
+                recon_loss = torch.tensor(0.0, device=self.device)
             
             # Gate loss
             gate_pred_valid = gate_pred[valid_mask]
@@ -210,49 +220,56 @@ class RDTTrainer:
             for batch in tqdm(self.val_loader, desc="Validating", leave=False):
                 input_tokens = batch['input'].to(self.device)
                 targets = batch['targets'].to(self.device)
+                loss_masks = batch['loss_masks'].to(self.device)
                 gate_targets = batch['gate_targets'].to(self.device)
                 chain_lengths = batch['chain_lengths']
                 
                 actual_max_length = chain_lengths.max().item()
                 
-                # Forward
-                all_logits, all_gate_preds = self.model.recursive_forward(
-                    input_tokens,
-                    num_steps=actual_max_length
-                )
-                
-                # Compute losses (same as training)
+                # Forward (step by step for memory efficiency)
                 batch_recon_loss = 0
                 batch_gate_loss = 0
                 num_valid_steps = 0
                 
+                hidden, logits, gate_pred = self.model(input_tokens, is_first_step=True)
+                
                 for step_idx in range(actual_max_length):
-                    logits = all_logits[step_idx]
-                    gate_pred = all_gate_preds[step_idx]
-                    
                     valid_mask = chain_lengths > step_idx
                     if valid_mask.sum() == 0:
-                        continue
+                        break
                     
                     step_targets = targets[:, step_idx, :]
+                    step_loss_mask = loss_masks[:, step_idx, :]
                     step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
                     
+                    # Reconstruction loss (masked)
                     logits_flat = logits.reshape(-1, logits.size(-1))
                     targets_flat = step_targets.reshape(-1)
+                    loss_mask_flat = step_loss_mask.reshape(-1)
                     
-                    recon_loss = self.recon_criterion(logits_flat, targets_flat)
+                    if loss_mask_flat.sum() > 0:
+                        logits_masked = logits_flat[loss_mask_flat]
+                        targets_masked = targets_flat[loss_mask_flat]
+                        recon_loss = self.recon_criterion(logits_masked, targets_masked)
+                    else:
+                        recon_loss = torch.tensor(0.0, device=self.device)
                     
+                    # Gate loss
                     gate_pred_valid = gate_pred[valid_mask]
                     gate_target_valid = step_gate_targets[valid_mask]
                     
                     if len(gate_pred_valid) > 0:
                         gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid)
                     else:
-                        gate_loss = 0
+                        gate_loss = torch.tensor(0.0, device=self.device)
                     
-                    batch_recon_loss += recon_loss
-                    batch_gate_loss += gate_loss
+                    batch_recon_loss += recon_loss.item()
+                    batch_gate_loss += gate_loss.item()
                     num_valid_steps += 1
+                    
+                    # Next step
+                    if step_idx < actual_max_length - 1:
+                        hidden, logits, gate_pred = self.model(hidden, is_first_step=False)
                 
                 if num_valid_steps > 0:
                     avg_recon = batch_recon_loss / num_valid_steps
@@ -262,9 +279,9 @@ class RDTTrainer:
                         self.loss_weight_gate * avg_gate
                     )
                     
-                    total_loss += avg_total.item()
-                    total_recon_loss += avg_recon.item() if isinstance(avg_recon, torch.Tensor) else avg_recon
-                    total_gate_loss += avg_gate.item() if isinstance(avg_gate, torch.Tensor) else avg_gate
+                    total_loss += avg_total
+                    total_recon_loss += avg_recon
+                    total_gate_loss += avg_gate
                     num_batches += 1
         
         if num_batches == 0:
