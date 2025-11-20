@@ -6,7 +6,7 @@ A PyTorch implementation of Recursive Denoising Transformer for progressive text
 __version__ = "0.1.0"
 
 from .model import RDT, TransformerEncoder, LinearDecoder, TransformerDecoder, GateMLP
-from .data import WikiTextDataset, MaskingStrategy, create_dataloaders
+from .data import WikiTextDataset, ShuffleIndexMasking, create_dataloaders
 from .trainer import RDTTrainer
 from .utils import (
     load_config,
@@ -27,7 +27,7 @@ __all__ = [
     "GateMLP",
     # Data
     "WikiTextDataset",
-    "MaskingStrategy",
+    "ShuffleIndexMasking",
     "create_dataloaders",
     # Training
     "RDTTrainer",
