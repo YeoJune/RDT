@@ -65,7 +65,8 @@ def main():
         dropout=config['model']['dropout'],
         max_seq_len=config['data']['max_seq_length'],
         decoder_type=config['model']['decoder_type'],
-        gate_hidden_dim=config['model']['gate_hidden_dim']
+        gate_hidden_dim=config['model']['gate_hidden_dim'],
+        gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
     )
     
     # Create trainer
