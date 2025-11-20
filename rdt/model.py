@@ -86,8 +86,8 @@ class TransformerEncoder(nn.Module):
             from torch.utils.checkpoint import checkpoint
             
             def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    return module(*inputs)
+                def custom_forward(x_input, mask_input):
+                    return module(x_input, src_key_padding_mask=mask_input)
                 return custom_forward
             
             return checkpoint(
