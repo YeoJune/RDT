@@ -215,28 +215,33 @@ class RDTTrainer:
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validating", leave=False):
+                # 데이터 로드 (Train과 동일)
                 input_tokens = batch['input'].to(self.device)
                 targets = batch['targets'].to(self.device)
                 pos_ids = batch['pos_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
-                n_loss = batch['n_loss']
+                n_revealed = batch['n_revealed'].to(self.device)
+                n_delta = batch['n_delta'].to(self.device)
                 gate_targets = batch['gate_targets'].to(self.device)
                 chain_lengths = batch['chain_lengths']
                 
+                batch_size, seq_len = input_tokens.shape
                 actual_max_length = chain_lengths.max().item()
                 
-                # Forward (step by step for memory efficiency)
                 batch_recon_loss = 0
                 batch_gate_loss = 0
                 num_valid_steps = 0
                 
-                # First forward (with pos_ids and attention_mask)
+                # 1. 인코더 Forward
                 hidden, gate_pred = self.model(
                     input_tokens,
-                    pos_ids=pos_ids[:, 0, :],
+                    pos_ids=pos_ids, # (B, Seq) 그대로 전달
                     attention_mask=attention_mask,
                     is_first_step=True
                 )
+                
+                # Position Index 미리 생성
+                pos_range = torch.arange(seq_len, device=self.device).unsqueeze(0)
                 
                 for step_idx in range(actual_max_length):
                     valid_mask = chain_lengths > step_idx
@@ -244,71 +249,54 @@ class RDTTrainer:
                         break
                     
                     step_targets = targets[:, step_idx, :]
-                    step_n_loss = n_loss[:, step_idx]
-                    step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
+                    step_n_revealed = n_revealed[:, step_idx].unsqueeze(1)
+                    step_n_delta = n_delta[:, step_idx].unsqueeze(1)
                     
-                    max_n_loss = step_n_loss.max().item()
+                    # === Slicing & Projection 최적화 (Train과 동일) ===
+                    loss_mask = (pos_range >= step_n_revealed) & (pos_range < (step_n_revealed + step_n_delta))
                     
-                    # Reconstruction loss (sliced)
-                    if max_n_loss > 0:
+                    if loss_mask.sum() > 0:
                         if hasattr(self.model.decoder, 'decoder'):
-                            decoder_features = self.model.decoder.decoder(hidden)
-                            delta_features = decoder_features[:, :max_n_loss, :]
-                            delta_targets = step_targets[:, :max_n_loss]
+                            # Decoder Body (Full Context)
+                            decoder_features = self.model.decoder.decoder(
+                                hidden,
+                                src_key_padding_mask=(attention_mask == 0)
+                            )
                             
-                            delta_features_flat = delta_features.reshape(-1, delta_features.size(-1))
-                            delta_targets_flat = delta_targets.reshape(-1)
+                            # Selection (VRAM 절약)
+                            selected_features = decoder_features[loss_mask]
+                            selected_targets = step_targets[loss_mask]
                             
-                            valid_positions = torch.arange(max_n_loss, device=self.device).unsqueeze(0) < step_n_loss.unsqueeze(1).to(self.device)
-                            valid_positions_flat = valid_positions.reshape(-1)
+                            # Projection
+                            logits_active = self.model.decoder.projection(selected_features)
                             
-                            if valid_positions_flat.sum() > 0:
-                                delta_features_valid = delta_features_flat[valid_positions_flat]
-                                delta_targets_valid = delta_targets_flat[valid_positions_flat]
-                                
-                                logits_valid = self.model.decoder.projection(delta_features_valid)
-                                recon_loss = self.recon_criterion(logits_valid, delta_targets_valid)
-                            else:
-                                recon_loss = torch.tensor(0.0, device=self.device)
+                            recon_loss = self.recon_criterion(logits_active, selected_targets)
                         else:
-                            delta_hidden = hidden[:, :max_n_loss, :]
-                            delta_targets = step_targets[:, :max_n_loss]
-                            
-                            delta_hidden_flat = delta_hidden.reshape(-1, delta_hidden.size(-1))
-                            delta_targets_flat = delta_targets.reshape(-1)
-                            
-                            valid_positions = torch.arange(max_n_loss, device=self.device).unsqueeze(0) < step_n_loss.unsqueeze(1).to(self.device)
-                            valid_positions_flat = valid_positions.reshape(-1)
-                            
-                            if valid_positions_flat.sum() > 0:
-                                delta_hidden_valid = delta_hidden_flat[valid_positions_flat]
-                                delta_targets_valid = delta_targets_flat[valid_positions_flat]
-                                
-                                logits_valid = self.model.decoder(delta_hidden_valid)
-                                recon_loss = self.recon_criterion(logits_valid, delta_targets_valid)
-                            else:
-                                recon_loss = torch.tensor(0.0, device=self.device)
+                            # Linear Decoder Case
+                            selected_hidden = hidden[loss_mask]
+                            selected_targets = step_targets[loss_mask]
+                            logits_active = self.model.decoder(selected_hidden)
+                            recon_loss = self.recon_criterion(logits_active, selected_targets)
                     else:
                         recon_loss = torch.tensor(0.0, device=self.device)
                     
-                    # Gate loss
+                    # === Gate Loss ===
+                    step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
                     gate_pred_valid = gate_pred[valid_mask]
                     gate_target_valid = step_gate_targets[valid_mask]
                     
-                    if len(gate_pred_valid) > 0:
-                        gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid)
-                    else:
-                        gate_loss = torch.tensor(0.0, device=self.device)
+                    gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.device)
                     
                     batch_recon_loss += recon_loss.item()
                     batch_gate_loss += gate_loss.item()
                     num_valid_steps += 1
                     
-                    # Next step
+                    # Next Step (Recursive)
                     if step_idx < actual_max_length - 1:
                         hidden = self.model.encoder(hidden, mask=(attention_mask == 0))
                         gate_pred = self.model.gate(hidden)
                 
+                # 배치 통계 집계
                 if num_valid_steps > 0:
                     avg_recon = batch_recon_loss / num_valid_steps
                     avg_gate = batch_gate_loss / num_valid_steps
