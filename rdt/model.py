@@ -46,7 +46,7 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    """Shared Transformer Encoder (Recursive Core)"""
+    """Shared Transformer Encoder (Recursive Core) with gradient checkpointing support"""
     
     def __init__(
         self,
@@ -70,6 +70,8 @@ class TransformerEncoder(nn.Module):
             encoder_layer,
             num_layers=n_layers
         )
+        
+        self.gradient_checkpointing = False
     
     def forward(self, x, mask=None):
         """
@@ -79,7 +81,23 @@ class TransformerEncoder(nn.Module):
         Returns:
             (batch_size, seq_len, d_model)
         """
-        return self.encoder(x, src_key_padding_mask=mask)
+        if self.gradient_checkpointing and self.training:
+            # Use gradient checkpointing
+            from torch.utils.checkpoint import checkpoint
+            
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+            
+            return checkpoint(
+                create_custom_forward(self.encoder),
+                x,
+                mask,
+                use_reentrant=False
+            )
+        else:
+            return self.encoder(x, src_key_padding_mask=mask)
 
 
 class LinearDecoder(nn.Module):
@@ -100,7 +118,7 @@ class LinearDecoder(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    """Lightweight Transformer Decoder (1-layer)"""
+    """Lightweight Transformer Decoder (1-layer) with gradient checkpointing support"""
     
     def __init__(
         self,
@@ -127,6 +145,7 @@ class TransformerDecoder(nn.Module):
         )
         
         self.projection = nn.Linear(d_model, vocab_size)
+        self.gradient_checkpointing = False
     
     def forward(self, x):
         """
@@ -135,7 +154,22 @@ class TransformerDecoder(nn.Module):
         Returns:
             (batch_size, seq_len, vocab_size)
         """
-        x = self.decoder(x)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+            
+            x = checkpoint(
+                create_custom_forward(self.decoder),
+                x,
+                use_reentrant=False
+            )
+        else:
+            x = self.decoder(x)
+        
         return self.projection(x)
 
 
@@ -179,12 +213,14 @@ class RDT(nn.Module):
         dropout: float = 0.1,
         max_seq_len: int = 512,
         decoder_type: str = 'linear',  # 'linear' or 'transformer'
-        gate_hidden_dim: int = 256
+        gate_hidden_dim: int = 256,
+        gradient_checkpointing: bool = False
     ):
         super().__init__()
         
         self.d_model = d_model
         self.decoder_type = decoder_type
+        self.gradient_checkpointing = gradient_checkpointing
         
         # Embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -216,6 +252,13 @@ class RDT(nn.Module):
         self.gate = GateMLP(d_model, gate_hidden_dim)
         
         self._init_weights()
+        
+        # Enable gradient checkpointing if requested
+        if gradient_checkpointing:
+            print("Gradient checkpointing enabled")
+            self.encoder.gradient_checkpointing = True
+            if hasattr(self.decoder, 'gradient_checkpointing'):
+                self.decoder.gradient_checkpointing = True
     
     def _init_weights(self):
         """Initialize weights"""

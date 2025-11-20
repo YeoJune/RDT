@@ -15,6 +15,9 @@ model:
   # Decoder type: 'transformer' or 'linear'
   decoder_type: "transformer" # Extreme case: just projection
 
+  # Memory optimization
+  gradient_checkpointing: false # Enable gradient checkpointing to save memory
+
 # Training Strategy
 training:
   # Chain & Masking
@@ -29,7 +32,7 @@ training:
 
   # Optimization
   batch_size: 4
-  num_epochs: 10
+  num_epochs: 5
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.1 # 10% of total steps
