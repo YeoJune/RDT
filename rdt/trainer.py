@@ -110,6 +110,7 @@ class RDTTrainer:
         input_tokens = batch['input'].to(self.device)  # (B, seq_len)
         targets = batch['targets'].to(self.device)  # (B, L, seq_len)
         pos_ids = batch['pos_ids'].to(self.device)  # (B, L, seq_len)
+        attention_mask = batch['attention_mask'].to(self.device)  # (B, seq_len)
         n_loss = batch['n_loss']  # (B, L) - CPU is fine
         gate_targets = batch['gate_targets'].to(self.device)  # (B, L)
         chain_lengths = batch['chain_lengths']  # (B,)
@@ -124,10 +125,11 @@ class RDTTrainer:
         
         accumulated_loss = 0
         
-        # First forward pass (with pos_ids for reordered input)
+        # First forward pass (with pos_ids and attention_mask for reordered input)
         hidden, gate_pred = self.model(
             input_tokens,
             pos_ids=pos_ids[:, 0, :],  # First step pos_ids
+            attention_mask=attention_mask,
             is_first_step=True
         )
         
@@ -218,7 +220,7 @@ class RDTTrainer:
             
             # Next step (reuse hidden state)
             if step_idx < actual_max_length - 1:
-                hidden = self.model.encoder(hidden)
+                hidden = self.model.encoder(hidden, mask=(attention_mask == 0))
                 gate_pred = self.model.gate(hidden)
         
         # Average loss
@@ -264,6 +266,7 @@ class RDTTrainer:
                 input_tokens = batch['input'].to(self.device)
                 targets = batch['targets'].to(self.device)
                 pos_ids = batch['pos_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
                 n_loss = batch['n_loss']
                 gate_targets = batch['gate_targets'].to(self.device)
                 chain_lengths = batch['chain_lengths']
@@ -275,10 +278,11 @@ class RDTTrainer:
                 batch_gate_loss = 0
                 num_valid_steps = 0
                 
-                # First forward (with pos_ids)
+                # First forward (with pos_ids and attention_mask)
                 hidden, gate_pred = self.model(
                     input_tokens,
                     pos_ids=pos_ids[:, 0, :],
+                    attention_mask=attention_mask,
                     is_first_step=True
                 )
                 
@@ -350,7 +354,7 @@ class RDTTrainer:
                     
                     # Next step
                     if step_idx < actual_max_length - 1:
-                        hidden = self.model.encoder(hidden)
+                        hidden = self.model.encoder(hidden, mask=(attention_mask == 0))
                         gate_pred = self.model.gate(hidden)
                 
                 if num_valid_steps > 0:

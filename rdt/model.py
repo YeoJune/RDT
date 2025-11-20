@@ -75,11 +75,11 @@ class TransformerEncoder(nn.Module):
         """
         Args:
             x: (batch_size, seq_len, d_model)
-            mask: attention mask
+            mask: (batch_size, seq_len) - True for positions to IGNORE (padding)
         Returns:
             (batch_size, seq_len, d_model)
         """
-        return self.encoder(x, mask=mask)
+        return self.encoder(x, src_key_padding_mask=mask)
 
 
 class LinearDecoder(nn.Module):
@@ -223,13 +223,14 @@ class RDT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
     
-    def forward(self, x, pos_ids=None, is_first_step: bool = True):
+    def forward(self, x, pos_ids=None, attention_mask=None, is_first_step: bool = True):
         """
         Single step forward pass
         
         Args:
             x: (batch_size, seq_len) if is_first_step else (batch_size, seq_len, d_model)
             pos_ids: (batch_size, seq_len) - explicit position IDs for training
+            attention_mask: (batch_size, seq_len) - 1 for valid tokens, 0 for padding
             is_first_step: whether this is the first step (needs embedding)
         
         Returns:
@@ -250,8 +251,14 @@ class RDT(nn.Module):
                 x = self.pos_encoding(x=x)
         # Otherwise x is already hidden state from previous step
         
+        # Create attention mask for Transformer
+        # PyTorch Transformer expects: True for positions to IGNORE
+        src_key_padding_mask = None
+        if attention_mask is not None:
+            src_key_padding_mask = (attention_mask == 0)  # True for padding
+        
         # Encode
-        hidden = self.encoder(x)
+        hidden = self.encoder(x, mask=src_key_padding_mask)
         
         # Gate
         gate_pred = self.gate(hidden)

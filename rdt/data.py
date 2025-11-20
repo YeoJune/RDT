@@ -240,7 +240,7 @@ class WikiTextDataset(Dataset):
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
-    Collate function for DataLoader with padding
+    Collate function for DataLoader with padding and attention mask
     """
     # Find max sequence length and max chain length in batch
     max_seq_len = max(item['input'].size(0) for item in batch)
@@ -255,6 +255,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     inputs = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long)
     targets = torch.full((batch_size, max_chain_len, max_seq_len), pad_token_id, dtype=torch.long)
     pos_ids = torch.zeros((batch_size, max_chain_len, max_seq_len), dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.long)  # 0 for padding
     n_loss = torch.zeros((batch_size, max_chain_len), dtype=torch.long)
     gate_targets = torch.zeros((batch_size, max_chain_len), dtype=torch.float)
     chain_lengths = torch.zeros(batch_size, dtype=torch.long)
@@ -266,6 +267,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         inputs[i, :seq_len] = item['input']
         targets[i, :chain_len, :seq_len] = item['targets']
         pos_ids[i, :chain_len, :seq_len] = item['pos_ids']
+        attention_mask[i, :seq_len] = 1  # Valid tokens
         n_loss[i, :chain_len] = item['n_loss']
         gate_targets[i, :chain_len] = item['gate_targets']
         chain_lengths[i] = chain_len
@@ -274,6 +276,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'input': inputs,
         'targets': targets,
         'pos_ids': pos_ids,
+        'attention_mask': attention_mask,
         'n_loss': n_loss,
         'gate_targets': gate_targets,
         'chain_lengths': chain_lengths
