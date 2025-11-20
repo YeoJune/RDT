@@ -13,7 +13,7 @@ model:
   gate_hidden_dim: 256 # Gate MLP hidden size
 
   # Decoder type: 'transformer' or 'linear'
-  decoder_type: "linear" # Extreme case: just projection
+  decoder_type: "transformer" # Extreme case: just projection
 
 # Training Strategy
 training:
@@ -28,7 +28,7 @@ training:
   loss_weight_gate: 1.0 # Gate prediction loss weight
 
   # Optimization
-  batch_size: 1
+  batch_size: 4
   num_epochs: 10
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01

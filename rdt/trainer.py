@@ -141,15 +141,28 @@ class RDTTrainer:
             
             # Reconstruction loss (only compute logits where loss_mask=True)
             if step_loss_mask.sum() > 0:
-                # Extract hidden states only where we need loss
-                hidden_flat = hidden.reshape(-1, hidden.size(-1))  # (B*seq_len, d_model)
-                targets_flat = step_targets.reshape(-1)  # (B*seq_len,)
-                loss_mask_flat = step_loss_mask.reshape(-1)  # (B*seq_len,)
-                
-                # Only project where needed
-                hidden_masked = hidden_flat[loss_mask_flat]  # (N, d_model) where N = num True
-                logits_masked = self.model.decoder(hidden_masked)  # (N, vocab_size)
-                targets_masked = targets_flat[loss_mask_flat]  # (N,)
+                # For Transformer Decoder: need full sequence for attention
+                if hasattr(self.model.decoder, 'decoder'):
+                    # Transformer Decoder: run full attention, then project masked positions
+                    decoder_features = self.model.decoder.decoder(hidden)  # (B, seq_len, d_model)
+                    
+                    features_flat = decoder_features.reshape(-1, decoder_features.size(-1))  # (B*seq_len, d_model)
+                    targets_flat = step_targets.reshape(-1)  # (B*seq_len,)
+                    loss_mask_flat = step_loss_mask.reshape(-1)  # (B*seq_len,)
+                    
+                    # Only project where needed
+                    features_masked = features_flat[loss_mask_flat]  # (N, d_model)
+                    logits_masked = self.model.decoder.projection(features_masked)  # (N, vocab_size)
+                    targets_masked = targets_flat[loss_mask_flat]  # (N,)
+                else:
+                    # Linear Decoder: can directly slice
+                    hidden_flat = hidden.reshape(-1, hidden.size(-1))  # (B*seq_len, d_model)
+                    targets_flat = step_targets.reshape(-1)  # (B*seq_len,)
+                    loss_mask_flat = step_loss_mask.reshape(-1)  # (B*seq_len,)
+                    
+                    hidden_masked = hidden_flat[loss_mask_flat]  # (N, d_model)
+                    logits_masked = self.model.decoder(hidden_masked)  # (N, vocab_size)
+                    targets_masked = targets_flat[loss_mask_flat]  # (N,)
                 
                 recon_loss = self.recon_criterion(logits_masked, targets_masked)
             else:
@@ -250,13 +263,27 @@ class RDTTrainer:
                     
                     # Reconstruction loss (masked projection)
                     if step_loss_mask.sum() > 0:
-                        hidden_flat = hidden.reshape(-1, hidden.size(-1))
-                        targets_flat = step_targets.reshape(-1)
-                        loss_mask_flat = step_loss_mask.reshape(-1)
-                        
-                        hidden_masked = hidden_flat[loss_mask_flat]
-                        logits_masked = self.model.decoder(hidden_masked)
-                        targets_masked = targets_flat[loss_mask_flat]
+                        # For Transformer Decoder: need full sequence for attention
+                        if hasattr(self.model.decoder, 'decoder'):
+                            # Transformer Decoder: run full attention, then project masked positions
+                            decoder_features = self.model.decoder.decoder(hidden)  # (B, seq_len, d_model)
+                            
+                            features_flat = decoder_features.reshape(-1, decoder_features.size(-1))
+                            targets_flat = step_targets.reshape(-1)
+                            loss_mask_flat = step_loss_mask.reshape(-1)
+                            
+                            features_masked = features_flat[loss_mask_flat]
+                            logits_masked = self.model.decoder.projection(features_masked)
+                            targets_masked = targets_flat[loss_mask_flat]
+                        else:
+                            # Linear Decoder: can directly slice
+                            hidden_flat = hidden.reshape(-1, hidden.size(-1))
+                            targets_flat = step_targets.reshape(-1)
+                            loss_mask_flat = step_loss_mask.reshape(-1)
+                            
+                            hidden_masked = hidden_flat[loss_mask_flat]
+                            logits_masked = self.model.decoder(hidden_masked)
+                            targets_masked = targets_flat[loss_mask_flat]
                         
                         recon_loss = self.recon_criterion(logits_masked, targets_masked)
                     else:
