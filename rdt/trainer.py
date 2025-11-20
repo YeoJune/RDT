@@ -95,173 +95,114 @@ class RDTTrainer:
         return scheduler
     
     def train_step(self, batch: Dict) -> Tuple[float, float, float]:
-        """
-        Single training step with memory-aligned slicing
-        
-        Args:
-            batch: dictionary with 'input', 'targets', 'pos_ids', 'n_revealed', 'n_delta', 'gate_targets', 'chain_lengths'
-        
-        Returns:
-            total_loss, recon_loss, gate_loss
-        """
         self.model.train()
         
-        # Move to device
-        input_tokens = batch['input'].to(self.device)  # (B, seq_len)
-        targets = batch['targets'].to(self.device)  # (B, L, seq_len)
-        pos_ids = batch['pos_ids'].to(self.device)  # (B, L, seq_len)
-        attention_mask = batch['attention_mask'].to(self.device)  # (B, seq_len)
-        n_revealed = batch['n_revealed']  # (B, L) - CPU is fine
-        n_delta = batch['n_delta']  # (B, L) - CPU is fine
-        gate_targets = batch['gate_targets'].to(self.device)  # (B, L)
-        chain_lengths = batch['chain_lengths']  # (B,)
+        # 데이터 로드
+        input_tokens = batch['input'].to(self.device)
+        targets = batch['targets'].to(self.device)
+        pos_ids = batch['pos_ids'].to(self.device)
+        attention_mask = batch['attention_mask'].to(self.device)
+        n_revealed = batch['n_revealed'].to(self.device) # GPU로 이동
+        n_delta = batch['n_delta'].to(self.device)       # GPU로 이동
+        gate_targets = batch['gate_targets'].to(self.device)
+        chain_lengths = batch['chain_lengths']
         
-        batch_size = input_tokens.size(0)
+        batch_size, seq_len = input_tokens.shape
         actual_max_length = chain_lengths.max().item()
         
-        # Accumulate loss step by step (memory efficient)
-        total_recon_loss = 0.0
-        total_gate_loss = 0.0
+        accumulated_loss = 0
+        total_recon_loss = 0
+        total_gate_loss = 0
         num_valid_steps = 0
         
-        accumulated_loss = 0
-        
-        # First forward pass (with pos_ids and attention_mask for reordered input)
+        # 1. 인코더 Forward (문맥 파악)
         hidden, gate_pred = self.model(
             input_tokens,
-            pos_ids=pos_ids[:, 0, :],  # First step pos_ids
+            pos_ids=pos_ids[:, 0, :], # Pos IDs는 고정이므로 첫번째 것 사용
             attention_mask=attention_mask,
             is_first_step=True
         )
         
+        # Position Index 미리 생성 (마스킹용)
+        # (1, seq_len) 형태: [[0, 1, 2, ...]]
+        pos_range = torch.arange(seq_len, device=self.device).unsqueeze(0)
+        
         for step_idx in range(actual_max_length):
-            # Check which samples need this step
             valid_mask = chain_lengths > step_idx
-            if valid_mask.sum() == 0:
-                break
+            if valid_mask.sum() == 0: break
             
-            # Get target for this step
-            step_targets = targets[:, step_idx, :]  # (B, seq_len)
-            step_n_revealed = n_revealed[:, step_idx]  # (B,)
-            step_n_delta = n_delta[:, step_idx]  # (B,)
-            step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)  # (B, 1)
+            step_targets = targets[:, step_idx, :]      # (B, Seq)
+            step_n_revealed = n_revealed[:, step_idx].unsqueeze(1) # (B, 1)
+            step_n_delta = n_delta[:, step_idx].unsqueeze(1)       # (B, 1)
             
-            # Calculate loss region: from n_revealed to seq_len (delta region)
-            # We'll compute loss on the masked region starting from n_revealed
-            max_n_revealed = step_n_revealed.max().item()
-            seq_len = step_targets.size(1)
+            # === [핵심] Slicing & Projection 최적화 ===
             
-            # Reconstruction loss (slice-based, memory-aligned!)
-            # Loss region: [n_revealed, seq_len] for each sample
-            if max_n_revealed < seq_len:
-                # For Transformer Decoder: need full sequence for attention
+            # 1. 이번에 계산해야 할 토큰 위치 찾기 (Boolean Mask)
+            # 조건: n_revealed <= 위치 < n_revealed + n_delta
+            # 배치마다 구간이 달라도 정확하게 필요한 곳만 True가 됨
+            loss_mask = (pos_range >= step_n_revealed) & (pos_range < (step_n_revealed + step_n_delta))
+            
+            if loss_mask.sum() > 0:
+                # 2. Transformer Decoder Body 실행 (전체 문맥 유지)
                 if hasattr(self.model.decoder, 'decoder'):
-                    # Transformer Decoder: run full attention
-                    decoder_features = self.model.decoder.decoder(hidden)  # (B, seq_len, d_model)
+                    # (B, Seq, D_model) -> 아직 Vocab으로 확장 안 됨 (메모리 안전)
+                    decoder_features = self.model.decoder.decoder(
+                        hidden, 
+                        src_key_padding_mask=(attention_mask == 0)
+                    )
                     
-                    # Slice delta region (from max_n_revealed to end)
-                    delta_features = decoder_features[:, max_n_revealed:, :]  # (B, delta_len, d_model)
-                    delta_targets = step_targets[:, max_n_revealed:]  # (B, delta_len)
+                    # 3. 필요한 토큰만 쏙 뽑아내기 (Selection)
+                    # (N_total_delta, D_model) 형태로 평탄화됨
+                    selected_features = decoder_features[loss_mask]
+                    selected_targets = step_targets[loss_mask]
                     
-                    # Flatten
-                    delta_features_flat = delta_features.reshape(-1, delta_features.size(-1))  # (B*delta_len, d_model)
-                    delta_targets_flat = delta_targets.reshape(-1)  # (B*delta_len,)
+                    # 4. 뽑아낸 것만 단어로 변환 (Projection)
+                    # 여기서 메모리 절약 효과 발생! (512개 다 하는 게 아니라 50개 정도만 함)
+                    logits_active = self.model.decoder.projection(selected_features)
                     
-                    # Create mask for valid samples (where this position is actually in delta region)
-                    delta_len = seq_len - max_n_revealed
-                    valid_positions = torch.arange(delta_len, device=self.device).unsqueeze(0) + max_n_revealed < seq_len  # (B, delta_len)
-                    # More precise: check if position >= n_revealed for each sample
-                    position_indices = torch.arange(max_n_revealed, seq_len, device=self.device).unsqueeze(0)  # (1, delta_len)
-                    valid_positions = position_indices >= step_n_revealed.unsqueeze(1).to(self.device)  # (B, delta_len)
-                    valid_positions_flat = valid_positions.reshape(-1)  # (B*delta_len,)
-                    
-                    if valid_positions_flat.sum() > 0:
-                        delta_features_valid = delta_features_flat[valid_positions_flat]
-                        delta_targets_valid = delta_targets_flat[valid_positions_flat]
-                        
-                        # Project only valid positions
-                        logits_valid = self.model.decoder.projection(delta_features_valid)
-                        recon_loss = self.recon_criterion(logits_valid, delta_targets_valid)
-                    else:
-                        recon_loss = torch.tensor(0.0, device=self.device)
+                    recon_loss = self.recon_criterion(logits_active, selected_targets)
                 else:
-                    # Linear Decoder: can directly slice and project
-                    delta_hidden = hidden[:, max_n_revealed:, :]  # (B, delta_len, d_model)
-                    delta_targets = step_targets[:, max_n_revealed:]  # (B, delta_len)
-                    
-                    delta_hidden_flat = delta_hidden.reshape(-1, delta_hidden.size(-1))
-                    delta_targets_flat = delta_targets.reshape(-1)
-                    
-                    delta_len = seq_len - max_n_revealed
-                    position_indices = torch.arange(max_n_revealed, seq_len, device=self.device).unsqueeze(0)
-                    valid_positions = position_indices >= step_n_revealed.unsqueeze(1).to(self.device)
-                    valid_positions_flat = valid_positions.reshape(-1)
-                    
-                    if valid_positions_flat.sum() > 0:
-                        delta_hidden_valid = delta_hidden_flat[valid_positions_flat]
-                        delta_targets_valid = delta_targets_flat[valid_positions_flat]
-                        
-                        logits_valid = self.model.decoder(delta_hidden_valid)
-                        recon_loss = self.recon_criterion(logits_valid, delta_targets_valid)
-                    else:
-                        recon_loss = torch.tensor(0.0, device=self.device)
+                    # Linear Decoder인 경우
+                    selected_hidden = hidden[loss_mask]
+                    selected_targets = step_targets[loss_mask]
+                    logits_active = self.model.decoder(selected_hidden)
+                    recon_loss = self.recon_criterion(logits_active, selected_targets)
             else:
                 recon_loss = torch.tensor(0.0, device=self.device)
             
-            # Gate loss
+            # === Gate Loss ===
+            step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
             gate_pred_valid = gate_pred[valid_mask]
             gate_target_valid = step_gate_targets[valid_mask]
             
-            if len(gate_pred_valid) > 0:
-                gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid)
-            else:
-                gate_loss = torch.tensor(0.0, device=self.device)
+            gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.device)
             
-            # Step loss
-            step_loss = (
-                self.loss_weight_recon * recon_loss +
-                self.loss_weight_gate * gate_loss
-            )
+            # Step Loss 합산
+            step_loss = self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss
             accumulated_loss = accumulated_loss + step_loss
             
-            # Accumulate for logging (detached)
             total_recon_loss += recon_loss.item()
             total_gate_loss += gate_loss.item()
             num_valid_steps += 1
             
-            # Next step (reuse hidden state)
+            # 다음 스텝 준비 (Recursive)
             if step_idx < actual_max_length - 1:
                 hidden = self.model.encoder(hidden, mask=(attention_mask == 0))
                 gate_pred = self.model.gate(hidden)
         
-        # Average loss
-        if num_valid_steps > 0:
-            final_loss = accumulated_loss / num_valid_steps
-            avg_recon_loss = total_recon_loss / num_valid_steps
-            avg_gate_loss = total_gate_loss / num_valid_steps
-        else:
-            final_loss = accumulated_loss
-            avg_recon_loss = 0.0
-            avg_gate_loss = 0.0
+        # 최종 Loss
+        final_loss = accumulated_loss / max(1, num_valid_steps)
         
-        # Backward
+        # Backward & Update (Accumulation 없이 매번 실행)
         self.optimizer.zero_grad()
-        if isinstance(final_loss, torch.Tensor):
-            final_loss.backward()
+        final_loss.backward()
         
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-        
-        # Update
         self.optimizer.step()
         if self.scheduler:
             self.scheduler.step()
         
-        return (
-            final_loss.item() if isinstance(final_loss, torch.Tensor) else 0.0,
-            avg_recon_loss,
-            avg_gate_loss
-        )
+        return final_loss.item(), total_recon_loss / max(1, num_valid_steps), total_gate_loss / max(1, num_valid_steps)
     
     def validate(self) -> Tuple[float, float, float]:
         """Validation loop with memory-aligned slicing"""
