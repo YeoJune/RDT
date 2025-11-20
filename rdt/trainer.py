@@ -96,7 +96,7 @@ class RDTTrainer:
     
     def train_step(self, batch: Dict) -> Tuple[float, float, float]:
         """
-        Single training step with recursive forward pass
+        Single training step with memory-efficient recursive forward pass
         
         Args:
             batch: dictionary with 'input', 'targets', 'gate_targets', 'chain_lengths'
@@ -113,46 +113,34 @@ class RDTTrainer:
         chain_lengths = batch['chain_lengths']  # (B,)
         
         batch_size = input_tokens.size(0)
-        max_chain_length = targets.size(1)
-        
-        # Get max chain length in this batch
         actual_max_length = chain_lengths.max().item()
         
-        # Forward pass: recursive steps
-        all_logits, all_gate_preds = self.model.recursive_forward(
-            input_tokens,
-            num_steps=actual_max_length
-        )
-        
-        # Compute losses
-        total_recon_loss = 0
-        total_gate_loss = 0
+        # Accumulate loss step by step (memory efficient)
+        total_recon_loss = 0.0
+        total_gate_loss = 0.0
         num_valid_steps = 0
         
-        # Accumulate losses for backward
-        loss_to_backward = 0
+        accumulated_loss = 0
+        
+        # First forward pass
+        hidden, logits, gate_pred = self.model(input_tokens, is_first_step=True)
         
         for step_idx in range(actual_max_length):
-            logits = all_logits[step_idx]  # (B, seq_len, vocab_size)
-            gate_pred = all_gate_preds[step_idx]  # (B, 1)
-            
-            # Create mask for samples that have this step
-            valid_mask = chain_lengths > step_idx  # (B,)
-            
+            # Check which samples need this step
+            valid_mask = chain_lengths > step_idx
             if valid_mask.sum() == 0:
-                continue
+                break
             
-            # Get targets for this step
+            # Get target for this step
             step_targets = targets[:, step_idx, :]  # (B, seq_len)
             step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)  # (B, 1)
             
-            # Reconstruction loss (only for valid samples)
-            logits_flat = logits.reshape(-1, logits.size(-1))  # (B*seq_len, vocab_size)
-            targets_flat = step_targets.reshape(-1)  # (B*seq_len,)
-            
+            # Reconstruction loss
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            targets_flat = step_targets.reshape(-1)
             recon_loss = self.recon_criterion(logits_flat, targets_flat)
             
-            # Gate loss (only for valid samples)
+            # Gate loss
             gate_pred_valid = gate_pred[valid_mask]
             gate_target_valid = step_gate_targets[valid_mask]
             
@@ -161,26 +149,39 @@ class RDTTrainer:
             else:
                 gate_loss = torch.tensor(0.0, device=self.device)
             
+            # Step loss
+            step_loss = (
+                self.loss_weight_recon * recon_loss +
+                self.loss_weight_gate * gate_loss
+            )
+            accumulated_loss = accumulated_loss + step_loss
+            
             # Accumulate for logging (detached)
             total_recon_loss += recon_loss.item()
-            total_gate_loss += gate_loss.item() if isinstance(gate_loss, torch.Tensor) else gate_loss
+            total_gate_loss += gate_loss.item()
             num_valid_steps += 1
             
-            # Accumulate for backward (keep graph)
-            step_loss = self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss
-            loss_to_backward = loss_to_backward + step_loss
+            # Next step (reuse hidden state, don't store all logits)
+            if step_idx < actual_max_length - 1:
+                hidden, logits, gate_pred = self.model(hidden, is_first_step=False)
+            else:
+                # Clear to save memory
+                del logits, gate_pred
         
-        # Average losses for logging
-        avg_recon_loss = total_recon_loss / num_valid_steps if num_valid_steps > 0 else 0
-        avg_gate_loss = total_gate_loss / num_valid_steps if num_valid_steps > 0 else 0
-        
-        # Total loss for backward (already accumulated)
-        total_loss = loss_to_backward / num_valid_steps if num_valid_steps > 0 else loss_to_backward
+        # Average loss
+        if num_valid_steps > 0:
+            final_loss = accumulated_loss / num_valid_steps
+            avg_recon_loss = total_recon_loss / num_valid_steps
+            avg_gate_loss = total_gate_loss / num_valid_steps
+        else:
+            final_loss = accumulated_loss
+            avg_recon_loss = 0.0
+            avg_gate_loss = 0.0
         
         # Backward
         self.optimizer.zero_grad()
-        if isinstance(total_loss, torch.Tensor):
-            total_loss.backward()
+        if isinstance(final_loss, torch.Tensor):
+            final_loss.backward()
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -191,7 +192,7 @@ class RDTTrainer:
             self.scheduler.step()
         
         return (
-            total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss,
+            final_loss.item() if isinstance(final_loss, torch.Tensor) else 0.0,
             avg_recon_loss,
             avg_gate_loss
         )
