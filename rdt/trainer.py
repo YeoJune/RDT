@@ -99,7 +99,7 @@ class RDTTrainer:
         Single training step with memory-aligned slicing
         
         Args:
-            batch: dictionary with 'input', 'targets', 'pos_ids', 'n_loss', 'gate_targets', 'chain_lengths'
+            batch: dictionary with 'input', 'targets', 'pos_ids', 'n_revealed', 'n_delta', 'gate_targets', 'chain_lengths'
         
         Returns:
             total_loss, recon_loss, gate_loss
@@ -111,7 +111,8 @@ class RDTTrainer:
         targets = batch['targets'].to(self.device)  # (B, L, seq_len)
         pos_ids = batch['pos_ids'].to(self.device)  # (B, L, seq_len)
         attention_mask = batch['attention_mask'].to(self.device)  # (B, seq_len)
-        n_loss = batch['n_loss']  # (B, L) - CPU is fine
+        n_revealed = batch['n_revealed']  # (B, L) - CPU is fine
+        n_delta = batch['n_delta']  # (B, L) - CPU is fine
         gate_targets = batch['gate_targets'].to(self.device)  # (B, L)
         chain_lengths = batch['chain_lengths']  # (B,)
         
@@ -139,32 +140,40 @@ class RDTTrainer:
             if valid_mask.sum() == 0:
                 break
             
-            # Get target and n_loss for this step
+            # Get target for this step
             step_targets = targets[:, step_idx, :]  # (B, seq_len)
-            step_n_loss = n_loss[:, step_idx]  # (B,)
+            step_n_revealed = n_revealed[:, step_idx]  # (B,)
+            step_n_delta = n_delta[:, step_idx]  # (B,)
             step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)  # (B, 1)
             
-            # Get max n_loss in this step
-            max_n_loss = step_n_loss.max().item()
+            # Calculate loss region: from n_revealed to seq_len (delta region)
+            # We'll compute loss on the masked region starting from n_revealed
+            max_n_revealed = step_n_revealed.max().item()
+            seq_len = step_targets.size(1)
             
             # Reconstruction loss (slice-based, memory-aligned!)
-            if max_n_loss > 0:
+            # Loss region: [n_revealed, seq_len] for each sample
+            if max_n_revealed < seq_len:
                 # For Transformer Decoder: need full sequence for attention
                 if hasattr(self.model.decoder, 'decoder'):
                     # Transformer Decoder: run full attention
                     decoder_features = self.model.decoder.decoder(hidden)  # (B, seq_len, d_model)
                     
-                    # Slice delta region (memory-aligned!)
-                    delta_features = decoder_features[:, :max_n_loss, :]  # (B, n_delta, d_model)
-                    delta_targets = step_targets[:, :max_n_loss]  # (B, n_delta)
+                    # Slice delta region (from max_n_revealed to end)
+                    delta_features = decoder_features[:, max_n_revealed:, :]  # (B, delta_len, d_model)
+                    delta_targets = step_targets[:, max_n_revealed:]  # (B, delta_len)
                     
-                    # Flatten and filter valid samples
-                    delta_features_flat = delta_features.reshape(-1, delta_features.size(-1))  # (B*n_delta, d_model)
-                    delta_targets_flat = delta_targets.reshape(-1)  # (B*n_delta,)
+                    # Flatten
+                    delta_features_flat = delta_features.reshape(-1, delta_features.size(-1))  # (B*delta_len, d_model)
+                    delta_targets_flat = delta_targets.reshape(-1)  # (B*delta_len,)
                     
-                    # Create mask for valid samples (where n_loss > position)
-                    valid_positions = torch.arange(max_n_loss, device=self.device).unsqueeze(0) < step_n_loss.unsqueeze(1).to(self.device)  # (B, n_delta)
-                    valid_positions_flat = valid_positions.reshape(-1)  # (B*n_delta,)
+                    # Create mask for valid samples (where this position is actually in delta region)
+                    delta_len = seq_len - max_n_revealed
+                    valid_positions = torch.arange(delta_len, device=self.device).unsqueeze(0) + max_n_revealed < seq_len  # (B, delta_len)
+                    # More precise: check if position >= n_revealed for each sample
+                    position_indices = torch.arange(max_n_revealed, seq_len, device=self.device).unsqueeze(0)  # (1, delta_len)
+                    valid_positions = position_indices >= step_n_revealed.unsqueeze(1).to(self.device)  # (B, delta_len)
+                    valid_positions_flat = valid_positions.reshape(-1)  # (B*delta_len,)
                     
                     if valid_positions_flat.sum() > 0:
                         delta_features_valid = delta_features_flat[valid_positions_flat]
@@ -177,13 +186,15 @@ class RDTTrainer:
                         recon_loss = torch.tensor(0.0, device=self.device)
                 else:
                     # Linear Decoder: can directly slice and project
-                    delta_hidden = hidden[:, :max_n_loss, :]  # (B, n_delta, d_model)
-                    delta_targets = step_targets[:, :max_n_loss]  # (B, n_delta)
+                    delta_hidden = hidden[:, max_n_revealed:, :]  # (B, delta_len, d_model)
+                    delta_targets = step_targets[:, max_n_revealed:]  # (B, delta_len)
                     
                     delta_hidden_flat = delta_hidden.reshape(-1, delta_hidden.size(-1))
                     delta_targets_flat = delta_targets.reshape(-1)
                     
-                    valid_positions = torch.arange(max_n_loss, device=self.device).unsqueeze(0) < step_n_loss.unsqueeze(1).to(self.device)
+                    delta_len = seq_len - max_n_revealed
+                    position_indices = torch.arange(max_n_revealed, seq_len, device=self.device).unsqueeze(0)
+                    valid_positions = position_indices >= step_n_revealed.unsqueeze(1).to(self.device)
                     valid_positions_flat = valid_positions.reshape(-1)
                     
                     if valid_positions_flat.sum() > 0:

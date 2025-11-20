@@ -190,6 +190,7 @@ class WikiTextDataset(Dataset):
         # Generate L consecutive steps (SAME physical order, different masks)
         inputs = []
         targets = []
+        pos_ids_list = []
         n_revealed_list = []
         n_delta_list = []
         gate_targets = []
@@ -197,23 +198,25 @@ class WikiTextDataset(Dataset):
         for offset in range(chain_length):
             step = start_step - offset
             
-            # Create data for this step (FIXED physical order)
-            input_tokens, target_tokens, pos_ids, n_revealed, n_delta = self.masking.create_step_data(
+            # Create data for this step (reordered)
+            input_tokens, target_tokens, pos_ids_step, n_revealed_step, n_delta_step = self.masking.create_step_data(
                 tokens, shuffle_order, step
             )
             
             inputs.append(input_tokens)
             targets.append(target_tokens)
-            n_revealed_list.append(n_revealed)
-            n_delta_list.append(n_delta)
-            gate_targets.append(step / self.total_steps)  # Normalized
+            pos_ids_list.append(pos_ids_step)
+            n_revealed_list.append(n_revealed_step)
+            n_delta_list.append(n_delta_step)
+            gate_targets.append(step / self.total_steps)
         
         # Stack
-        inputs = torch.stack(inputs)  # (L, seq_len)
-        targets = torch.stack(targets)  # (L, seq_len)
-        n_revealed = torch.tensor(n_revealed_list, dtype=torch.long)  # (L,)
-        n_delta = torch.tensor(n_delta_list, dtype=torch.long)  # (L,)
-        gate_targets = torch.tensor(gate_targets, dtype=torch.float)  # (L,)
+        inputs = torch.stack(inputs)
+        targets = torch.stack(targets)
+        pos_ids = torch.stack(pos_ids_list)
+        n_revealed = torch.tensor(n_revealed_list, dtype=torch.long)
+        n_delta = torch.tensor(n_delta_list, dtype=torch.long)
+        gate_targets = torch.tensor(gate_targets, dtype=torch.float)
         
         return {
             'input': inputs[0],  # First step input
