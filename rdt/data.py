@@ -33,73 +33,59 @@ class ShuffleIndexMasking:
         tokens: torch.Tensor,
         shuffle_order: np.ndarray,
         step: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
         """
-        Create input and targets for a given step with Delta-first reordering
+        Create input and targets for a given step with FIXED permutation
         
         Args:
             tokens: (seq_len,) original clean tokens
-            shuffle_order: (seq_len,) shuffled restoration order
+            shuffle_order: (seq_len,) shuffled restoration order (FIXED for all steps)
             step: current step (0 = clean, total_steps = fully masked)
         
         Returns:
-            input_tokens: (seq_len,) reordered [Delta | Context | Masked]
-            target_tokens: (seq_len,) reordered targets
+            input_tokens: (seq_len,) reordered once, with masking
+            target_tokens: (seq_len,) reordered once (clean)
             pos_ids: (seq_len,) original position indices for PE
-            n_delta: int, number of delta tokens
+            n_revealed: int, number of already revealed tokens
+            n_delta: int, number of delta tokens (newly revealing)
         """
         seq_len = len(tokens)
         
-        # Calculate how many tokens to reveal at this step
+        # Reorder tokens ONCE by shuffle_order (FIXED physical order)
+        tokens_reordered = tokens[shuffle_order]
+        pos_ids = torch.from_numpy(shuffle_order).long()
+        
+        # Calculate how many tokens are revealed at this step
+        # step 0 → all visible, step N → all masked
+        # Restoration order: shuffle_order[0] reveals first, shuffle_order[-1] reveals last
         num_visible = int(seq_len * (1 - step / self.total_steps))
         
-        # Slice indices
-        visible_idx = shuffle_order[:num_visible]
-        masked_idx = shuffle_order[num_visible:]
+        # Already revealed: shuffle_order[:num_visible]
+        # Still masked: shuffle_order[num_visible:]
         
-        # Determine delta and context
-        # Delta: newly revealed tokens (will compute loss)
-        # Context: already visible tokens (sample for loss)
+        # Create input with masking (physical order is FIXED)
+        input_tokens = tokens_reordered.clone()
+        input_tokens[num_visible:] = self.mask_token_id  # Mask unrevealed positions
+        
+        # Target is always clean (physical order is FIXED)
+        target_tokens = tokens_reordered
+        
+        # Calculate loss region
+        # Delta: newly revealed tokens
+        # Context: sample from already revealed tokens for stability
         if num_visible > 0:
-            num_context_loss = max(1, int(num_visible * self.visible_loss_ratio))
-            context_loss_idx = np.random.choice(
-                visible_idx,
-                size=min(num_context_loss, len(visible_idx)),
-                replace=False
-            )
-            # Delta is masked region (for this step's perspective)
-            delta_idx = masked_idx
-            context_idx = visible_idx
+            n_context_loss = max(1, int(num_visible * self.visible_loss_ratio))
+            n_delta = seq_len - num_visible  # All masked positions
+            n_revealed = num_visible
         else:
-            # All masked
-            delta_idx = masked_idx
-            context_idx = np.array([], dtype=np.int64)
-            context_loss_idx = np.array([], dtype=np.int64)
+            n_context_loss = 0
+            n_delta = seq_len
+            n_revealed = 0
         
-        n_delta = len(delta_idx)
-        n_context_loss = len(context_loss_idx)
+        # Total loss region: delta + sampled context
+        n_loss = n_delta + n_context_loss
         
-        # Reorder: [Delta | Context_loss | Context_no_loss | Pad]
-        # For simplicity: [Delta_and_Context_loss | Other]
-        loss_idx = np.concatenate([delta_idx, context_loss_idx]) if n_context_loss > 0 else delta_idx
-        no_loss_idx = np.setdiff1d(context_idx, context_loss_idx)
-        
-        reorder_idx = np.concatenate([loss_idx, no_loss_idx])
-        
-        # Reorder tokens
-        input_tokens = tokens.clone()
-        input_tokens[masked_idx] = self.mask_token_id
-        input_tokens_reordered = input_tokens[reorder_idx]
-        
-        target_tokens_reordered = tokens[reorder_idx]
-        
-        # Position IDs (original positions for PE)
-        pos_ids = torch.from_numpy(reorder_idx).long()
-        
-        # Loss region length
-        n_loss = len(loss_idx)
-        
-        return input_tokens_reordered, target_tokens_reordered, pos_ids, n_loss
+        return input_tokens, target_tokens, pos_ids, n_revealed, n_delta
 
 
 class WikiTextDataset(Dataset):
@@ -174,14 +160,15 @@ class WikiTextDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get training sample with shuffle-index based masking and Delta-first reordering
+        Get training sample with fixed permutation and sliding window loss
         
         Returns:
             {
-                'input': (L, seq_len) - reordered masked inputs
-                'targets': (L, seq_len) - reordered targets
-                'pos_ids': (L, seq_len) - position IDs for PE
-                'n_loss': (L,) - number of loss positions per step
+                'input': (L, seq_len) - fixed order, varying masks
+                'targets': (L, seq_len) - fixed order targets
+                'pos_ids': (seq_len,) - position IDs (same for all steps)
+                'n_revealed': (L,) - number of already revealed tokens per step
+                'n_delta': (L,) - number of delta tokens per step
                 'gate_targets': (L,) - normalized step indices
                 'chain_length': int
             }
@@ -189,7 +176,7 @@ class WikiTextDataset(Dataset):
         tokens = self.tokenized_data[idx]
         seq_len = len(tokens)
         
-        # Generate shuffle order (restoration order)
+        # Generate shuffle order (restoration order) - FIXED for all steps
         shuffle_order = self.masking.generate_shuffle_order(seq_len)
         
         # Random starting step
@@ -200,39 +187,40 @@ class WikiTextDataset(Dataset):
         # Chain length
         chain_length = min(self.max_chain_length, start_step)
         
-        # Generate L consecutive steps
+        # Generate L consecutive steps (SAME physical order, different masks)
         inputs = []
         targets = []
-        pos_ids_list = []
-        n_loss_list = []
+        n_revealed_list = []
+        n_delta_list = []
         gate_targets = []
         
         for offset in range(chain_length):
             step = start_step - offset
             
-            # Create data for this step (reordered)
-            input_tokens, target_tokens, pos_ids, n_loss = self.masking.create_step_data(
+            # Create data for this step (FIXED physical order)
+            input_tokens, target_tokens, pos_ids, n_revealed, n_delta = self.masking.create_step_data(
                 tokens, shuffle_order, step
             )
             
             inputs.append(input_tokens)
             targets.append(target_tokens)
-            pos_ids_list.append(pos_ids)
-            n_loss_list.append(n_loss)
+            n_revealed_list.append(n_revealed)
+            n_delta_list.append(n_delta)
             gate_targets.append(step / self.total_steps)  # Normalized
         
         # Stack
         inputs = torch.stack(inputs)  # (L, seq_len)
         targets = torch.stack(targets)  # (L, seq_len)
-        pos_ids = torch.stack(pos_ids_list)  # (L, seq_len)
-        n_loss = torch.tensor(n_loss_list, dtype=torch.long)  # (L,)
+        n_revealed = torch.tensor(n_revealed_list, dtype=torch.long)  # (L,)
+        n_delta = torch.tensor(n_delta_list, dtype=torch.long)  # (L,)
         gate_targets = torch.tensor(gate_targets, dtype=torch.float)  # (L,)
         
         return {
             'input': inputs[0],  # First step input
             'targets': targets,
-            'pos_ids': pos_ids,
-            'n_loss': n_loss,
+            'pos_ids': pos_ids,  # Same for all steps!
+            'n_revealed': n_revealed,
+            'n_delta': n_delta,
             'gate_targets': gate_targets,
             'chain_length': chain_length
         }
@@ -254,9 +242,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     # Initialize tensors
     inputs = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long)
     targets = torch.full((batch_size, max_chain_len, max_seq_len), pad_token_id, dtype=torch.long)
-    pos_ids = torch.zeros((batch_size, max_chain_len, max_seq_len), dtype=torch.long)
+    pos_ids = torch.zeros((batch_size, max_seq_len), dtype=torch.long)  # Same for all steps!
     attention_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.long)  # 0 for padding
-    n_loss = torch.zeros((batch_size, max_chain_len), dtype=torch.long)
+    n_revealed = torch.zeros((batch_size, max_chain_len), dtype=torch.long)
+    n_delta = torch.zeros((batch_size, max_chain_len), dtype=torch.long)
     gate_targets = torch.zeros((batch_size, max_chain_len), dtype=torch.float)
     chain_lengths = torch.zeros(batch_size, dtype=torch.long)
     
@@ -266,18 +255,20 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         
         inputs[i, :seq_len] = item['input']
         targets[i, :chain_len, :seq_len] = item['targets']
-        pos_ids[i, :chain_len, :seq_len] = item['pos_ids']
+        pos_ids[i, :seq_len] = item['pos_ids']  # Same for all steps!
         attention_mask[i, :seq_len] = 1  # Valid tokens
-        n_loss[i, :chain_len] = item['n_loss']
+        n_revealed[i, :chain_len] = item['n_revealed']
+        n_delta[i, :chain_len] = item['n_delta']
         gate_targets[i, :chain_len] = item['gate_targets']
         chain_lengths[i] = chain_len
     
     return {
         'input': inputs,
         'targets': targets,
-        'pos_ids': pos_ids,
+        'pos_ids': pos_ids,  # (B, seq_len) - same for all steps!
         'attention_mask': attention_mask,
-        'n_loss': n_loss,
+        'n_revealed': n_revealed,
+        'n_delta': n_delta,
         'gate_targets': gate_targets,
         'chain_lengths': chain_lengths
     }
