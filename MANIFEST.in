@@ -1,0 +1,17 @@
+include README.md
+include USAGE_GUIDE.md
+include LICENSE
+include requirements.txt
+include pyproject.toml
+
+recursive-include rdt/configs *.yaml
+recursive-include configs *.yaml
+
+exclude test_model.py
+exclude .gitignore
+exclude .git
+
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store

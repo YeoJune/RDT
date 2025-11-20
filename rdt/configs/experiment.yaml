@@ -1,0 +1,14 @@
+# Experiment Configuration (Override base.yaml)
+
+# Quick experiment with larger model
+model:
+  d_model: 768
+  n_heads: 12
+  n_encoder_layers: 12
+
+training:
+  batch_size: 16
+  learning_rate: 0.0005
+
+data:
+  dataset_name: 'wikitext-103'
