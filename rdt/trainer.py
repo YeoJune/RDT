@@ -96,10 +96,10 @@ class RDTTrainer:
     
     def train_step(self, batch: Dict) -> Tuple[float, float, float]:
         """
-        Single training step with memory-efficient recursive forward pass
+        Single training step with memory-aligned slicing
         
         Args:
-            batch: dictionary with 'input', 'targets', 'loss_masks', 'gate_targets', 'chain_lengths'
+            batch: dictionary with 'input', 'targets', 'pos_ids', 'n_loss', 'gate_targets', 'chain_lengths'
         
         Returns:
             total_loss, recon_loss, gate_loss
@@ -109,7 +109,8 @@ class RDTTrainer:
         # Move to device
         input_tokens = batch['input'].to(self.device)  # (B, seq_len)
         targets = batch['targets'].to(self.device)  # (B, L, seq_len)
-        loss_masks = batch['loss_masks'].to(self.device)  # (B, L, seq_len)
+        pos_ids = batch['pos_ids'].to(self.device)  # (B, L, seq_len)
+        n_loss = batch['n_loss']  # (B, L) - CPU is fine
         gate_targets = batch['gate_targets'].to(self.device)  # (B, L)
         chain_lengths = batch['chain_lengths']  # (B,)
         
@@ -123,10 +124,12 @@ class RDTTrainer:
         
         accumulated_loss = 0
         
-        # First forward pass (only hidden, no logits yet)
-        hidden = self.model.token_embedding(input_tokens) * (self.model.d_model ** 0.5)
-        hidden = self.model.pos_encoding(hidden)
-        hidden = self.model.encoder(hidden)
+        # First forward pass (with pos_ids for reordered input)
+        hidden, gate_pred = self.model(
+            input_tokens,
+            pos_ids=pos_ids[:, 0, :],  # First step pos_ids
+            is_first_step=True
+        )
         
         for step_idx in range(actual_max_length):
             # Check which samples need this step
@@ -134,42 +137,65 @@ class RDTTrainer:
             if valid_mask.sum() == 0:
                 break
             
-            # Get target and loss mask for this step
+            # Get target and n_loss for this step
             step_targets = targets[:, step_idx, :]  # (B, seq_len)
-            step_loss_mask = loss_masks[:, step_idx, :]  # (B, seq_len)
+            step_n_loss = n_loss[:, step_idx]  # (B,)
             step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)  # (B, 1)
             
-            # Reconstruction loss (only compute logits where loss_mask=True)
-            if step_loss_mask.sum() > 0:
+            # Get max n_loss in this step
+            max_n_loss = step_n_loss.max().item()
+            
+            # Reconstruction loss (slice-based, memory-aligned!)
+            if max_n_loss > 0:
                 # For Transformer Decoder: need full sequence for attention
                 if hasattr(self.model.decoder, 'decoder'):
-                    # Transformer Decoder: run full attention, then project masked positions
+                    # Transformer Decoder: run full attention
                     decoder_features = self.model.decoder.decoder(hidden)  # (B, seq_len, d_model)
                     
-                    features_flat = decoder_features.reshape(-1, decoder_features.size(-1))  # (B*seq_len, d_model)
-                    targets_flat = step_targets.reshape(-1)  # (B*seq_len,)
-                    loss_mask_flat = step_loss_mask.reshape(-1)  # (B*seq_len,)
+                    # Slice delta region (memory-aligned!)
+                    delta_features = decoder_features[:, :max_n_loss, :]  # (B, n_delta, d_model)
+                    delta_targets = step_targets[:, :max_n_loss]  # (B, n_delta)
                     
-                    # Only project where needed
-                    features_masked = features_flat[loss_mask_flat]  # (N, d_model)
-                    logits_masked = self.model.decoder.projection(features_masked)  # (N, vocab_size)
-                    targets_masked = targets_flat[loss_mask_flat]  # (N,)
+                    # Flatten and filter valid samples
+                    delta_features_flat = delta_features.reshape(-1, delta_features.size(-1))  # (B*n_delta, d_model)
+                    delta_targets_flat = delta_targets.reshape(-1)  # (B*n_delta,)
+                    
+                    # Create mask for valid samples (where n_loss > position)
+                    valid_positions = torch.arange(max_n_loss, device=self.device).unsqueeze(0) < step_n_loss.unsqueeze(1).to(self.device)  # (B, n_delta)
+                    valid_positions_flat = valid_positions.reshape(-1)  # (B*n_delta,)
+                    
+                    if valid_positions_flat.sum() > 0:
+                        delta_features_valid = delta_features_flat[valid_positions_flat]
+                        delta_targets_valid = delta_targets_flat[valid_positions_flat]
+                        
+                        # Project only valid positions
+                        logits_valid = self.model.decoder.projection(delta_features_valid)
+                        recon_loss = self.recon_criterion(logits_valid, delta_targets_valid)
+                    else:
+                        recon_loss = torch.tensor(0.0, device=self.device)
                 else:
-                    # Linear Decoder: can directly slice
-                    hidden_flat = hidden.reshape(-1, hidden.size(-1))  # (B*seq_len, d_model)
-                    targets_flat = step_targets.reshape(-1)  # (B*seq_len,)
-                    loss_mask_flat = step_loss_mask.reshape(-1)  # (B*seq_len,)
+                    # Linear Decoder: can directly slice and project
+                    delta_hidden = hidden[:, :max_n_loss, :]  # (B, n_delta, d_model)
+                    delta_targets = step_targets[:, :max_n_loss]  # (B, n_delta)
                     
-                    hidden_masked = hidden_flat[loss_mask_flat]  # (N, d_model)
-                    logits_masked = self.model.decoder(hidden_masked)  # (N, vocab_size)
-                    targets_masked = targets_flat[loss_mask_flat]  # (N,)
-                
-                recon_loss = self.recon_criterion(logits_masked, targets_masked)
+                    delta_hidden_flat = delta_hidden.reshape(-1, delta_hidden.size(-1))
+                    delta_targets_flat = delta_targets.reshape(-1)
+                    
+                    valid_positions = torch.arange(max_n_loss, device=self.device).unsqueeze(0) < step_n_loss.unsqueeze(1).to(self.device)
+                    valid_positions_flat = valid_positions.reshape(-1)
+                    
+                    if valid_positions_flat.sum() > 0:
+                        delta_hidden_valid = delta_hidden_flat[valid_positions_flat]
+                        delta_targets_valid = delta_targets_flat[valid_positions_flat]
+                        
+                        logits_valid = self.model.decoder(delta_hidden_valid)
+                        recon_loss = self.recon_criterion(logits_valid, delta_targets_valid)
+                    else:
+                        recon_loss = torch.tensor(0.0, device=self.device)
             else:
                 recon_loss = torch.tensor(0.0, device=self.device)
             
             # Gate loss
-            gate_pred = self.model.gate(hidden)  # (B, 1)
             gate_pred_valid = gate_pred[valid_mask]
             gate_target_valid = step_gate_targets[valid_mask]
             
@@ -193,6 +219,7 @@ class RDTTrainer:
             # Next step (reuse hidden state)
             if step_idx < actual_max_length - 1:
                 hidden = self.model.encoder(hidden)
+                gate_pred = self.model.gate(hidden)
         
         # Average loss
         if num_valid_steps > 0:
@@ -224,7 +251,7 @@ class RDTTrainer:
         )
     
     def validate(self) -> Tuple[float, float, float]:
-        """Validation loop"""
+        """Validation loop with memory-aligned slicing"""
         self.model.eval()
         
         total_loss = 0
@@ -236,7 +263,8 @@ class RDTTrainer:
             for batch in tqdm(self.val_loader, desc="Validating", leave=False):
                 input_tokens = batch['input'].to(self.device)
                 targets = batch['targets'].to(self.device)
-                loss_masks = batch['loss_masks'].to(self.device)
+                pos_ids = batch['pos_ids'].to(self.device)
+                n_loss = batch['n_loss']
                 gate_targets = batch['gate_targets'].to(self.device)
                 chain_lengths = batch['chain_lengths']
                 
@@ -247,10 +275,12 @@ class RDTTrainer:
                 batch_gate_loss = 0
                 num_valid_steps = 0
                 
-                # First forward (only hidden)
-                hidden = self.model.token_embedding(input_tokens) * (self.model.d_model ** 0.5)
-                hidden = self.model.pos_encoding(hidden)
-                hidden = self.model.encoder(hidden)
+                # First forward (with pos_ids)
+                hidden, gate_pred = self.model(
+                    input_tokens,
+                    pos_ids=pos_ids[:, 0, :],
+                    is_first_step=True
+                )
                 
                 for step_idx in range(actual_max_length):
                     valid_mask = chain_lengths > step_idx
@@ -258,39 +288,54 @@ class RDTTrainer:
                         break
                     
                     step_targets = targets[:, step_idx, :]
-                    step_loss_mask = loss_masks[:, step_idx, :]
+                    step_n_loss = n_loss[:, step_idx]
                     step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
                     
-                    # Reconstruction loss (masked projection)
-                    if step_loss_mask.sum() > 0:
-                        # For Transformer Decoder: need full sequence for attention
+                    max_n_loss = step_n_loss.max().item()
+                    
+                    # Reconstruction loss (sliced)
+                    if max_n_loss > 0:
                         if hasattr(self.model.decoder, 'decoder'):
-                            # Transformer Decoder: run full attention, then project masked positions
-                            decoder_features = self.model.decoder.decoder(hidden)  # (B, seq_len, d_model)
+                            decoder_features = self.model.decoder.decoder(hidden)
+                            delta_features = decoder_features[:, :max_n_loss, :]
+                            delta_targets = step_targets[:, :max_n_loss]
                             
-                            features_flat = decoder_features.reshape(-1, decoder_features.size(-1))
-                            targets_flat = step_targets.reshape(-1)
-                            loss_mask_flat = step_loss_mask.reshape(-1)
+                            delta_features_flat = delta_features.reshape(-1, delta_features.size(-1))
+                            delta_targets_flat = delta_targets.reshape(-1)
                             
-                            features_masked = features_flat[loss_mask_flat]
-                            logits_masked = self.model.decoder.projection(features_masked)
-                            targets_masked = targets_flat[loss_mask_flat]
+                            valid_positions = torch.arange(max_n_loss, device=self.device).unsqueeze(0) < step_n_loss.unsqueeze(1).to(self.device)
+                            valid_positions_flat = valid_positions.reshape(-1)
+                            
+                            if valid_positions_flat.sum() > 0:
+                                delta_features_valid = delta_features_flat[valid_positions_flat]
+                                delta_targets_valid = delta_targets_flat[valid_positions_flat]
+                                
+                                logits_valid = self.model.decoder.projection(delta_features_valid)
+                                recon_loss = self.recon_criterion(logits_valid, delta_targets_valid)
+                            else:
+                                recon_loss = torch.tensor(0.0, device=self.device)
                         else:
-                            # Linear Decoder: can directly slice
-                            hidden_flat = hidden.reshape(-1, hidden.size(-1))
-                            targets_flat = step_targets.reshape(-1)
-                            loss_mask_flat = step_loss_mask.reshape(-1)
+                            delta_hidden = hidden[:, :max_n_loss, :]
+                            delta_targets = step_targets[:, :max_n_loss]
                             
-                            hidden_masked = hidden_flat[loss_mask_flat]
-                            logits_masked = self.model.decoder(hidden_masked)
-                            targets_masked = targets_flat[loss_mask_flat]
-                        
-                        recon_loss = self.recon_criterion(logits_masked, targets_masked)
+                            delta_hidden_flat = delta_hidden.reshape(-1, delta_hidden.size(-1))
+                            delta_targets_flat = delta_targets.reshape(-1)
+                            
+                            valid_positions = torch.arange(max_n_loss, device=self.device).unsqueeze(0) < step_n_loss.unsqueeze(1).to(self.device)
+                            valid_positions_flat = valid_positions.reshape(-1)
+                            
+                            if valid_positions_flat.sum() > 0:
+                                delta_hidden_valid = delta_hidden_flat[valid_positions_flat]
+                                delta_targets_valid = delta_targets_flat[valid_positions_flat]
+                                
+                                logits_valid = self.model.decoder(delta_hidden_valid)
+                                recon_loss = self.recon_criterion(logits_valid, delta_targets_valid)
+                            else:
+                                recon_loss = torch.tensor(0.0, device=self.device)
                     else:
                         recon_loss = torch.tensor(0.0, device=self.device)
                     
                     # Gate loss
-                    gate_pred = self.model.gate(hidden)
                     gate_pred_valid = gate_pred[valid_mask]
                     gate_target_valid = step_gate_targets[valid_mask]
                     
@@ -306,6 +351,7 @@ class RDTTrainer:
                     # Next step
                     if step_idx < actual_max_length - 1:
                         hidden = self.model.encoder(hidden)
+                        gate_pred = self.model.gate(hidden)
                 
                 if num_valid_steps > 0:
                     avg_recon = batch_recon_loss / num_valid_steps

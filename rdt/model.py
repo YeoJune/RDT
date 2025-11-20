@@ -6,30 +6,43 @@ import math
 
 
 class PositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding"""
+    """Sinusoidal positional encoding with explicit position IDs support"""
     
     def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         
-        # Create positional encoding
+        # Create positional encoding table
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
         
-        self.register_buffer('pe', pe)
+        self.register_buffer('pe', pe)  # (max_len, d_model)
     
-    def forward(self, x):
+    def forward(self, x=None, pos_ids=None):
         """
         Args:
-            x: (batch_size, seq_len, d_model)
+            x: (batch_size, seq_len, d_model) - optional, for getting shape
+            pos_ids: (batch_size, seq_len) - explicit position indices
+        Returns:
+            (batch_size, seq_len, d_model) or (seq_len, d_model)
         """
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
+        if pos_ids is not None:
+            # Training mode: use explicit position IDs
+            # pos_ids: (B, seq_len) -> (B, seq_len, d_model)
+            pos_emb = torch.nn.functional.embedding(pos_ids, self.pe)
+            return self.dropout(pos_emb)
+        else:
+            # Inference mode: sequential positions
+            if x is not None:
+                seq_len = x.size(1)
+                pos_emb = self.pe[:seq_len, :].unsqueeze(0)  # (1, seq_len, d_model)
+                return self.dropout(x + pos_emb)
+            else:
+                raise ValueError("Either x or pos_ids must be provided")
 
 
 class TransformerEncoder(nn.Module):
@@ -210,35 +223,40 @@ class RDT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
     
-    def forward(self, x, is_first_step: bool = True):
+    def forward(self, x, pos_ids=None, is_first_step: bool = True):
         """
         Single step forward pass
         
         Args:
             x: (batch_size, seq_len) if is_first_step else (batch_size, seq_len, d_model)
+            pos_ids: (batch_size, seq_len) - explicit position IDs for training
             is_first_step: whether this is the first step (needs embedding)
         
         Returns:
             hidden: (batch_size, seq_len, d_model)
-            logits: (batch_size, seq_len, vocab_size)
             gate_pred: (batch_size, 1)
         """
         # Embedding (only for first step)
         if is_first_step:
             x = self.token_embedding(x) * math.sqrt(self.d_model)
-            x = self.pos_encoding(x)
+            
+            # Positional encoding
+            if pos_ids is not None:
+                # Training: use explicit position IDs (for reordered input)
+                pos_emb = self.pos_encoding(pos_ids=pos_ids)
+                x = x + pos_emb
+            else:
+                # Inference: sequential positions
+                x = self.pos_encoding(x=x)
         # Otherwise x is already hidden state from previous step
         
         # Encode
         hidden = self.encoder(x)
         
-        # Decode
-        logits = self.decoder(hidden)
-        
         # Gate
         gate_pred = self.gate(hidden)
         
-        return hidden, logits, gate_pred
+        return hidden, gate_pred
     
     def recursive_forward(self, x, num_steps: int):
         """
