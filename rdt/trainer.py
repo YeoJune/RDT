@@ -129,6 +129,9 @@ class RDTTrainer:
         total_gate_loss = 0
         num_valid_steps = 0
         
+        # Accumulate losses for backward
+        loss_to_backward = 0
+        
         for step_idx in range(actual_max_length):
             logits = all_logits[step_idx]  # (B, seq_len, vocab_size)
             gate_pred = all_gate_preds[step_idx]  # (B, 1)
@@ -156,25 +159,28 @@ class RDTTrainer:
             if len(gate_pred_valid) > 0:
                 gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid)
             else:
-                gate_loss = 0
+                gate_loss = torch.tensor(0.0, device=self.device)
             
-            total_recon_loss += recon_loss
-            total_gate_loss += gate_loss
+            # Accumulate for logging (detached)
+            total_recon_loss += recon_loss.item()
+            total_gate_loss += gate_loss.item() if isinstance(gate_loss, torch.Tensor) else gate_loss
             num_valid_steps += 1
+            
+            # Accumulate for backward (keep graph)
+            step_loss = self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss
+            loss_to_backward = loss_to_backward + step_loss
         
-        # Average losses
+        # Average losses for logging
         avg_recon_loss = total_recon_loss / num_valid_steps if num_valid_steps > 0 else 0
         avg_gate_loss = total_gate_loss / num_valid_steps if num_valid_steps > 0 else 0
         
-        # Total loss
-        total_loss = (
-            self.loss_weight_recon * avg_recon_loss +
-            self.loss_weight_gate * avg_gate_loss
-        )
+        # Total loss for backward (already accumulated)
+        total_loss = loss_to_backward / num_valid_steps if num_valid_steps > 0 else loss_to_backward
         
         # Backward
         self.optimizer.zero_grad()
-        total_loss.backward()
+        if isinstance(total_loss, torch.Tensor):
+            total_loss.backward()
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -185,9 +191,9 @@ class RDTTrainer:
             self.scheduler.step()
         
         return (
-            total_loss.item(),
-            avg_recon_loss.item() if isinstance(avg_recon_loss, torch.Tensor) else avg_recon_loss,
-            avg_gate_loss.item() if isinstance(avg_gate_loss, torch.Tensor) else avg_gate_loss
+            total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss,
+            avg_recon_loss,
+            avg_gate_loss
         )
     
     def validate(self) -> Tuple[float, float, float]:
