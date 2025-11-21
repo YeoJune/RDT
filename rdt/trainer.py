@@ -106,6 +106,7 @@ class RDTTrainer:
         n_delta = batch['n_delta'].to(self.device)       # GPU로 이동
         gate_targets = batch['gate_targets'].to(self.device)
         chain_lengths = batch['chain_lengths']
+        visible_ratio = self.config['training'].get('visible_loss_ratio', 0.15)
         
         batch_size, seq_len = input_tokens.shape
         actual_max_length = chain_lengths.max().item()
@@ -134,13 +135,25 @@ class RDTTrainer:
             step_targets = targets[:, step_idx, :]      # (B, Seq)
             step_n_revealed = n_revealed[:, step_idx].unsqueeze(1) # (B, 1)
             step_n_delta = n_delta[:, step_idx].unsqueeze(1)       # (B, 1)
+                        
+            # 1. Delta Mask (이번에 꼭 맞춰야 하는 구간)
+            # 조건: n_revealed <= pos < n_revealed + n_delta
+            delta_mask = (pos_range >= step_n_revealed) & (pos_range < (step_n_revealed + step_n_delta))
             
-            # === [핵심] Slicing & Projection 최적화 ===
+            # 2. Visible Mask (이미 밝혀진 구간 중 랜덤 샘플링)
+            # 조건 1: pos < n_revealed (이미 밝혀진 구간)
+            visible_region = (pos_range < step_n_revealed)
             
-            # 1. 이번에 계산해야 할 토큰 위치 찾기 (Boolean Mask)
-            # 조건: n_revealed <= 위치 < n_revealed + n_delta
-            # 배치마다 구간이 달라도 정확하게 필요한 곳만 True가 됨
-            loss_mask = (pos_range >= step_n_revealed) & (pos_range < (step_n_revealed + step_n_delta))
+            # 조건 2: 랜덤 확률 (ratio)
+            # torch.rand_like로 같은 크기의 랜덤 텐서 생성 후 비율보다 작은 곳만 True
+            if visible_ratio > 0:
+                random_select = torch.rand_like(pos_range, dtype=torch.float) < visible_ratio
+                maintenance_mask = visible_region & random_select
+            else:
+                maintenance_mask = torch.zeros_like(delta_mask, dtype=torch.bool)
+            
+            # 3. 최종 Mask 합치기 (OR 연산)
+            loss_mask = delta_mask | maintenance_mask
             
             if loss_mask.sum() > 0:
                 # 2. Transformer Decoder Body 실행 (전체 문맥 유지)
