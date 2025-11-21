@@ -100,7 +100,6 @@ class RDTTrainer:
         # 데이터 로드
         input_tokens = batch['input'].to(self.device)
         targets = batch['targets'].to(self.device)
-        pos_ids = batch['pos_ids'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)
         loss_masks = batch['loss_masks'].to(self.device)
         gate_targets = batch['gate_targets'].to(self.device)
@@ -117,7 +116,6 @@ class RDTTrainer:
         # 1. First Forward
         hidden, gate_pred = self.model(
             input_tokens,
-            pos_ids=pos_ids,
             attention_mask=attention_mask,
             is_first_step=True
         )
@@ -210,7 +208,7 @@ class RDTTrainer:
                     input_tokens, 
                     attention_mask=attention_mask, 
                     is_first_step=True
-                ) # pos_ids 제거됨
+                )
                 
                 for step_idx in range(actual_max_length):
                     valid_mask = chain_lengths > step_idx
