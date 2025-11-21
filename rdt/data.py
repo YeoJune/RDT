@@ -8,6 +8,9 @@ import random
 import numpy as np
 from typing import List, Dict, Tuple
 
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class ShuffleIndexMasking:
     def __init__(self, total_steps: int = 10, mask_token_id: int = 103, visible_loss_ratio: float = 0.15):
