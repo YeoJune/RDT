@@ -31,7 +31,7 @@ training:
   loss_weight_gate: 1.0 # Gate prediction loss weight
 
   # Optimization
-  batch_size: 4
+  batch_size: 16
   num_epochs: 5
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
@@ -50,7 +50,7 @@ training:
 # Data
 data:
   dataset_name: "wikitext-2" # 'wikitext-2' or 'wikitext-103'
-  max_seq_length: 512 # Maximum sequence length
+  max_seq_length: 128 # Maximum sequence length
   mask_token: "[MASK]"
   samples_per_text: 10 # Number of random samples to generate per text
 
