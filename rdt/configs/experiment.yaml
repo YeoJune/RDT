@@ -12,3 +12,4 @@ training:
 
 data:
   dataset_name: "wikitext-103"
+  samples_per_text: 2 # Generate 2 random samples per text for data augmentation

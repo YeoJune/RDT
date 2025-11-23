@@ -14,12 +14,13 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class WikiTextDataset(Dataset):
     def __init__(self, dataset_name='wikitext-2', split='train', tokenizer_name='bert-base-uncased', 
-                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15):
+                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15, samples_per_text=1):
         self.split = split
         self.max_seq_length = max_seq_length
         self.total_steps = total_steps
         self.max_chain_length = max_chain_length
         self.visible_loss_ratio = visible_loss_ratio
+        self.samples_per_text = samples_per_text
         
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.mask_token_id = self.tokenizer.mask_token_id
@@ -30,6 +31,7 @@ class WikiTextDataset(Dataset):
         self.dataset = load_dataset('wikitext', dataset_config, split=split)
         self.tokenized_data = self._prepare_data()
         print(f"Dataset loaded: {len(self.tokenized_data)} sequences")
+        print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
     
     def _prepare_data(self) -> List[torch.Tensor]:
         tokenized = []
@@ -43,10 +45,14 @@ class WikiTextDataset(Dataset):
         return tokenized
     
     def __len__(self):
-        return len(self.tokenized_data)
+        return len(self.tokenized_data) * self.samples_per_text
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        tokens = self.tokenized_data[idx]
+        # 실제 텍스트 인덱스와 샘플 번호 계산
+        text_idx = idx // self.samples_per_text
+        sample_idx = idx % self.samples_per_text
+        
+        tokens = self.tokenized_data[text_idx]
         seq_len = len(tokens)
         
         # 1. 복원 순서 결정 (랜덤 순열)
@@ -162,7 +168,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         max_seq_length=data_config['max_seq_length'],
         total_steps=training_config['total_steps'],
         max_chain_length=training_config['max_chain_length'],
-        visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15)
+        visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
+        samples_per_text=data_config.get('samples_per_text', 1)
     )
     
     val_dataset = WikiTextDataset(
@@ -172,7 +179,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         max_seq_length=data_config['max_seq_length'],
         total_steps=training_config['total_steps'],
         max_chain_length=training_config['max_chain_length'],
-        visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15)
+        visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
+        samples_per_text=data_config.get('samples_per_text', 1)
     )
     
     train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], shuffle=True, num_workers=data_config['num_workers'], pin_memory=data_config['pin_memory'], collate_fn=collate_fn)

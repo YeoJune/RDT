@@ -21,7 +21,7 @@ model:
 # Training Strategy
 training:
   # Chain & Masking
-  max_chain_length: 10 # L: length of training segment
+  max_chain_length: 20 # L: length of training segment
   total_steps: 10 # N: total denoising steps (100% → 0%)
   masking_strategy: "shuffle" # 'shuffle' (index-based)
   visible_loss_ratio: 0.15 # Visible 중에서도 loss 계산할 비율 (안정화)
@@ -52,6 +52,7 @@ data:
   dataset_name: "wikitext-2" # 'wikitext-2' or 'wikitext-103'
   max_seq_length: 512 # Maximum sequence length
   mask_token: "[MASK]"
+  samples_per_text: 10 # Number of random samples to generate per text
 
   # Tokenizer
   tokenizer_name: "bert-base-uncased" # Using standard BERT tokenizer
