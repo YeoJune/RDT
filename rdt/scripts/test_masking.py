@@ -59,7 +59,13 @@ def test_model(model, tokenizer, test_texts, mask_ratios, device, max_steps=20, 
     
     for text in tqdm(test_texts, desc="Processing texts"):
         # Tokenize
-        encoded = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
+        encoded = tokenizer(
+            text, 
+            return_tensors='pt', 
+            truncation=True, 
+            max_length=128,  # Match model's max_seq_len
+            padding=False
+        )
         tokens = encoded['input_ids'].squeeze(0)
         
         if len(tokens) < 10:
