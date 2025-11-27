@@ -208,12 +208,11 @@ class RDT(nn.Module):
             x = self.token_embedding(x) * math.sqrt(self.d_model)
             x = self.pos_encoding(x)
             hidden = self.input_projector(x)
-            # First step: assume maximum noise
-            current_noise = torch.ones(x.size(0), 1, device=x.device)
         else:
             hidden = x
-            # Use previous gate score as current noise level
-            current_noise = last_gate_score if last_gate_score is not None else torch.zeros(hidden.size(0), 1, device=hidden.device)
+
+        # Use previous gate score as current noise level
+        current_noise = last_gate_score if last_gate_score is not None else self.gate(hidden)
 
         # 2. Inject Noise Level Embedding
         noise_vec = self.noise_emb(current_noise)  # [B, 1, D]
