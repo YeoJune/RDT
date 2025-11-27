@@ -121,7 +121,7 @@ class RDTTrainer:
         total_gate_loss = 0
         num_valid_steps = 0
         
-        with autocast(enabled=self.use_amp):
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
             # 1. First Forward
             hidden, gate_pred = self.model(
                 input_tokens,
