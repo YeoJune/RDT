@@ -47,7 +47,7 @@ def calculate_accuracy(pred_tokens, target_tokens, eval_mask):
     return correct / total
 
 
-def test_model(model, tokenizer, test_texts, mask_ratios, device, max_steps=20, threshold=0.1):
+def test_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, max_steps=20, threshold=0.1):
     """Test model across different masking levels"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
@@ -55,15 +55,15 @@ def test_model(model, tokenizer, test_texts, mask_ratios, device, max_steps=20, 
     results = {ratio: [] for ratio in mask_ratios}
     steps_taken = {ratio: [] for ratio in mask_ratios}
     
-    print("\nTesting reconstruction capability...")
+    print(f"\nTesting reconstruction capability (max_seq_len={max_seq_len})...")
     
     for text in tqdm(test_texts, desc="Processing texts"):
-        # Tokenize
+        # Tokenize with config max_length
         encoded = tokenizer(
             text, 
             return_tensors='pt', 
             truncation=True, 
-            max_length=128,  # Match model's max_seq_len
+            max_length=max_seq_len,
             padding=False
         )
         tokens = encoded['input_ids'].squeeze(0)
@@ -235,7 +235,7 @@ def main():
     # Test model
     accuracies, steps = test_model(
         model, tokenizer, test_texts, mask_ratios, 
-        device, args.max_steps, args.threshold
+        device, config['data']['max_seq_length'], args.max_steps, args.threshold
     )
     
     # Print results
