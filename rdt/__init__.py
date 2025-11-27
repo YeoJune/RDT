@@ -1,11 +1,20 @@
 """RDT: Recursive Denoising Transformer
 
 A PyTorch implementation of Recursive Denoising Transformer for progressive text denoising.
+Enhanced with noise-level conditioning and directional recursive blocks.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-from .model import RDT, TransformerEncoder, LinearDecoder, TransformerDecoder, GateMLP
+from .model import (
+    RDT,
+    PositionalEncoding,
+    NoiseLevelEmbedding,
+    DirectionalRecursiveBlock,
+    LinearDecoder,
+    TransformerDecoder,
+    GateMLP,
+)
 from .data import WikiTextDataset, create_dataloaders
 from .trainer import RDTTrainer
 from .utils import (
@@ -21,7 +30,9 @@ from .utils import (
 __all__ = [
     # Model components
     "RDT",
-    "TransformerEncoder",
+    "PositionalEncoding",
+    "NoiseLevelEmbedding",
+    "DirectionalRecursiveBlock",
     "LinearDecoder",
     "TransformerDecoder",
     "GateMLP",
