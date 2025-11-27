@@ -166,8 +166,12 @@ class RDTTrainer:
             
             # Next Step (Recursive)
             if step_idx < actual_max_length - 1:
-                hidden = self.model.encoder(hidden, mask=(attention_mask == 0))
-                gate_pred = self.model.gate(hidden)
+                hidden, gate_pred = self.model.forward(
+                    hidden,
+                    attention_mask=attention_mask,
+                    last_gate_score=gate_pred,
+                    is_first_step=False
+                )
         
         # Final Loss Calculation
         final_loss = accumulated_loss / max(1, num_valid_steps)
@@ -242,8 +246,12 @@ class RDTTrainer:
                     num_valid += 1
                     
                     if step_idx < actual_max_length - 1:
-                        hidden = self.model.encoder(hidden, mask=(attention_mask == 0))
-                        gate_pred = self.model.gate(hidden)
+                        hidden, gate_pred = self.model.forward(
+                            hidden,
+                            attention_mask=attention_mask,
+                            last_gate_score=gate_pred,
+                            is_first_step=False
+                        )
                 
                 if num_valid > 0:
                     avg_recon = batch_recon / num_valid
