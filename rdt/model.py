@@ -159,10 +159,8 @@ class RDT(nn.Module):
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
         
         # Input Consistency Projection
-        self.input_projector = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model)
-        )
+        self.input_projector = nn.Linear(d_model, d_model)
+        self.input_norm = nn.LayerNorm(d_model)
         
         # Noise Level Embedding
         self.noise_emb = NoiseLevelEmbedding(d_model)
@@ -210,6 +208,8 @@ class RDT(nn.Module):
             hidden = self.input_projector(x)
         else:
             hidden = x
+        
+        hidden = self.input_norm(hidden) 
 
         # Use previous gate score as current noise level
         current_noise = last_gate_score if last_gate_score is not None else self.gate(hidden)
