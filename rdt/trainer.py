@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Tuple
@@ -56,6 +57,13 @@ class RDTTrainer:
         log_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=log_dir)
         self.log_every_n_steps = config['output']['log_every_n_steps']
+
+        # AMP
+        self.use_amp = config.get('mixed_precision', False)
+        self.scaler = GradScaler() if self.use_amp else None
+        
+        if self.use_amp:
+            print("Using Automatic Mixed Precision (AMP)")
         
         # Checkpointing
         self.checkpoint_dir = config['output']['checkpoint_dir']
@@ -113,68 +121,69 @@ class RDTTrainer:
         total_gate_loss = 0
         num_valid_steps = 0
         
-        # 1. First Forward
-        hidden, gate_pred = self.model(
-            input_tokens,
-            attention_mask=attention_mask,
-            is_first_step=True
-        )
-        
-        for step_idx in range(actual_max_length):
-            valid_mask = chain_lengths > step_idx
-            if valid_mask.sum() == 0: break
+        with autocast(enabled=self.use_amp):
+            # 1. First Forward
+            hidden, gate_pred = self.model(
+                input_tokens,
+                attention_mask=attention_mask,
+                is_first_step=True
+            )
             
-            step_targets = targets[:, step_idx, :]
-            step_loss_mask = loss_masks[:, step_idx, :]
-            step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
-            
-            # 2. Reconstruction Loss (Masked Selection)
-            if step_loss_mask.sum() > 0:
-                if hasattr(self.model.decoder, 'decoder'):
-                    # Decoder Body (Full Context)
-                    decoder_features = self.model.decoder.decoder(
-                        hidden, 
-                        src_key_padding_mask=(attention_mask == 0)
-                    )
-                    # Selection (Gather)
-                    selected_features = decoder_features[step_loss_mask]
-                    selected_targets = step_targets[step_loss_mask]
-                    # Projection
-                    logits_active = self.model.decoder.projection(selected_features)
-                    recon_loss = self.recon_criterion(logits_active, selected_targets)
+            for step_idx in range(actual_max_length):
+                valid_mask = chain_lengths > step_idx
+                if valid_mask.sum() == 0: break
+                
+                step_targets = targets[:, step_idx, :]
+                step_loss_mask = loss_masks[:, step_idx, :]
+                step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
+                
+                # 2. Reconstruction Loss (Masked Selection)
+                if step_loss_mask.sum() > 0:
+                    if hasattr(self.model.decoder, 'decoder'):
+                        # Decoder Body (Full Context)
+                        decoder_features = self.model.decoder.decoder(
+                            hidden, 
+                            src_key_padding_mask=(attention_mask == 0)
+                        )
+                        # Selection (Gather)
+                        selected_features = decoder_features[step_loss_mask]
+                        selected_targets = step_targets[step_loss_mask]
+                        # Projection
+                        logits_active = self.model.decoder.projection(selected_features)
+                        recon_loss = self.recon_criterion(logits_active, selected_targets)
+                    else:
+                        # Linear Decoder
+                        selected_hidden = hidden[step_loss_mask]
+                        selected_targets = step_targets[step_loss_mask]
+                        logits_active = self.model.decoder(selected_hidden)
+                        recon_loss = self.recon_criterion(logits_active, selected_targets)
                 else:
-                    # Linear Decoder
-                    selected_hidden = hidden[step_loss_mask]
-                    selected_targets = step_targets[step_loss_mask]
-                    logits_active = self.model.decoder(selected_hidden)
-                    recon_loss = self.recon_criterion(logits_active, selected_targets)
-            else:
-                recon_loss = torch.tensor(0.0, device=self.device)
+                    recon_loss = torch.tensor(0.0, device=self.device)
+                
+                # 3. Gate Loss
+                gate_pred_valid = gate_pred[valid_mask]
+                gate_target_valid = step_gate_targets[valid_mask]
+                gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.device)
+                
+                # Step Loss Accumulation
+                step_loss = self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss
+                accumulated_loss = accumulated_loss + step_loss
+                
+                total_recon_loss += recon_loss.item()
+                total_gate_loss += gate_loss.item()
+                num_valid_steps += 1
+                
+                # Next Step (Recursive)
+                if step_idx < actual_max_length - 1:
+                    hidden, gate_pred = self.model.forward(
+                        hidden,
+                        attention_mask=attention_mask,
+                        last_gate_score=gate_pred,
+                        is_first_step=False
+                    )
             
-            # 3. Gate Loss
-            gate_pred_valid = gate_pred[valid_mask]
-            gate_target_valid = step_gate_targets[valid_mask]
-            gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.device)
-            
-            # Step Loss Accumulation
-            step_loss = self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss
-            accumulated_loss = accumulated_loss + step_loss
-            
-            total_recon_loss += recon_loss.item()
-            total_gate_loss += gate_loss.item()
-            num_valid_steps += 1
-            
-            # Next Step (Recursive)
-            if step_idx < actual_max_length - 1:
-                hidden, gate_pred = self.model.forward(
-                    hidden,
-                    attention_mask=attention_mask,
-                    last_gate_score=gate_pred,
-                    is_first_step=False
-                )
-        
-        # Final Loss Calculation
-        final_loss = accumulated_loss / max(1, num_valid_steps)
+            # Final Loss Calculation
+            final_loss = accumulated_loss / max(1, num_valid_steps)
         
         # [수정] Standard Optimization (No Accumulation)
         self.optimizer.zero_grad()
