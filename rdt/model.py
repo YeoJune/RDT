@@ -130,22 +130,46 @@ class TransformerDecoder(nn.Module):
             x = self.decoder(x, src_key_padding_mask=mask)
         return self.projection(x)
 
-
 class GateMLP(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int = 256):
         super().__init__()
+        # Attention-based pooling
+        self.attention = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # Gate prediction
         self.mlp = nn.Sequential(
             nn.Linear(d_model, hidden_dim), 
             nn.ReLU(), 
             nn.Linear(hidden_dim, 1)
         )
     
-    def forward(self, x):
-        if x.dim() == 3: 
-            x = x.mean(dim=1)
-        return torch.sigmoid(self.mlp(x))
-
-
+    def forward(self, x, mask=None):
+        """
+        x: [B, L, D]
+        mask: [B, L] (1=valid, 0=padding)
+        """
+        if x.dim() == 2:  # Already pooled
+            return torch.sigmoid(self.mlp(x))
+        
+        # Attention scores
+        attn_scores = self.attention(x).squeeze(-1)  # [B, L]
+        
+        # Mask out padding
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+        
+        # Softmax
+        attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, L, 1]
+        
+        # Weighted sum
+        pooled = (x * attn_weights).sum(dim=1)  # [B, D]
+        
+        return torch.sigmoid(self.mlp(pooled))
+    
 class RDT(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_decoder_layers=1, 
                  d_ff=2048, dropout=0.1, max_seq_len=512, decoder_type='transformer', 
@@ -212,7 +236,7 @@ class RDT(nn.Module):
         hidden = self.input_norm(hidden) 
 
         # Use previous gate score as current noise level
-        current_noise = last_gate_score if last_gate_score is not None else self.gate(hidden)
+        current_noise = last_gate_score if last_gate_score is not None else self.gate(hidden, attention_mask)
 
         # 2. Inject Noise Level Embedding
         noise_vec = self.noise_emb(current_noise)  # [B, 1, D]
@@ -243,7 +267,7 @@ class RDT(nn.Module):
                 )
 
         # 5. Gate Prediction
-        gate_pred = self.gate(hidden)
+        gate_pred = self.gate(hidden, attention_mask)
         
         return hidden, gate_pred
 
