@@ -160,7 +160,7 @@ class GateMLP(nn.Module):
         
         # Mask out padding
         if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+            attn_scores = attn_scores.masked_fill(mask == 0, -1e4)
         
         # Softmax
         attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, L, 1]
