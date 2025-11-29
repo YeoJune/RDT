@@ -65,7 +65,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         # t: [Batch, 1] (0.0 ~ 1.0)
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t * 50, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb.unsqueeze(1) # [Batch, 1, Hidden]
 
