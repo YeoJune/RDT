@@ -271,7 +271,7 @@ class RDT(nn.Module):
         
         return hidden, gate_pred
 
-    def inference(self, x, context=None, max_steps=20, threshold=0.01):
+    def inference(self, x, context=None, max_steps=20, threshold=0.02):
         """Inference with adaptive recursion"""
         self.eval()
         with torch.no_grad():
