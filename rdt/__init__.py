@@ -9,7 +9,7 @@ __version__ = "0.2.0"
 from .model import (
     RDT,
     PositionalEncoding,
-    NoiseLevelEmbedding,
+    TimestepEmbedder,
     DirectionalRecursiveBlock,
     LinearDecoder,
     TransformerDecoder,
@@ -31,7 +31,7 @@ __all__ = [
     # Model components
     "RDT",
     "PositionalEncoding",
-    "NoiseLevelEmbedding",
+    "TimestepEmbedder",
     "DirectionalRecursiveBlock",
     "LinearDecoder",
     "TransformerDecoder",
