@@ -10,7 +10,9 @@ model:
   dropout: 0.1
 
   # Gate MLP
+  gate_scale: 1000
   gate_hidden_dim: 512 # Gate MLP hidden size
+  threshold: 20 # Gate threshold for stopping criterion
 
   # Decoder type: 'transformer' or 'linear'
   decoder_type: "transformer" # Extreme case: just projection
@@ -28,7 +30,7 @@ training:
 
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
-  loss_weight_gate: 20.0 # Gate prediction loss weight
+  loss_weight_gate: 0.02 # Gate prediction loss weight
 
   # Optimization
   batch_size: 16

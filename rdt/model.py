@@ -65,11 +65,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         # t: [Batch, 1] (0.0 ~ 1.0)
-        
-        # [중요] 0~1 사이의 값을 0~1000 수준으로 스케일링해야 Sin/Cos이 진동함
-        t_scaled = t * 1000.0 
-        
-        t_freq = self.timestep_embedding(t_scaled, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb.unsqueeze(1) # [Batch, 1, Hidden]
 
@@ -239,7 +235,10 @@ class GateMLP(nn.Module):
         # Weighted sum
         pooled = (x * attn_weights).sum(dim=1)  # [B, D]
         
-        return torch.sigmoid(self.mlp(pooled))
+        raw_output = self.mlp(pooled)
+        gate_output = nn.functional.softplus(raw_output)
+        
+        return gate_output
 
 class RDT(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_decoder_layers=1, 

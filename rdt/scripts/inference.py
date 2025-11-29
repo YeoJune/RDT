@@ -8,7 +8,7 @@ from rdt.model import RDT
 from rdt.utils import load_config, load_checkpoint, get_device
 
 
-def inference_interactive(model, tokenizer, device, max_steps=20, threshold=0.02):
+def inference_interactive(model, tokenizer, device, max_steps=20, threshold=20):
     """Interactive inference mode"""
     model.eval()
     
@@ -57,7 +57,7 @@ def inference_interactive(model, tokenizer, device, max_steps=20, threshold=0.02
         print("-" * 50 + "\n")
 
 
-def inference_single(model, tokenizer, device, text, max_steps=20, threshold=0.02):
+def inference_single(model, tokenizer, device, text, max_steps=20, threshold=20):
     """Single text inference"""
     model.eval()
     
@@ -96,8 +96,6 @@ def main():
                         help='Input text to denoise')
     parser.add_argument('--max_steps', type=int, default=20,
                         help='Maximum number of recursive steps')
-    parser.add_argument('--threshold', type=float, default=0.02,
-                        help='Gate threshold for stopping')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use')
     parser.add_argument('--interactive', action='store_true',
@@ -147,10 +145,10 @@ def main():
     
     # Run inference
     if args.interactive:
-        inference_interactive(model, tokenizer, device, args.max_steps, args.threshold)
+        inference_interactive(model, tokenizer, device, args.max_steps, config['model']['threshold'])
     elif args.text:
         output_text, num_steps = inference_single(
-            model, tokenizer, device, args.text, args.max_steps, args.threshold
+            model, tokenizer, device, args.text, args.max_steps, config['model']['threshold']
         )
         print(f"\nInput:  {args.text}")
         print(f"Output: {output_text}")

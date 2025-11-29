@@ -108,7 +108,7 @@ class WikiTextDataset(Dataset):
             inputs.append(input_ids)
             targets.append(tokens) # 타겟은 항상 원본
             loss_masks.append(mask_bool)
-            gate_targets.append(step / self.total_steps)
+            gate_targets.append(step / self.total_steps * 1000) # 0~1000 스케일링
             
         return {
             'input': torch.stack(inputs),       # (L, Seq)
