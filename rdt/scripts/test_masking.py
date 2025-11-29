@@ -47,7 +47,7 @@ def calculate_accuracy(pred_tokens, target_tokens, eval_mask):
     return correct / total
 
 
-def test_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, max_steps=20, threshold=0.1):
+def test_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, max_steps=20, threshold=0.01):
     """Test model across different masking levels"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
@@ -178,7 +178,7 @@ def main():
                         help='Number of test samples')
     parser.add_argument('--max_steps', type=int, default=20,
                         help='Maximum inference steps')
-    parser.add_argument('--threshold', type=float, default=0.1,
+    parser.add_argument('--threshold', type=float, default=0.01,
                         help='Gate threshold for stopping')
     parser.add_argument('--output', type=str, default='masking_test_results.png',
                         help='Output visualization path')
