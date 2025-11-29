@@ -1,4 +1,4 @@
-"""RDT Model Architecture (Enhanced with Cross-Attention & Latent Consistency) - Fixed"""
+"""RDT Model Architecture (Enhanced with AdaLN & Cross-Attention) - Diffusion Style"""
 
 import torch
 import torch.nn as nn
@@ -36,40 +36,72 @@ class NoiseLevelEmbedding(nn.Module):
         return self.proj(gate_score).unsqueeze(1)
 
 
+class AdaptiveLayerNorm(nn.Module):
+    """
+    Diffusion Style Adaptive LayerNorm (AdaLN)
+    Noise Embedding을 받아 LayerNorm의 Scale(gamma)과 Shift(beta)를 동적으로 제어
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        # elementwise_affine=False: 정적 파라미터 끔 (동적으로 생성할 것이므로)
+        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
+        
+        # 임베딩을 Scale & Shift로 변환
+        self.proj = nn.Linear(d_model, d_model * 2)
+        
+        # [Zero-Init Trick]
+        # 학습 초기에는 조건이 영향을 주지 않도록(Identity) 가중치를 0으로 초기화
+        nn.init.constant_(self.proj.weight, 0)
+        nn.init.constant_(self.proj.bias, 0)
+
+    def forward(self, x, emb):
+        # emb: [Batch, 1, D] -> [Batch, D]
+        if emb.dim() == 3:
+            emb = emb.squeeze(1)
+            
+        # Scale & Shift 예측
+        gamma, beta = self.proj(emb).chunk(2, dim=1)
+        
+        # 차원 맞추기 (Broadcasting: [B, 1, D])
+        gamma = gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
+        
+        # Modulation: Norm(x) * (1 + gamma) + beta
+        return self.norm(x) * (1 + gamma) + beta
+
+
 class DirectionalRecursiveBlock(nn.Module):
-    """Self-Attention + Optional Cross-Attention Block"""
+    """Self-Attention + Optional Cross-Attention Block with AdaLN"""
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-        # 1. Self-Attention
+        
+        # 1. Self-Attention (AdaLN 적용)
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.norm1 = nn.LayerNorm(d_model)
+        self.norm1 = AdaptiveLayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         
-        # 2. Cross-Attention (Optional)
+        # 2. Cross-Attention (Conditional, AdaLN 적용)
         self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm2 = AdaptiveLayerNorm(d_model)
         self.dropout2 = nn.Dropout(dropout)
         
-        # 3. Feed-Forward
+        # 3. Feed-Forward (AdaLN 적용)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_ff, d_model)
         )
-        self.norm3 = nn.LayerNorm(d_model)
+        self.norm3 = AdaptiveLayerNorm(d_model)
         self.dropout3 = nn.Dropout(dropout)
 
-    def forward(self, x, context=None, src_key_padding_mask=None, context_key_padding_mask=None):
+    def forward(self, x, noise_emb, context=None, src_key_padding_mask=None, context_key_padding_mask=None):
         """
-        x: [B, L, D]
-        context: [B, C, D] (optional)
-        src_key_padding_mask: [B, L] (True = ignore)
-        context_key_padding_mask: [B, C] (True = ignore)
+        noise_emb: [B, 1, D] - 필수 입력 (Gate Embedding)
         """
         # Phase 1: Self-Attention
         res = x
-        x_norm = self.norm1(x)
+        x_norm = self.norm1(x, noise_emb) # AdaLN
         attn_out, _ = self.self_attn(
             x_norm, x_norm, x_norm, 
             key_padding_mask=src_key_padding_mask, 
@@ -77,10 +109,10 @@ class DirectionalRecursiveBlock(nn.Module):
         )
         x = res + self.dropout1(attn_out)
         
-        # Phase 2: Cross-Attention (Conditional)
+        # Phase 2: Cross-Attention
         if context is not None:
             res = x
-            x_norm = self.norm2(x)
+            x_norm = self.norm2(x, noise_emb) # AdaLN
             attn_out, _ = self.cross_attn(
                 query=x_norm, 
                 key=context, 
@@ -92,7 +124,7 @@ class DirectionalRecursiveBlock(nn.Module):
         
         # Phase 3: Feed-Forward
         res = x
-        x_norm = self.norm3(x)
+        x_norm = self.norm3(x, noise_emb) # AdaLN
         ffn_out = self.ffn(x_norm)
         x = res + self.dropout3(ffn_out)
         
@@ -130,6 +162,7 @@ class TransformerDecoder(nn.Module):
             x = self.decoder(x, src_key_padding_mask=mask)
         return self.projection(x)
 
+
 class GateMLP(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int = 256):
         super().__init__()
@@ -160,6 +193,7 @@ class GateMLP(nn.Module):
         
         # Mask out padding
         if mask is not None:
+            # -1e4 is safer than -1e9 for fp16
             attn_scores = attn_scores.masked_fill(mask == 0, -1e4)
         
         # Softmax
@@ -169,7 +203,7 @@ class GateMLP(nn.Module):
         pooled = (x * attn_weights).sum(dim=1)  # [B, D]
         
         return torch.sigmoid(self.mlp(pooled))
-    
+
 class RDT(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_decoder_layers=1, 
                  d_ff=2048, dropout=0.1, max_seq_len=512, decoder_type='transformer', 
@@ -189,7 +223,7 @@ class RDT(nn.Module):
         # Noise Level Embedding
         self.noise_emb = NoiseLevelEmbedding(d_model)
         
-        # 2. Recursive Encoder
+        # 2. Recursive Encoder (Using AdaLN Blocks)
         self.encoder_layers = nn.ModuleList([
             DirectionalRecursiveBlock(d_model, n_heads, d_ff, dropout)
             for _ in range(n_encoder_layers)
@@ -219,13 +253,9 @@ class RDT(nn.Module):
                 last_gate_score=None, is_first_step=True):
         """
         x: [B, L] (tokens) or [B, L, D] (hidden)
-        context: [B, C, D] (optional)
-        attention_mask: [B, L] (1=attend, 0=ignore)
-        context_mask: [B, C] (1=attend, 0=ignore)
-        last_gate_score: [B, 1] (previous gate prediction)
         """
         
-        # 1. Initialization
+        # 1. Initialization & Projection
         if is_first_step:
             x = self.token_embedding(x) * math.sqrt(self.d_model)
             x = self.pos_encoding(x)
@@ -233,53 +263,53 @@ class RDT(nn.Module):
         else:
             hidden = x
         
-        hidden = self.input_norm(hidden) 
+        # Recursive Norm (Reset Distribution)
+        hidden = self.input_norm(hidden)
 
-        # Use previous gate score as current noise level
+        # 2. Gate Diagnosis
         current_noise = last_gate_score if last_gate_score is not None else self.gate(hidden, attention_mask)
-
-        # 2. Inject Noise Level Embedding
+        
+        # 3. Create Noise Embedding (Condition)
+        # Additive Injection 제거 -> AdaLN을 위한 임베딩 생성만 함
         noise_vec = self.noise_emb(current_noise)  # [B, 1, D]
-        hidden = hidden + noise_vec
 
-        # 3. Prepare Masks
+        # 4. Prepare Masks
         src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         context_key_padding_mask = (context_mask == 0) if context_mask is not None else None
 
-        # 4. Recursive Encoding
+        # 5. Recursive Encoding with AdaLN
         for layer in self.encoder_layers:
             if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
-                    def custom_forward(h, c, sm, cm):
-                        return module(h, context=c, src_key_padding_mask=sm, context_key_padding_mask=cm)
+                    def custom_forward(h, n_emb, c, sm, cm):
+                        # noise_emb를 블록 안으로 전달
+                        return module(h, noise_emb=n_emb, context=c, src_key_padding_mask=sm, context_key_padding_mask=cm)
                     return custom_forward
+                
                 hidden = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer), 
-                    hidden, context, src_key_padding_mask, context_key_padding_mask,
+                    hidden, noise_vec, context, src_key_padding_mask, context_key_padding_mask,
                     use_reentrant=False
                 )
             else:
                 hidden = layer(
                     hidden, 
+                    noise_emb=noise_vec, # [중요] AdaLN을 위해 전달
                     context=context, 
                     src_key_padding_mask=src_key_padding_mask, 
                     context_key_padding_mask=context_key_padding_mask
                 )
 
-        # 5. Gate Prediction
+        # 6. Next Gate Prediction
         gate_pred = self.gate(hidden, attention_mask)
         
         return hidden, gate_pred
 
     def inference(self, x, context=None, max_steps=20, threshold=0.02):
-        """Inference with adaptive recursion"""
         self.eval()
         with torch.no_grad():
-            # First Step
             hidden, gate_pred = self.forward(x, context=context, is_first_step=True)
             step = 1
-            
-            # Recursive Loop
             while step < max_steps and gate_pred.mean().item() > threshold:
                 hidden, gate_pred = self.forward(
                     hidden, 
@@ -289,13 +319,11 @@ class RDT(nn.Module):
                 )
                 step += 1
             
-            # Final Decode
             if hasattr(self.decoder, 'decoder'):
                 feat = self.decoder.decoder(hidden)
                 logits = self.decoder.projection(feat)
             else:
                 logits = self.decoder(hidden)
-                
             output_tokens = logits.argmax(dim=-1)
             
         return output_tokens, step
