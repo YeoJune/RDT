@@ -5,12 +5,12 @@ model:
   d_model: 512 # Hidden dimension
   n_heads: 8 # Attention heads (d_model / 64)
   n_encoder_layers: 6 # Shared encoder depth (recursive)
-  n_decoder_layers: 1 # Shallow decoder (MAE-style)
+  n_decoder_layers: 2 # Shallow decoder (MAE-style)
   d_ff: 2048 # FFN dimension (4x d_model)
   dropout: 0.1
 
   # Gate MLP
-  gate_hidden_dim: 256 # Gate MLP hidden size
+  gate_hidden_dim: 512 # Gate MLP hidden size
 
   # Decoder type: 'transformer' or 'linear'
   decoder_type: "transformer" # Extreme case: just projection
@@ -21,18 +21,18 @@ model:
 # Training Strategy
 training:
   # Chain & Masking
-  max_chain_length: 10 # L: length of training segment
+  max_chain_length: 5 # L: length of training segment
   total_steps: 20 # N: total denoising steps (100% → 0%)
   masking_strategy: "shuffle" # 'shuffle' (index-based)
   visible_loss_ratio: 0.15 # Visible 중에서도 loss 계산할 비율 (안정화)
 
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
-  loss_weight_gate: 1.0 # Gate prediction loss weight
+  loss_weight_gate: 20.0 # Gate prediction loss weight
 
   # Optimization
   batch_size: 16
-  num_epochs: 5
+  num_epochs: 10
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.1 # 10% of total steps
