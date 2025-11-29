@@ -287,9 +287,14 @@ class RDT(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x, context=None, attention_mask=None, context_mask=None, 
-                last_gate_score=None, is_first_step=True):
+                last_gate_score=None, is_first_step=True, gt_timestep=None, sampling_prob=0.0):
         """
         x: [B, L] (tokens) or [B, L, D] (hidden)
+        gt_timestep: [B, 1] Ground truth timestep (0~1), training 시 제공
+        sampling_prob: Scheduled sampling probability (0~1)
+                       - 0.0: 항상 predicted gate 사용 (inference)
+                       - 1.0: 항상 gt_timestep 사용 (early training)
+                       - 0~1: 확률적으로 혼합 (curriculum learning)
         """
         
         # 1. Initialization & Projection
@@ -304,19 +309,33 @@ class RDT(nn.Module):
         hidden = self.input_norm(hidden)
 
         # 2. Gate Diagnosis
-        current_noise = last_gate_score if last_gate_score is not None else self.gate(hidden, attention_mask)
+        predicted_gate = last_gate_score if last_gate_score is not None else self.gate(hidden, attention_mask)
         
-        current_noise_detached = current_noise.detach()
+        # 3. Scheduled Sampling (Training Stabilization)
+        if self.training and gt_timestep is not None:
+            # Sampling probability로 GT vs Predicted 선택
+            if sampling_prob > 0.0:
+                # Bernoulli sampling: sampling_prob 확률로 GT 사용
+                use_gt = torch.rand(1).item() < sampling_prob
+                if use_gt:
+                    current_noise = gt_timestep  # Ground Truth 사용
+                else:
+                    current_noise = predicted_gate.detach()  # Predicted 사용 (detached)
+            else:
+                current_noise = predicted_gate.detach()  # sampling_prob=0이면 항상 predicted
+        else:
+            # Inference 또는 GT 없을 때: 항상 predicted gate 사용
+            current_noise = predicted_gate.detach()
 
-        # 3. Create Noise Embedding (Condition)
+        # 4. Create Noise Embedding (Condition)
         # Additive Injection 제거 -> AdaLN을 위한 임베딩 생성만 함
-        noise_vec = self.noise_emb(current_noise_detached)  # [B, 1, D]
+        noise_vec = self.noise_emb(current_noise)  # [B, 1, D]
 
-        # 4. Prepare Masks
+        # 5. Prepare Masks
         src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         context_key_padding_mask = (context_mask == 0) if context_mask is not None else None
 
-        # 5. Recursive Encoding with AdaLN
+        # 6. Recursive Encoding with AdaLN
         for layer in self.encoder_layers:
             if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
@@ -339,10 +358,10 @@ class RDT(nn.Module):
                     context_key_padding_mask=context_key_padding_mask
                 )
 
-        # 6. Next Gate Prediction
-        gate_pred = self.gate(hidden, attention_mask)
+        # 7. Next Gate Prediction
+        next_gate_pred = self.gate(hidden, attention_mask)
         
-        return hidden, gate_pred
+        return hidden, next_gate_pred
 
     def inference(self, x, context=None, max_steps=20, threshold=0.02):
         self.eval()

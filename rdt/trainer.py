@@ -102,6 +102,20 @@ class RDTTrainer:
         
         return scheduler
     
+    def get_sampling_prob(self, epoch: int) -> float:
+        """
+        Scheduled Sampling Probability Scheduler
+        - Epoch 0 ~ num_epochs: 1.0 -> 0.0 (Linear Decay)
+        - Early training: Use GT timestep for stability
+        - Late training: Use predicted gate for inference alignment
+        """
+        if self.num_epochs <= 1:
+            return 0.0  # Single epoch -> no scheduling
+        
+        # Linear decay: 1.0 -> 0.0
+        sampling_prob = max(0.0, 1.0 - (epoch / (self.num_epochs - 1)))
+        return sampling_prob
+    
     def train_step(self, batch: Dict) -> Tuple[float, float, float]:
         self.model.train()
         
@@ -121,12 +135,18 @@ class RDTTrainer:
         total_gate_loss = 0
         num_valid_steps = 0
         
+        # Scheduled Sampling Probability
+        sampling_prob = self.get_sampling_prob(self.current_epoch)
+        
         with torch.amp.autocast('cuda', enabled=self.use_amp):
-            # 1. First Forward
+            # 1. First Forward (with Scheduled Sampling)
+            step_gt_timestep = gate_targets[:, 0].unsqueeze(1)  # [B, 1]
             hidden, gate_pred = self.model(
                 input_tokens,
                 attention_mask=attention_mask,
-                is_first_step=True
+                is_first_step=True,
+                gt_timestep=step_gt_timestep,
+                sampling_prob=sampling_prob
             )
             
             for step_idx in range(actual_max_length):
@@ -175,11 +195,14 @@ class RDTTrainer:
                 
                 # Next Step (Recursive)
                 if step_idx < actual_max_length - 1:
+                    next_gt_timestep = gate_targets[:, step_idx + 1].unsqueeze(1)  # [B, 1]
                     hidden, gate_pred = self.model.forward(
                         hidden,
                         attention_mask=attention_mask,
                         last_gate_score=gate_pred,
-                        is_first_step=False
+                        is_first_step=False,
+                        gt_timestep=next_gt_timestep,
+                        sampling_prob=sampling_prob
                     )
             
             # Final Loss Calculation
@@ -281,7 +304,8 @@ class RDTTrainer:
         
         for epoch in range(self.num_epochs):
             self.current_epoch = epoch
-            print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
+            sampling_prob = self.get_sampling_prob(epoch)
+            print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
             
             epoch_loss = 0; epoch_recon = 0; epoch_gate = 0
             progress_bar = tqdm(self.train_loader, desc="Training")
@@ -294,6 +318,7 @@ class RDTTrainer:
                 if self.global_step % self.log_every_n_steps == 0:
                     self.writer.add_scalar('train/loss', loss, self.global_step)
                     self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
+                    self.writer.add_scalar('train/sampling_prob', sampling_prob, self.global_step)
                 
                 progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}'})
             
