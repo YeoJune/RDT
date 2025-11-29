@@ -20,21 +20,58 @@ class PositionalEncoding(nn.Module):
         pos_emb = self.pe[:seq_len, :].unsqueeze(0)
         return self.dropout(x + pos_emb)
 
-
-class NoiseLevelEmbedding(nn.Module):
-    """Gate score를 벡터로 변환하여 인코더에 노이즈 레벨 힌트 제공"""
-    def __init__(self, d_model: int):
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    Classic DDPM Style: Sinusoidal -> Linear -> SiLU -> Linear
+    """
+    def __init__(self, hidden_dim, frequency_embedding_size=256):
         super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(1, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-    
-    def forward(self, gate_score):
-        # gate_score: [Batch, 1] -> [Batch, 1, d_model]
-        return self.proj(gate_score).unsqueeze(1)
+        self.frequency_embedding_size = frequency_embedding_size
 
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        t: [Batch] (1D Tensor)
+        dim: Output dimension
+        """
+        # 1. Frequency 계산: exp(-log(10000) / (d-1))
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        
+        # 2. Argument 계산: t * freq
+        # t가 [Batch, 1]로 들어올 수도 있으므로 차원 맞춤
+        if t.dim() == 2:
+            t = t.squeeze(-1) # [Batch]
+            
+        args = t[:, None].float() * freqs[None]
+        
+        # 3. Sin/Cos 결합
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        
+        # 4. 차원이 홀수일 경우 0 패딩 (안전장치)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            
+        return embedding
+
+    def forward(self, t):
+        # t: [Batch, 1] (0.0 ~ 1.0)
+        
+        # [중요] 0~1 사이의 값을 0~1000 수준으로 스케일링해야 Sin/Cos이 진동함
+        t_scaled = t * 1000.0 
+        
+        t_freq = self.timestep_embedding(t_scaled, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb.unsqueeze(1) # [Batch, 1, Hidden]
 
 class AdaptiveLayerNorm(nn.Module):
     """
@@ -221,7 +258,7 @@ class RDT(nn.Module):
         self.input_norm = nn.LayerNorm(d_model)
         
         # Noise Level Embedding
-        self.noise_emb = NoiseLevelEmbedding(d_model)
+        self.noise_emb = TimestepEmbedder(d_model, frequency_embedding_size=d_model)
         
         # 2. Recursive Encoder (Using AdaLN Blocks)
         self.encoder_layers = nn.ModuleList([
