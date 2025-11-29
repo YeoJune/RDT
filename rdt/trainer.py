@@ -50,7 +50,7 @@ class RDTTrainer:
         
         # Loss functions
         self.recon_criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding
-        self.gate_criterion = nn.L1Loss()
+        self.gate_criterion = nn.SmoothL1Loss(beta=0.1)
         
         # Logging
         log_dir = Path(config['output']['log_dir'])
