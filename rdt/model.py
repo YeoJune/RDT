@@ -306,9 +306,11 @@ class RDT(nn.Module):
         # 2. Gate Diagnosis
         current_noise = last_gate_score if last_gate_score is not None else self.gate(hidden, attention_mask)
         
+        current_noise_detached = current_noise.detach()
+
         # 3. Create Noise Embedding (Condition)
         # Additive Injection 제거 -> AdaLN을 위한 임베딩 생성만 함
-        noise_vec = self.noise_emb(current_noise)  # [B, 1, D]
+        noise_vec = self.noise_emb(current_noise_detached)  # [B, 1, D]
 
         # 4. Prepare Masks
         src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
