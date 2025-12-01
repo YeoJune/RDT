@@ -233,7 +233,7 @@ def main():
     # Test model
     accuracies, steps = test_model(
         model, tokenizer, test_texts, mask_ratios, 
-        device, config['data']['max_seq_length'], args.max_steps, config['model']['threshold']
+        device, config['data']['max_seq_length'], config['model']['total_steps'], config['model']['threshold']
     )
     
     # Print results
