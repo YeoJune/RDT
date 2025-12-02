@@ -197,34 +197,36 @@ class RDTTrainer:
             main_loss = accumulated_loss / max(1, num_valid_steps)
             
             # === Auxiliary Loss: I/O Reconstruction ===
-            aux_loss = 0
-            num_aux_steps = 0
-            
-            # targets의 각 중간 step을 Input Encoder -> Output Decoder로 재구성
-            for step_idx in range(actual_max_length):
-                step_target = targets[:, step_idx, :]  # [B, Seq]
+            if self.loss_weight_aux > 0:
+                aux_loss = 0
+                num_aux_steps = 0
                 
-                # Input Encoder로 인코딩
-                target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
-                target_emb = self.model.pos_encoding(target_emb)
-                src_key_padding_mask = (attention_mask == 0)
-                target_hidden = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
+                # targets의 각 중간 step을 Input Encoder -> Output Decoder로 재구성
+                for step_idx in range(actual_max_length):
+                    step_target = targets[:, step_idx, :]  # [B, Seq]
+                    
+                    # Input Encoder로 인코딩
+                    target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
+                    target_emb = self.model.pos_encoding(target_emb)
+                    src_key_padding_mask = (attention_mask == 0)
+                    target_hidden = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
+                    
+                    # Output Decoder로 디코딩
+                    recon_logits = self.model.decode(target_hidden, attention_mask)
+                    
+                    # Reconstruction Loss (전체 시퀀스, padding 제외)
+                    recon_logits_flat = recon_logits.reshape(-1, recon_logits.size(-1))
+                    target_flat = step_target.reshape(-1)
+                    step_aux_loss = self.recon_criterion(recon_logits_flat, target_flat)
+                    
+                    aux_loss += step_aux_loss
+                    num_aux_steps += 1
                 
-                # Output Decoder로 디코딩
-                recon_logits = self.model.decode(target_hidden, attention_mask)
-                
-                # Reconstruction Loss (전체 시퀀스, padding 제외)
-                recon_logits_flat = recon_logits.reshape(-1, recon_logits.size(-1))
-                target_flat = step_target.reshape(-1)
-                step_aux_loss = self.recon_criterion(recon_logits_flat, target_flat)
-                
-                aux_loss += step_aux_loss
-                num_aux_steps += 1
-            
-            aux_loss = aux_loss / max(1, num_aux_steps)
-            
-            # Total Loss
-            final_loss = main_loss + self.loss_weight_aux * aux_loss
+                aux_loss = aux_loss / max(1, num_aux_steps)
+                final_loss = main_loss + self.loss_weight_aux * aux_loss
+            else:
+                aux_loss = torch.tensor(0.0, device=self.device)
+                final_loss = main_loss
         
         # [수정] Standard Optimization (No Accumulation)
         self.optimizer.zero_grad()
