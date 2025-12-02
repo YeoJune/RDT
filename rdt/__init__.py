@@ -11,8 +11,6 @@ from .model import (
     PositionalEncoding,
     TimestepEmbedder,
     DirectionalRecursiveBlock,
-    LinearDecoder,
-    TransformerDecoder,
     GateMLP,
 )
 from .data import WikiTextDataset, create_dataloaders
@@ -33,8 +31,6 @@ __all__ = [
     "PositionalEncoding",
     "TimestepEmbedder",
     "DirectionalRecursiveBlock",
-    "LinearDecoder",
-    "TransformerDecoder",
     "GateMLP",
     # Data
     "WikiTextDataset",
