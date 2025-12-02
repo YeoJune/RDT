@@ -48,12 +48,14 @@ class WikiTextDataset(Dataset):
         return len(self.tokenized_data) * self.samples_per_text
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # 실제 텍스트 인덱스와 샘플 번호 계산
         text_idx = idx // self.samples_per_text
         sample_idx = idx % self.samples_per_text
         
         tokens = self.tokenized_data[text_idx]
         seq_len = len(tokens)
         
+        # 복원 순서 결정 (랜덤 순열)
         restore_order = torch.randperm(seq_len)
         
         max_start = self.total_steps
@@ -62,69 +64,71 @@ class WikiTextDataset(Dataset):
         chain_length = min(self.max_chain_length, start_step)
         
         inputs = []
-        targets = []
-        loss_masks = []
         gate_targets = []
         
+        # Step 1: 각 step의 입력 생성
         for offset in range(chain_length):
             step = start_step - offset
             num_visible = int(seq_len * (1 - step / self.total_steps))
             
-            # 현재 step의 입력 생성
             visible_indices = restore_order[:num_visible]
             masked_indices = restore_order[num_visible:]
+            
             input_ids = tokens.clone()
             if len(masked_indices) > 0:
                 input_ids[masked_indices] = self.mask_token_id
             
             inputs.append(input_ids)
             gate_targets.append(step / self.total_steps * 20)
-
-        # Loss mask는 별도로 계산 (target 기준)
+        
+        # Step 2: Target과 Loss Mask 생성 (점진적 디노이징)
+        targets = []
+        loss_masks = []
+        
         for i in range(chain_length):
             if i < chain_length - 1:
-                # target은 다음 step (i+1)
-                target_step = start_step - (i + 1)
-                target_visible = int(seq_len * (1 - target_step / self.total_steps))
+                # Target: 다음 step의 입력 (덜 마스킹된 버전)
+                target = inputs[i + 1]
                 
-                # 현재 step의 visible
+                # Loss Mask: 다음 step에서 새로 드러나는 위치만
                 current_step = start_step - i
-                current_visible = int(seq_len * (1 - current_step / self.total_steps))
+                next_step = start_step - (i + 1)
                 
-                # Delta: target에서 새로 드러난 부분
-                delta_indices = restore_order[current_visible:target_visible]
+                current_visible = int(seq_len * (1 - current_step / self.total_steps))
+                next_visible = int(seq_len * (1 - next_step / self.total_steps))
+                
+                # Delta: 다음 step에서 새로 드러나는 구간
+                delta_indices = restore_order[current_visible:next_visible]
                 
                 mask_bool = torch.zeros(seq_len, dtype=torch.bool)
                 mask_bool[delta_indices] = True
                 
-                # Maintenance
+                # Maintenance: 이미 드러난 것 중 일부 (일관성 유지)
                 if current_visible > 0 and self.visible_loss_ratio > 0:
                     num_maint = max(1, int(current_visible * self.visible_loss_ratio))
                     perm = torch.randperm(current_visible)[:num_maint]
                     maint_indices = restore_order[perm]
                     mask_bool[maint_indices] = True
+                
             else:
-                # 마지막 step: target이 원본이므로 모든 masked 영역
-                current_step = start_step - i
-                current_visible = int(seq_len * (1 - current_step / self.total_steps))
-                remaining_indices = restore_order[current_visible:]
+                # 마지막 step: 완전히 복원된 원본이 target
+                target = tokens
+                
+                # Loss Mask: 아직 마스킹된 모든 위치
+                last_step = start_step - (chain_length - 1)
+                last_visible = int(seq_len * (1 - last_step / self.total_steps))
+                remaining_indices = restore_order[last_visible:]
                 
                 mask_bool = torch.zeros(seq_len, dtype=torch.bool)
                 mask_bool[remaining_indices] = True
             
+            targets.append(target)
             loss_masks.append(mask_bool)
         
-        # targets는 다음 step의 input으로 설정
-        for i in range(chain_length):
-            if i < chain_length - 1:
-                targets.append(inputs[i + 1])  # 다음 step의 입력
-            else:
-                targets.append(tokens)  # 마지막 step은 원본
-        
         return {
-            'input': torch.stack(inputs),
-            'targets': torch.stack(targets),
-            'loss_masks': torch.stack(loss_masks),
+            'input': torch.stack(inputs),           # (L, Seq)
+            'targets': torch.stack(targets),        # (L, Seq)
+            'loss_masks': torch.stack(loss_masks),  # (L, Seq)
             'gate_targets': torch.tensor(gate_targets, dtype=torch.float),
             'chain_length': chain_length
         }
@@ -146,9 +150,6 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         seq_len = item['input'].size(1)
         chain_len = item['chain_length']
         
-        # 입력 (첫 스텝만 가져와서 모델에 넣고 돌림 -> Trainer에서 loop 처리하므로 첫 입력만 필요? 
-        # 아니요, Trainer는 hidden을 재사용하므로 첫 입력만 필요합니다.
-        # 하지만 여기선 item['input']이 (L, Seq) 형태입니다.
         # Trainer 로직상 첫 입력(Start Step)만 필요하므로 0번째만 씁니다.
         inputs[i, :seq_len] = item['input'][0] 
         
