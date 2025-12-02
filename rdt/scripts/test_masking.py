@@ -208,11 +208,10 @@ def main():
         d_model=config['model']['d_model'],
         n_heads=config['model']['n_heads'],
         n_encoder_layers=config['model']['n_encoder_layers'],
-        n_decoder_layers=config['model']['n_decoder_layers'],
+        n_io_layers=config['model']['n_io_layers'],
         d_ff=config['model']['d_ff'],
         dropout=config['model']['dropout'],
         max_seq_len=config['data']['max_seq_length'],
-        decoder_type=config['model']['decoder_type'],
         gate_hidden_dim=config['model']['gate_hidden_dim']
     )
     

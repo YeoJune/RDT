@@ -242,7 +242,7 @@ class GateMLP(nn.Module):
 
 class RDT(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_io_layers=1, 
-                 d_ff=2048, dropout=0.1, max_seq_len=512, decoder_type='transformer', 
+                 d_ff=2048, dropout=0.1, max_seq_len=512,
                  gate_hidden_dim=256, gradient_checkpointing=False):
         super().__init__()
         self.d_model = d_model
