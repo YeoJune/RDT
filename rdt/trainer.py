@@ -214,8 +214,8 @@ class RDTTrainer:
                 recon_logits = self.model.decode(target_hidden, attention_mask)
                 
                 # Reconstruction Loss (전체 시퀀스, padding 제외)
-                recon_logits_flat = recon_logits.view(-1, recon_logits.size(-1))
-                target_flat = step_target.view(-1)
+                recon_logits_flat = recon_logits.reshape(-1, recon_logits.size(-1))
+                target_flat = step_target.reshape(-1)
                 step_aux_loss = self.recon_criterion(recon_logits_flat, target_flat)
                 
                 aux_loss += step_aux_loss
