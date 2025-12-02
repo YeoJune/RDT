@@ -37,6 +37,7 @@ class RDTTrainer:
         self.max_grad_norm = config['training']['max_grad_norm']
         self.loss_weight_recon = config['training']['loss_weight_recon']
         self.loss_weight_gate = config['training']['loss_weight_gate']
+        self.loss_weight_aux = config['training'].get('loss_weight_aux', 0.1)
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -159,24 +160,11 @@ class RDTTrainer:
                 
                 # 2. Reconstruction Loss (Masked Selection)
                 if step_loss_mask.sum() > 0:
-                    if hasattr(self.model.decoder, 'decoder'):
-                        # Decoder Body (Full Context)
-                        decoder_features = self.model.decoder.decoder(
-                            hidden, 
-                            src_key_padding_mask=(attention_mask == 0)
-                        )
-                        # Selection (Gather)
-                        selected_features = decoder_features[step_loss_mask]
-                        selected_targets = step_targets[step_loss_mask]
-                        # Projection
-                        logits_active = self.model.decoder.projection(selected_features)
-                        recon_loss = self.recon_criterion(logits_active, selected_targets)
-                    else:
-                        # Linear Decoder
-                        selected_hidden = hidden[step_loss_mask]
-                        selected_targets = step_targets[step_loss_mask]
-                        logits_active = self.model.decoder(selected_hidden)
-                        recon_loss = self.recon_criterion(logits_active, selected_targets)
+                    # Use decode method
+                    logits = self.model.decode(hidden, attention_mask)
+                    selected_logits = logits[step_loss_mask]
+                    selected_targets = step_targets[step_loss_mask]
+                    recon_loss = self.recon_criterion(selected_logits, selected_targets)
                 else:
                     recon_loss = torch.tensor(0.0, device=self.device)
                 
@@ -206,7 +194,37 @@ class RDTTrainer:
                     )
             
             # Final Loss Calculation
-            final_loss = accumulated_loss / max(1, num_valid_steps)
+            main_loss = accumulated_loss / max(1, num_valid_steps)
+            
+            # === Auxiliary Loss: I/O Reconstruction ===
+            aux_loss = 0
+            num_aux_steps = 0
+            
+            # targets의 각 중간 step을 Input Encoder -> Output Decoder로 재구성
+            for step_idx in range(actual_max_length):
+                step_target = targets[:, step_idx, :]  # [B, Seq]
+                
+                # Input Encoder로 인코딩
+                target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
+                target_emb = self.model.pos_encoding(target_emb)
+                src_key_padding_mask = (attention_mask == 0)
+                target_hidden = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
+                
+                # Output Decoder로 디코딩
+                recon_logits = self.model.decode(target_hidden, attention_mask)
+                
+                # Reconstruction Loss (전체 시퀀스, padding 제외)
+                recon_logits_flat = recon_logits.view(-1, recon_logits.size(-1))
+                target_flat = step_target.view(-1)
+                step_aux_loss = self.recon_criterion(recon_logits_flat, target_flat)
+                
+                aux_loss += step_aux_loss
+                num_aux_steps += 1
+            
+            aux_loss = aux_loss / max(1, num_aux_steps)
+            
+            # Total Loss
+            final_loss = main_loss + self.loss_weight_aux * aux_loss
         
         # [수정] Standard Optimization (No Accumulation)
         self.optimizer.zero_grad()
@@ -217,7 +235,7 @@ class RDTTrainer:
         if self.scheduler:
             self.scheduler.step()
         
-        return final_loss.item(), total_recon_loss / max(1, num_valid_steps), total_gate_loss / max(1, num_valid_steps)
+        return final_loss.item(), total_recon_loss / max(1, num_valid_steps), total_gate_loss / max(1, num_valid_steps), aux_loss.item()
     
     def validate(self) -> Tuple[float, float, float]:
         self.model.eval()
@@ -255,17 +273,10 @@ class RDTTrainer:
                     step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
                     
                     if step_loss_mask.sum() > 0:
-                        if hasattr(self.model.decoder, 'decoder'):
-                            feat = self.model.decoder.decoder(hidden, src_key_padding_mask=(attention_mask == 0))
-                            sel_feat = feat[step_loss_mask]
-                            sel_targ = step_targets[step_loss_mask]
-                            logits = self.model.decoder.projection(sel_feat)
-                            recon_loss = self.recon_criterion(logits, sel_targ)
-                        else:
-                            sel_hidden = hidden[step_loss_mask]
-                            sel_targ = step_targets[step_loss_mask]
-                            logits = self.model.decoder(sel_hidden)
-                            recon_loss = self.recon_criterion(logits, sel_targ)
+                        logits = self.model.decode(hidden, attention_mask)
+                        sel_logits = logits[step_loss_mask]
+                        sel_targ = step_targets[step_loss_mask]
+                        recon_loss = self.recon_criterion(sel_logits, sel_targ)
                     else:
                         recon_loss = torch.tensor(0.0, device=self.device)
                     
@@ -307,20 +318,23 @@ class RDTTrainer:
             sampling_prob = self.get_sampling_prob(epoch)
             print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
             
-            epoch_loss = 0; epoch_recon = 0; epoch_gate = 0
+            epoch_loss = 0; epoch_recon = 0; epoch_gate = 0; epoch_aux = 0
             progress_bar = tqdm(self.train_loader, desc="Training")
             
             for batch in progress_bar:
-                loss, recon, gate = self.train_step(batch)
-                epoch_loss += loss; epoch_recon += recon; epoch_gate += gate
+                loss, recon, gate, aux = self.train_step(batch)
+                epoch_loss += loss; epoch_recon += recon; epoch_gate += gate; epoch_aux += aux
                 self.global_step += 1
                 
                 if self.global_step % self.log_every_n_steps == 0:
                     self.writer.add_scalar('train/loss', loss, self.global_step)
+                    self.writer.add_scalar('train/recon_loss', recon, self.global_step)
+                    self.writer.add_scalar('train/gate_loss', gate, self.global_step)
+                    self.writer.add_scalar('train/aux_loss', aux, self.global_step)
                     self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
                     self.writer.add_scalar('train/sampling_prob', sampling_prob, self.global_step)
                 
-                progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}'})
+                progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
             
             # Validation
             if (epoch + 1) % self.config['output']['eval_every_n_epochs'] == 0:

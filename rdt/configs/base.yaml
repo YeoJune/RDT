@@ -31,6 +31,7 @@ training:
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
   loss_weight_gate: 1.0 # Gate prediction loss weight
+  loss_weight_aux: 0.1
 
   # Optimization
   batch_size: 16

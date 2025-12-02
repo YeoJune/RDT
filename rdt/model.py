@@ -252,8 +252,12 @@ class RDT(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
         
-        # Input Consistency Projection
-        self.input_projector = nn.Linear(d_model, d_model)
+        # Input Encoder (1-2 layer Transformer)
+        input_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, 
+            dropout=dropout, batch_first=True
+        )
+        self.input_encoder = nn.TransformerEncoder(input_encoder_layer, num_layers=2)
         self.input_norm = nn.LayerNorm(d_model)
         
         # Noise Level Embedding
@@ -265,18 +269,18 @@ class RDT(nn.Module):
             for _ in range(n_encoder_layers)
         ])
         
-        # 3. Decoder
-        if decoder_type == 'linear':
-            self.decoder = LinearDecoder(d_model, vocab_size)
-        else:
-            self.decoder = TransformerDecoder(d_model, n_heads, n_decoder_layers, d_ff, vocab_size, dropout)
-            if gradient_checkpointing:
-                self.decoder.gradient_checkpointing = True
+        # 3. Output Decoder (1-2 layer Transformer)
+        output_decoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            dropout=dropout, batch_first=True
+        )
+        self.output_decoder = nn.TransformerEncoder(output_decoder_layer, num_layers=2)
+        self.output_projection = nn.Linear(d_model, vocab_size)
             
         self.gate = GateMLP(d_model, gate_hidden_dim)
         
         # Weight Tying
-        self.decoder.projection.weight = self.token_embedding.weight
+        self.output_projection.weight = self.token_embedding.weight
         
         self._init_weights()
 
@@ -300,7 +304,9 @@ class RDT(nn.Module):
         if is_first_step:
             x = self.token_embedding(x) * math.sqrt(self.d_model)
             x = self.pos_encoding(x)
-            hidden = self.input_projector(x)
+            # Input Encoder
+            src_key_padding_mask_temp = (attention_mask == 0) if attention_mask is not None else None
+            hidden = self.input_encoder(x, src_key_padding_mask=src_key_padding_mask_temp)
         else:
             hidden = x
         
@@ -361,6 +367,18 @@ class RDT(nn.Module):
         next_gate_pred = self.gate(hidden, attention_mask)
         
         return hidden, next_gate_pred
+    
+    def decode(self, hidden, attention_mask=None):
+        """
+        Output Decoder: hidden -> logits
+        hidden: [B, L, D]
+        attention_mask: [B, L] (1=valid, 0=padding)
+        Returns: logits [B, L, vocab_size]
+        """
+        src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        decoded = self.output_decoder(hidden, src_key_padding_mask=src_key_padding_mask)
+        logits = self.output_projection(decoded)
+        return logits
 
     def inference(self, x, context=None, max_steps=20, threshold=0.02):
         self.eval()
@@ -376,11 +394,8 @@ class RDT(nn.Module):
                 )
                 step += 1
             
-            if hasattr(self.decoder, 'decoder'):
-                feat = self.decoder.decoder(hidden)
-                logits = self.decoder.projection(feat)
-            else:
-                logits = self.decoder(hidden)
+            # Use decode method
+            logits = self.decode(hidden)
             output_tokens = logits.argmax(dim=-1)
             
         return output_tokens, step
