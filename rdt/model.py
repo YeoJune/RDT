@@ -164,38 +164,6 @@ class DirectionalRecursiveBlock(nn.Module):
         return x
 
 
-class LinearDecoder(nn.Module):
-    def __init__(self, d_model: int, vocab_size: int):
-        super().__init__()
-        self.projection = nn.Linear(d_model, vocab_size)
-    
-    def forward(self, x): 
-        return self.projection(x)
-
-
-class TransformerDecoder(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, n_layers: int, d_ff: int, vocab_size: int, dropout: float = 0.1):
-        super().__init__()
-        decoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, dropout=dropout, batch_first=True
-        )
-        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=n_layers)
-        self.projection = nn.Linear(d_model, vocab_size)
-        self.gradient_checkpointing = False
-    
-    def forward(self, x, mask=None): 
-        if self.gradient_checkpointing and self.training:
-            from torch.utils.checkpoint import checkpoint
-            def create_custom_forward(module):
-                def custom_forward(x_input, mask_input):
-                    return module(x_input, src_key_padding_mask=mask_input)
-                return custom_forward
-            x = checkpoint(create_custom_forward(self.decoder), x, mask, use_reentrant=False)
-        else:
-            x = self.decoder(x, src_key_padding_mask=mask)
-        return self.projection(x)
-
-
 class GateMLP(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int = 256):
         super().__init__()
