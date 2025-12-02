@@ -5,7 +5,7 @@ model:
   d_model: 512 # Hidden dimension
   n_heads: 8 # Attention heads (d_model / 64)
   n_encoder_layers: 6 # Shared encoder depth (recursive)
-  n_decoder_layers: 2 # Shallow decoder (MAE-style)
+  n_io_layers: 1 # Shallow decoder (MAE-style)
   d_ff: 2048 # FFN dimension (4x d_model)
   dropout: 0.1
 

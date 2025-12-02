@@ -241,7 +241,7 @@ class GateMLP(nn.Module):
         return gate_output
 
 class RDT(nn.Module):
-    def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_decoder_layers=1, 
+    def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_io_layers=1, 
                  d_ff=2048, dropout=0.1, max_seq_len=512, decoder_type='transformer', 
                  gate_hidden_dim=256, gradient_checkpointing=False):
         super().__init__()
@@ -257,7 +257,7 @@ class RDT(nn.Module):
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, 
             dropout=dropout, batch_first=True
         )
-        self.input_encoder = nn.TransformerEncoder(input_encoder_layer, num_layers=2)
+        self.input_encoder = nn.TransformerEncoder(input_encoder_layer, num_layers=n_io_layers)
         self.input_norm = nn.LayerNorm(d_model)
         
         # Noise Level Embedding
@@ -274,7 +274,7 @@ class RDT(nn.Module):
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
             dropout=dropout, batch_first=True
         )
-        self.output_decoder = nn.TransformerEncoder(output_decoder_layer, num_layers=2)
+        self.output_decoder = nn.TransformerEncoder(output_decoder_layer, num_layers=n_io_layers)
         self.output_projection = nn.Linear(d_model, vocab_size)
             
         self.gate = GateMLP(d_model, gate_hidden_dim)
