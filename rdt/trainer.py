@@ -38,6 +38,7 @@ class RDTTrainer:
         self.loss_weight_recon = config['training']['loss_weight_recon']
         self.loss_weight_gate = config['training']['loss_weight_gate']
         self.loss_weight_aux = config['training'].get('loss_weight_aux', 0.1)
+        self.aux_ratio = config['training'].get('aux_ratio', 0.25)
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -196,25 +197,30 @@ class RDTTrainer:
             # Final Loss Calculation
             main_loss = accumulated_loss / max(1, num_valid_steps)
             
-            # === Auxiliary Loss: I/O Reconstruction ===
+            # === Auxiliary Loss: I/O Reconstruction (Sub-sampling) ===
             if self.loss_weight_aux > 0:
+                # Compute micro-batch size (at least 1 sample)
+                aux_batch_size = max(1, int(batch_size * self.aux_ratio))
+                
                 aux_loss = 0
                 num_aux_steps = 0
                 
-                # targets의 각 중간 step을 Input Encoder -> Output Decoder로 재구성
+                # Process sub-sampled batch (first aux_batch_size samples)
                 for step_idx in range(actual_max_length):
-                    step_target = targets[:, step_idx, :]  # [B, Seq]
+                    # Sub-sample targets and attention mask
+                    step_target = targets[:aux_batch_size, step_idx, :]  # [Aux_B, Seq]
+                    aux_attention_mask = attention_mask[:aux_batch_size, :]
                     
-                    # Input Encoder로 인코딩
+                    # Input Encoder
                     target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
                     target_emb = self.model.pos_encoding(target_emb)
-                    src_key_padding_mask = (attention_mask == 0)
+                    src_key_padding_mask = (aux_attention_mask == 0)
                     target_hidden = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
                     
-                    # Output Decoder로 디코딩
-                    recon_logits = self.model.decode(target_hidden, attention_mask)
+                    # Output Decoder
+                    recon_logits = self.model.decode(target_hidden, aux_attention_mask)
                     
-                    # Reconstruction Loss (전체 시퀀스, padding 제외)
+                    # Reconstruction Loss (padding excluded)
                     recon_logits_flat = recon_logits.reshape(-1, recon_logits.size(-1))
                     target_flat = step_target.reshape(-1)
                     step_aux_loss = self.recon_criterion(recon_logits_flat, target_flat)

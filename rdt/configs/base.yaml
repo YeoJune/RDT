@@ -14,9 +14,6 @@ model:
   gate_hidden_dim: 512 # Gate MLP hidden size
   threshold: 0.5 # Gate threshold for stopping criterion
 
-  # Decoder type: 'transformer' or 'linear'
-  decoder_type: "transformer" # Extreme case: just projection
-
   # Memory optimization
   gradient_checkpointing: false # Enable gradient checkpointing to save memory
 
@@ -32,6 +29,7 @@ training:
   loss_weight_recon: 1.0 # Reconstruction loss weight
   loss_weight_gate: 1.0 # Gate prediction loss weight
   loss_weight_aux: 0.1
+  aux_ratio: 0.2 # Auxiliary loss micro-batch ratio (0.0-1.0)
 
   # Optimization
   batch_size: 16
