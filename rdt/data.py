@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 import random
 import numpy as np
 from typing import List, Dict, Tuple, Iterator
+from tqdm import tqdm
 
 import os
 
@@ -229,7 +230,8 @@ class WikiTextDataset(Dataset):
     
     def _prepare_data(self) -> List[torch.Tensor]:
         tokenized = []
-        for item in self.dataset:
+        print("Tokenizing texts...")
+        for item in tqdm(self.dataset, desc="Tokenizing"):
             # BookCorpus, WikiText, Wikipedia all use 'text' field
             text = item.get('text', '').strip()
             if len(text) == 0: continue
