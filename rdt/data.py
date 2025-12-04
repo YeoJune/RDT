@@ -191,7 +191,7 @@ class WikiTextDataset(Dataset):
             print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
         elif 'wikipedia' in dataset_name.lower():
             # Wikipedia 20231101.en only has train split, so we need to split it
-            full_dataset = load_dataset('wikipedia', '20231101.en', split='train')
+            full_dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train')
             
             # Split: 95% train, 2.5% validation, 2.5% test
             total_size = len(full_dataset)
