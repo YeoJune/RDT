@@ -229,16 +229,35 @@ class WikiTextDataset(Dataset):
             print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
     
     def _prepare_data(self) -> List[torch.Tensor]:
+        """Tokenize dataset using fast batched processing with multiprocessing"""
+        print("Tokenizing texts with multiprocessing...")
+        
+        # Use HuggingFace's fast .map() method with batching and multiprocessing
+        def tokenize_function(examples):
+            return self.tokenizer(
+                examples['text'],
+                max_length=self.max_seq_length,
+                truncation=True,
+                padding=False,
+            )
+        
+        # Apply tokenization with multiprocessing (num_proc=4 for parallel processing)
+        tokenized_dataset = self.dataset.map(
+            tokenize_function,
+            batched=True,
+            batch_size=1000,
+            num_proc=4,
+            remove_columns=self.dataset.column_names,
+            desc="Tokenizing"
+        )
+        
+        # Convert to list of tensors, filtering out short sequences
         tokenized = []
-        print("Tokenizing texts...")
-        for item in tqdm(self.dataset, desc="Tokenizing"):
-            # BookCorpus, WikiText, Wikipedia all use 'text' field
-            text = item.get('text', '').strip()
-            if len(text) == 0: continue
-            encoded = self.tokenizer(text, max_length=self.max_seq_length, truncation=True, padding=False, return_tensors='pt')
-            tokens = encoded['input_ids'].squeeze(0)
-            if len(tokens) < 10: continue
-            tokenized.append(tokens)
+        for item in tqdm(tokenized_dataset, desc="Processing tokens"):
+            tokens = torch.tensor(item['input_ids'], dtype=torch.long)
+            if len(tokens) >= 10:
+                tokenized.append(tokens)
+        
         return tokenized
     
     def __len__(self):
