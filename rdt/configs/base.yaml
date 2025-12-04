@@ -23,7 +23,7 @@ training:
   max_chain_length: 5 # L: length of training segment
   total_steps: 20 # N: total denoising steps (100% → 0%)
   masking_strategy: "shuffle" # 'shuffle' (index-based)
-  visible_loss_ratio: 0.15 # Visible 중에서도 loss 계산할 비율 (안정화)
+  visible_loss_ratio: 0.1 # Visible 중에서도 loss 계산할 비율 (안정화)
 
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
@@ -57,7 +57,7 @@ data:
   streaming: false # true: buffer-based on-the-fly loading, false: download all at once
   max_seq_length: 128 # Maximum sequence length
   mask_token: "[MASK]"
-  samples_per_text: 10 # Number of random samples to generate per text
+  samples_per_text: 1 # Number of random samples to generate per text
 
   # Tokenizer
   tokenizer_name: "bert-base-uncased" # Using standard BERT tokenizer

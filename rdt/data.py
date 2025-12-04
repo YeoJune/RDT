@@ -33,7 +33,7 @@ class WikiTextDataset(Dataset):
             # BookCorpus only has train split, so we need to split it
             if streaming:
                 # Streaming mode: load full dataset
-                full_dataset = load_dataset('bookcorpus/bookcorpus', split='train', streaming=True)
+                full_dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=True)
                 # Note: Cannot easily split streaming dataset, so we just use all data
                 # User should set streaming=False for bookcorpus if they want proper splits
                 self.dataset = full_dataset
@@ -41,7 +41,7 @@ class WikiTextDataset(Dataset):
                 print(f"BookCorpus loaded in streaming mode (split not supported)")
             else:
                 # Normal mode: load and split
-                full_dataset = load_dataset('bookcorpus/bookcorpus', split='train')
+                full_dataset = load_dataset('rojagtap/bookcorpus', split='train')
                 
                 # Split: 95% train, 2.5% validation, 2.5% test
                 total_size = len(full_dataset)
