@@ -34,6 +34,10 @@ class StreamingTextDataset(IterableDataset):
         if 'bookcorpus' in dataset_name.lower():
             self.dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=True)
             print(f"BookCorpus loaded in streaming mode (split not supported)")
+        elif 'wikipedia' in dataset_name.lower():
+            # Wikipedia 20231101.en - only train split available
+            self.dataset = load_dataset('wikipedia', '20231101.en', split='train', streaming=True)
+            print(f"Wikipedia 20231101.en loaded in streaming mode (split not supported)")
         else:
             dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
             self.dataset = load_dataset('wikitext', dataset_config, split=split, streaming=True)
@@ -184,6 +188,37 @@ class WikiTextDataset(Dataset):
             self.tokenized_data = self._prepare_data()
             print(f"BookCorpus {split} split: {len(self.tokenized_data)} sequences")
             print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
+        elif 'wikipedia' in dataset_name.lower():
+            # Wikipedia 20231101.en only has train split, so we need to split it
+            full_dataset = load_dataset('wikipedia', '20231101.en', split='train')
+            
+            # Split: 95% train, 2.5% validation, 2.5% test
+            total_size = len(full_dataset)
+            train_size = int(0.95 * total_size)
+            val_size = int(0.025 * total_size)
+            test_size = total_size - train_size - val_size
+            
+            splits = full_dataset.train_test_split(test_size=val_size + test_size, seed=42)
+            train_data = splits['train']
+            remaining = splits['test']
+            
+            val_test_splits = remaining.train_test_split(test_size=test_size, seed=42)
+            val_data = val_test_splits['train']
+            test_data = val_test_splits['test']
+            
+            # Select appropriate split
+            if split == 'train':
+                self.dataset = train_data
+            elif split == 'validation':
+                self.dataset = val_data
+            elif split == 'test':
+                self.dataset = test_data
+            else:
+                raise ValueError(f"Invalid split: {split}")
+            
+            self.tokenized_data = self._prepare_data()
+            print(f"Wikipedia 20231101.en {split} split: {len(self.tokenized_data)} sequences")
+            print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
         else:
             # WikiText datasets
             dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
@@ -195,7 +230,7 @@ class WikiTextDataset(Dataset):
     def _prepare_data(self) -> List[torch.Tensor]:
         tokenized = []
         for item in self.dataset:
-            # BookCorpus uses 'text' field, WikiText also uses 'text'
+            # BookCorpus, WikiText, Wikipedia all use 'text' field
             text = item.get('text', '').strip()
             if len(text) == 0: continue
             encoded = self.tokenizer(text, max_length=self.max_seq_length, truncation=True, padding=False, return_tensors='pt')
