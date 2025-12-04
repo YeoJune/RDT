@@ -245,7 +245,7 @@ class WikiTextDataset(Dataset):
         tokenized_dataset = self.dataset.map(
             tokenize_function,
             batched=True,
-            batch_size=1000,
+            batch_size=4096,
             num_proc=4,
             remove_columns=self.dataset.column_names,
             desc="Tokenizing"
