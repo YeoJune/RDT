@@ -12,79 +12,185 @@ import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+
+class StreamingTextDataset(IterableDataset):
+    """Streaming dataset for on-the-fly loading without preloading all data"""
+    
+    def __init__(self, dataset_name='wikitext-2', split='train', tokenizer_name='bert-base-uncased',
+                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15):
+        self.dataset_name = dataset_name
+        self.split = split
+        self.max_seq_length = max_seq_length
+        self.total_steps = total_steps
+        self.max_chain_length = max_chain_length
+        self.visible_loss_ratio = visible_loss_ratio
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.mask_token_id = self.tokenizer.mask_token_id
+        
+        print(f"Loading {dataset_name} ({split}) in streaming mode...")
+        
+        # Load streaming dataset
+        if 'bookcorpus' in dataset_name.lower():
+            self.dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=True)
+            print(f"BookCorpus loaded in streaming mode (split not supported)")
+        else:
+            dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
+            self.dataset = load_dataset('wikitext', dataset_config, split=split, streaming=True)
+            print(f"Dataset loaded in streaming mode")
+    
+    def _process_text(self, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Process a single tokenized text into training sample"""
+        seq_len = len(tokens)
+        
+        # Random restore order
+        restore_order = torch.randperm(seq_len)
+        
+        # Random start step
+        max_start = self.total_steps
+        min_start = 1
+        start_step = random.randint(min_start, max_start)
+        chain_length = min(self.max_chain_length, start_step)
+        
+        inputs = []
+        gate_targets = []
+        
+        # Generate inputs for each step
+        for offset in range(chain_length):
+            step = start_step - offset
+            num_visible = int(seq_len * (1 - step / self.total_steps))
+            
+            visible_indices = restore_order[:num_visible]
+            masked_indices = restore_order[num_visible:]
+            
+            input_ids = tokens.clone()
+            if len(masked_indices) > 0:
+                input_ids[masked_indices] = self.mask_token_id
+            
+            inputs.append(input_ids)
+            gate_targets.append(step / self.total_steps * 20)
+        
+        # Generate targets and loss masks
+        targets = []
+        loss_masks = []
+        
+        for i in range(chain_length):
+            if i < chain_length - 1:
+                target = inputs[i + 1]
+                
+                current_step = start_step - i
+                next_step = start_step - (i + 1)
+                
+                current_visible = int(seq_len * (1 - current_step / self.total_steps))
+                next_visible = int(seq_len * (1 - next_step / self.total_steps))
+                
+                delta_indices = restore_order[current_visible:next_visible]
+                
+                mask_bool = torch.zeros(seq_len, dtype=torch.bool)
+                mask_bool[delta_indices] = True
+                
+                if current_visible > 0 and self.visible_loss_ratio > 0:
+                    num_maint = max(1, int(current_visible * self.visible_loss_ratio))
+                    perm = torch.randperm(current_visible)[:num_maint]
+                    maint_indices = restore_order[perm]
+                    mask_bool[maint_indices] = True
+            else:
+                target = tokens
+                
+                last_step = start_step - (chain_length - 1)
+                last_visible = int(seq_len * (1 - last_step / self.total_steps))
+                remaining_indices = restore_order[last_visible:]
+                
+                mask_bool = torch.zeros(seq_len, dtype=torch.bool)
+                mask_bool[remaining_indices] = True
+            
+            targets.append(target)
+            loss_masks.append(mask_bool)
+        
+        return {
+            'input': torch.stack(inputs),
+            'targets': torch.stack(targets),
+            'loss_masks': torch.stack(loss_masks),
+            'gate_targets': torch.tensor(gate_targets, dtype=torch.float),
+            'chain_length': chain_length
+        }
+    
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """Iterate over streaming dataset"""
+        for item in self.dataset:
+            text = item.get('text', '').strip()
+            if len(text) == 0:
+                continue
+            
+            encoded = self.tokenizer(text, max_length=self.max_seq_length, truncation=True, 
+                                   padding=False, return_tensors='pt')
+            tokens = encoded['input_ids'].squeeze(0)
+            
+            if len(tokens) < 10:
+                continue
+            
+            yield self._process_text(tokens)
+
+
 class WikiTextDataset(Dataset):
+    """Map-style dataset for preloading all data into memory"""
+    
     def __init__(self, dataset_name='wikitext-2', split='train', tokenizer_name='bert-base-uncased', 
                  max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15, samples_per_text=1, streaming=False):
+        if streaming:
+            raise ValueError("Use StreamingTextDataset for streaming mode instead")
+        
         self.split = split
         self.max_seq_length = max_seq_length
         self.total_steps = total_steps
         self.max_chain_length = max_chain_length
         self.visible_loss_ratio = visible_loss_ratio
         self.samples_per_text = samples_per_text
-        self.streaming = streaming
         
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.mask_token_id = self.tokenizer.mask_token_id
         
-        print(f"Loading {dataset_name} ({split}) [streaming={streaming}]...")
+        print(f"Loading {dataset_name} ({split})...")
         
         # Determine dataset source and config
         if 'bookcorpus' in dataset_name.lower():
             # BookCorpus only has train split, so we need to split it
-            if streaming:
-                # Streaming mode: load full dataset
-                full_dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=True)
-                # Note: Cannot easily split streaming dataset, so we just use all data
-                # User should set streaming=False for bookcorpus if they want proper splits
-                self.dataset = full_dataset
-                self.tokenized_data = None
-                print(f"BookCorpus loaded in streaming mode (split not supported)")
+            full_dataset = load_dataset('rojagtap/bookcorpus', split='train')
+            
+            # Split: 95% train, 2.5% validation, 2.5% test
+            total_size = len(full_dataset)
+            train_size = int(0.95 * total_size)
+            val_size = int(0.025 * total_size)
+            test_size = total_size - train_size - val_size
+            
+            splits = full_dataset.train_test_split(test_size=val_size + test_size, seed=42)
+            train_data = splits['train']
+            remaining = splits['test']
+            
+            val_test_splits = remaining.train_test_split(test_size=test_size, seed=42)
+            val_data = val_test_splits['train']
+            test_data = val_test_splits['test']
+            
+            # Select appropriate split
+            if split == 'train':
+                self.dataset = train_data
+            elif split == 'validation':
+                self.dataset = val_data
+            elif split == 'test':
+                self.dataset = test_data
             else:
-                # Normal mode: load and split
-                full_dataset = load_dataset('rojagtap/bookcorpus', split='train')
-                
-                # Split: 95% train, 2.5% validation, 2.5% test
-                total_size = len(full_dataset)
-                train_size = int(0.95 * total_size)
-                val_size = int(0.025 * total_size)
-                test_size = total_size - train_size - val_size
-                
-                splits = full_dataset.train_test_split(test_size=val_size + test_size, seed=42)
-                train_data = splits['train']
-                remaining = splits['test']
-                
-                val_test_splits = remaining.train_test_split(test_size=test_size, seed=42)
-                val_data = val_test_splits['train']
-                test_data = val_test_splits['test']
-                
-                # Select appropriate split
-                if split == 'train':
-                    self.dataset = train_data
-                elif split == 'validation':
-                    self.dataset = val_data
-                elif split == 'test':
-                    self.dataset = test_data
-                else:
-                    raise ValueError(f"Invalid split: {split}")
-                
-                self.tokenized_data = self._prepare_data()
-                print(f"BookCorpus {split} split: {len(self.tokenized_data)} sequences")
-                print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
+                raise ValueError(f"Invalid split: {split}")
+            
+            self.tokenized_data = self._prepare_data()
+            print(f"BookCorpus {split} split: {len(self.tokenized_data)} sequences")
+            print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
         else:
             # WikiText datasets
             dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
-            
-            if streaming:
-                # Streaming mode: load dataset as IterableDataset
-                self.dataset = load_dataset('wikitext', dataset_config, split=split, streaming=True)
-                self.tokenized_data = None  # Not preloaded
-                print(f"Dataset loaded in streaming mode")
-            else:
-                # Normal mode: load all data at once
-                self.dataset = load_dataset('wikitext', dataset_config, split=split)
-                self.tokenized_data = self._prepare_data()
-                print(f"Dataset loaded: {len(self.tokenized_data)} sequences")
-                print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
+            self.dataset = load_dataset('wikitext', dataset_config, split=split)
+            self.tokenized_data = self._prepare_data()
+            print(f"Dataset loaded: {len(self.tokenized_data)} sequences")
+            print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
     
     def _prepare_data(self) -> List[torch.Tensor]:
         tokenized = []
@@ -99,8 +205,6 @@ class WikiTextDataset(Dataset):
         return tokenized
     
     def __len__(self):
-        if self.streaming:
-            raise NotImplementedError("Streaming dataset does not support __len__")
         return len(self.tokenized_data) * self.samples_per_text
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -225,38 +329,74 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     }
 
 def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
-    # 기존과 동일
     data_config = config['data']
     training_config = config['training']
     streaming = data_config.get('streaming', False)
     
-    train_dataset = WikiTextDataset(
-        dataset_name=data_config['dataset_name'],
-        split='train',
-        tokenizer_name=data_config['tokenizer_name'],
-        max_seq_length=data_config['max_seq_length'],
-        total_steps=training_config['total_steps'],
-        max_chain_length=training_config['max_chain_length'],
-        visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
-        samples_per_text=data_config.get('samples_per_text', 1),
-        streaming=streaming
-    )
-    
-    val_dataset = WikiTextDataset(
-        dataset_name=data_config['dataset_name'],
-        split='validation',
-        tokenizer_name=data_config['tokenizer_name'],
-        max_seq_length=data_config['max_seq_length'],
-        total_steps=training_config['total_steps'],
-        max_chain_length=training_config['max_chain_length'],
-        visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
-        samples_per_text=data_config.get('samples_per_text', 1),
-        streaming=streaming
-    )
-    
-    # Streaming mode does not support shuffle
-    train_shuffle = False if streaming else True
-    train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], shuffle=train_shuffle, num_workers=data_config['num_workers'], pin_memory=data_config['pin_memory'], collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=training_config['batch_size'], shuffle=False, num_workers=data_config['num_workers'], pin_memory=data_config['pin_memory'], collate_fn=collate_fn)
+    if streaming:
+        # Use StreamingTextDataset for streaming mode
+        train_dataset = StreamingTextDataset(
+            dataset_name=data_config['dataset_name'],
+            split='train',
+            tokenizer_name=data_config['tokenizer_name'],
+            max_seq_length=data_config['max_seq_length'],
+            total_steps=training_config['total_steps'],
+            max_chain_length=training_config['max_chain_length'],
+            visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15)
+        )
+        
+        val_dataset = StreamingTextDataset(
+            dataset_name=data_config['dataset_name'],
+            split='validation',
+            tokenizer_name=data_config['tokenizer_name'],
+            max_seq_length=data_config['max_seq_length'],
+            total_steps=training_config['total_steps'],
+            max_chain_length=training_config['max_chain_length'],
+            visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15)
+        )
+        
+        # Streaming datasets do not support shuffle
+        train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], 
+                                 num_workers=data_config['num_workers'], 
+                                 pin_memory=data_config['pin_memory'], 
+                                 collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=training_config['batch_size'], 
+                               num_workers=data_config['num_workers'], 
+                               pin_memory=data_config['pin_memory'], 
+                               collate_fn=collate_fn)
+    else:
+        # Use WikiTextDataset for normal mode
+        train_dataset = WikiTextDataset(
+            dataset_name=data_config['dataset_name'],
+            split='train',
+            tokenizer_name=data_config['tokenizer_name'],
+            max_seq_length=data_config['max_seq_length'],
+            total_steps=training_config['total_steps'],
+            max_chain_length=training_config['max_chain_length'],
+            visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
+            samples_per_text=data_config.get('samples_per_text', 1),
+            streaming=streaming
+        )
+        
+        val_dataset = WikiTextDataset(
+            dataset_name=data_config['dataset_name'],
+            split='validation',
+            tokenizer_name=data_config['tokenizer_name'],
+            max_seq_length=data_config['max_seq_length'],
+            total_steps=training_config['total_steps'],
+            max_chain_length=training_config['max_chain_length'],
+            visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
+            samples_per_text=data_config.get('samples_per_text', 1),
+            streaming=streaming
+        )
+        
+        train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], 
+                                 shuffle=True, num_workers=data_config['num_workers'], 
+                                 pin_memory=data_config['pin_memory'], 
+                                 collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=training_config['batch_size'], 
+                               shuffle=False, num_workers=data_config['num_workers'], 
+                               pin_memory=data_config['pin_memory'], 
+                               collate_fn=collate_fn)
     
     return train_loader, val_loader
