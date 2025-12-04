@@ -33,7 +33,9 @@ class RDTTrainer:
         self.device = device
         
         # Training config
-        self.num_epochs = config['training']['num_epochs']
+        self.training_mode = config['training'].get('training_mode', 'epoch')
+        self.num_epochs = config['training'].get('num_epochs', 10)
+        self.max_training_steps = config['training'].get('max_training_steps', 100000)
         self.max_grad_norm = config['training']['max_grad_norm']
         self.loss_weight_recon = config['training']['loss_weight_recon']
         self.loss_weight_gate = config['training']['loss_weight_gate']
@@ -69,7 +71,12 @@ class RDTTrainer:
         
         # Checkpointing
         self.checkpoint_dir = config['output']['checkpoint_dir']
-        self.save_every_n_epochs = config['training']['save_every_n_epochs']
+        if self.training_mode == 'epoch':
+            self.save_every_n_epochs = config['training'].get('save_every_n_epochs', 1)
+            self.save_every_n_steps = None
+        else:  # step mode
+            self.save_every_n_steps = config['training'].get('save_every_n_steps', 10000)
+            self.save_every_n_epochs = None
         self.keep_last_n_checkpoints = config['training']['keep_last_n_checkpoints']
         
         # State
@@ -82,8 +89,11 @@ class RDTTrainer:
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""
-        # [수정] Accumulation 제거로 Total Steps 계산 단순화
-        total_steps = len(self.train_loader) * self.num_epochs
+        # Calculate total steps based on training mode
+        if self.training_mode == 'epoch':
+            total_steps = len(self.train_loader) * self.num_epochs
+        else:  # step mode
+            total_steps = self.max_training_steps
         
         if self.config['training']['scheduler'] == 'cosine':
             scheduler = optim.lr_scheduler.OneCycleLR(
@@ -318,7 +328,13 @@ class RDTTrainer:
         return total_loss / num_batches, total_recon / num_batches, total_gate / num_batches
 
     def train(self):
-        print(f"\nStarting training for {self.num_epochs} epochs...")
+        if self.training_mode == 'epoch':
+            self._train_by_epoch()
+        else:
+            self._train_by_step()
+    
+    def _train_by_epoch(self):
+        print(f"\nStarting epoch-based training for {self.num_epochs} epochs...")
         best_val_loss = float('inf')
         
         for epoch in range(self.num_epochs):
@@ -358,6 +374,58 @@ class RDTTrainer:
             if (epoch + 1) % self.save_every_n_epochs == 0:
                 save_checkpoint(self.model, self.optimizer, self.scheduler, epoch, self.global_step, epoch_loss/len(self.train_loader), self.config, self.checkpoint_dir)
                 cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
+        
+        print("\nTraining completed!")
+        self.writer.close()
+    
+    def _train_by_step(self):
+        print(f"\nStarting step-based training for {self.max_training_steps} steps...")
+        best_val_loss = float('inf')
+        
+        step = 0
+        epoch = 0
+        
+        while step < self.max_training_steps:
+            self.current_epoch = epoch
+            sampling_prob = self.get_sampling_prob(epoch)
+            print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
+            
+            progress_bar = tqdm(self.train_loader, desc=f"Training (Step {step})")
+            
+            for batch in progress_bar:
+                if step >= self.max_training_steps:
+                    break
+                
+                loss, recon, gate, aux = self.train_step(batch)
+                step += 1
+                self.global_step = step
+                
+                if step % self.log_every_n_steps == 0:
+                    self.writer.add_scalar('train/loss', loss, step)
+                    self.writer.add_scalar('train/recon_loss', recon, step)
+                    self.writer.add_scalar('train/gate_loss', gate, step)
+                    self.writer.add_scalar('train/aux_loss', aux, step)
+                    self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], step)
+                    self.writer.add_scalar('train/sampling_prob', sampling_prob, step)
+                
+                # Validation at regular step intervals
+                if step % 5000 == 0:
+                    val_loss, val_recon, val_gate = self.validate()
+                    print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
+                    self.writer.add_scalar('val/loss', val_loss, step)
+                    
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_checkpoint(self.model, self.optimizer, self.scheduler, epoch, step, val_loss, self.config, self.checkpoint_dir, 'best_model.pt')
+                
+                # Checkpoint
+                if step % self.save_every_n_steps == 0:
+                    save_checkpoint(self.model, self.optimizer, self.scheduler, epoch, step, loss, self.config, self.checkpoint_dir)
+                    cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
+                
+                progress_bar.set_postfix({'step': step, 'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
+            
+            epoch += 1
         
         print("\nTraining completed!")
         self.writer.close()
