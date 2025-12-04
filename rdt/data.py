@@ -37,7 +37,7 @@ class StreamingTextDataset(IterableDataset):
             print(f"BookCorpus loaded in streaming mode (split not supported)")
         elif 'wikipedia' in dataset_name.lower():
             # Wikipedia 20231101.en - only train split available
-            self.dataset = load_dataset('wikipedia', '20231101.en', split='train', streaming=True)
+            self.dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train', streaming=True)
             print(f"Wikipedia 20231101.en loaded in streaming mode (split not supported)")
         else:
             dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
