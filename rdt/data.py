@@ -252,6 +252,7 @@ class WikiTextDataset(Dataset):
             tokenize_function,
             batched=True,
             batch_size=1024,
+            num_proc=4,
             remove_columns=self.dataset.column_names,
             desc="Tokenizing"
         )
