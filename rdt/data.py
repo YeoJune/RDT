@@ -229,24 +229,29 @@ class WikiTextDataset(Dataset):
             print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
     
     def _prepare_data(self) -> List[torch.Tensor]:
-        """Tokenize dataset using fast batched processing with multiprocessing"""
-        print("Tokenizing texts with multiprocessing...")
+        """Tokenize dataset using fast batched processing"""
+        print("Tokenizing texts...")
         
-        # Use HuggingFace's fast .map() method with batching and multiprocessing
+        # Create tokenizer instance with name (not self.tokenizer to avoid pickle issues)
+        tokenizer_name = self.tokenizer.name_or_path
+        
+        # Use HuggingFace's fast .map() method with batching
         def tokenize_function(examples):
-            return self.tokenizer(
+            # Create tokenizer inside function to avoid multiprocessing pickle issues
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+            return tokenizer(
                 examples['text'],
                 max_length=self.max_seq_length,
                 truncation=True,
                 padding=False,
             )
         
-        # Apply tokenization with multiprocessing (num_proc=4 for parallel processing)
+        # Apply tokenization with batching (single process to avoid memory/pickle issues)
         tokenized_dataset = self.dataset.map(
             tokenize_function,
             batched=True,
-            batch_size=4096,
-            num_proc=4,
+            batch_size=1024,
             remove_columns=self.dataset.column_names,
             desc="Tokenizing"
         )
