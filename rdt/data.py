@@ -33,12 +33,39 @@ class StreamingTextDataset(IterableDataset):
         
         # Load streaming dataset
         if 'bookcorpus' in dataset_name.lower():
-            self.dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=True)
-            print(f"BookCorpus loaded in streaming mode (split not supported)")
+            # BookCorpus: use modulo-based split (standard approach for streaming)
+            full_dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=True)
+            
+            # Modulo-based filtering: deterministic and efficient
+            if split == 'train':
+                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 < 38, with_indices=True)  # 38/40 = 95%
+                print(f"BookCorpus train split in streaming mode (95%)")
+            elif split == 'validation':
+                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 == 38, with_indices=True)  # 1/40 = 2.5%
+                print(f"BookCorpus validation split in streaming mode (2.5%)")
+            elif split == 'test':
+                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 == 39, with_indices=True)  # 1/40 = 2.5%
+                print(f"BookCorpus test split in streaming mode (2.5%)")
+            else:
+                self.dataset = full_dataset
+                print(f"BookCorpus loaded in streaming mode (no split applied)")
         elif 'wikipedia' in dataset_name.lower():
-            # Wikipedia 20231101.en - only train split available
-            self.dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train', streaming=True)
-            print(f"Wikipedia 20231101.en loaded in streaming mode (split not supported)")
+            # Wikipedia 20231101.en: use modulo-based split
+            full_dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train', streaming=True)
+            
+            # Modulo-based filtering: deterministic and efficient
+            if split == 'train':
+                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 < 38, with_indices=True)  # 38/40 = 95%
+                print(f"Wikipedia train split in streaming mode (95%)")
+            elif split == 'validation':
+                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 == 38, with_indices=True)  # 1/40 = 2.5%
+                print(f"Wikipedia validation split in streaming mode (2.5%)")
+            elif split == 'test':
+                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 == 39, with_indices=True)  # 1/40 = 2.5%
+                print(f"Wikipedia test split in streaming mode (2.5%)")
+            else:
+                self.dataset = full_dataset
+                print(f"Wikipedia loaded in streaming mode (no split applied)")
         else:
             dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
             self.dataset = load_dataset('wikitext', dataset_config, split=split, streaming=True)
