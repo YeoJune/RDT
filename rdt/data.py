@@ -31,42 +31,15 @@ class StreamingTextDataset(IterableDataset):
         
         print(f"Loading {dataset_name} ({split}) in streaming mode...")
         
-        # Load streaming dataset
+        # Load streaming dataset (split processing will be done in __iter__)
         if 'bookcorpus' in dataset_name.lower():
-            # BookCorpus: use modulo-based split (standard approach for streaming)
-            full_dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=True)
-            
-            # Modulo-based filtering: deterministic and efficient
-            if split == 'train':
-                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 < 38, with_indices=True)  # 38/40 = 95%
-                print(f"BookCorpus train split in streaming mode (95%)")
-            elif split == 'validation':
-                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 == 38, with_indices=True)  # 1/40 = 2.5%
-                print(f"BookCorpus validation split in streaming mode (2.5%)")
-            elif split == 'test':
-                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 == 39, with_indices=True)  # 1/40 = 2.5%
-                print(f"BookCorpus test split in streaming mode (2.5%)")
-            else:
-                self.dataset = full_dataset
-                print(f"BookCorpus loaded in streaming mode (no split applied)")
+            self.dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=True)
+            print(f"BookCorpus loaded in streaming mode")
         elif 'wikipedia' in dataset_name.lower():
-            # Wikipedia 20231101.en: use modulo-based split
-            full_dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train', streaming=True)
-            
-            # Modulo-based filtering: deterministic and efficient
-            if split == 'train':
-                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 < 38, with_indices=True)  # 38/40 = 95%
-                print(f"Wikipedia train split in streaming mode (95%)")
-            elif split == 'validation':
-                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 == 38, with_indices=True)  # 1/40 = 2.5%
-                print(f"Wikipedia validation split in streaming mode (2.5%)")
-            elif split == 'test':
-                self.dataset = full_dataset.filter(lambda example, idx: idx % 40 == 39, with_indices=True)  # 1/40 = 2.5%
-                print(f"Wikipedia test split in streaming mode (2.5%)")
-            else:
-                self.dataset = full_dataset
-                print(f"Wikipedia loaded in streaming mode (no split applied)")
+            self.dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train', streaming=True)
+            print(f"Wikipedia 20231101.en loaded in streaming mode")
         else:
+            # WikiText already has splits
             dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
             self.dataset = load_dataset('wikitext', dataset_config, split=split, streaming=True)
             print(f"Dataset loaded in streaming mode")
@@ -148,13 +121,38 @@ class StreamingTextDataset(IterableDataset):
         }
     
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        """Iterate over streaming dataset"""
-        for item in self.dataset:
+        """Iterate over streaming dataset with manual splitting and multi-worker support"""
+        
+        # Multi-worker support: prevent data duplication
+        worker_info = torch.utils.data.get_worker_info()
+        
+        for idx, item in enumerate(self.dataset):
+            # 1. Multi-worker handling: each worker processes different subset
+            if worker_info is not None:
+                if idx % worker_info.num_workers != worker_info.id:
+                    continue
+            
+            # 2. Train/Val/Test split for datasets without built-in splits (BookCorpus, Wikipedia)
+            if 'bookcorpus' in self.dataset_name.lower() or 'wikipedia' in self.dataset_name.lower():
+                # Modulo-based split: 40 items → 38 train (95%), 1 val (2.5%), 1 test (2.5%)
+                mod = idx % 40
+                
+                if self.split == 'train':
+                    if mod >= 38:  # Skip indices 38, 39
+                        continue
+                elif self.split == 'validation':
+                    if mod != 38:  # Only take index 38
+                        continue
+                elif self.split == 'test':
+                    if mod != 39:  # Only take index 39
+                        continue
+            
+            # 3. Process text
             text = item.get('text', '').strip()
             if len(text) == 0:
                 continue
             
-            encoded = self.tokenizer(text, max_length=self.max_seq_length, truncation=True, 
+            encoded = self.tokenizer(text, max_length=self.max_seq_length, truncation=True,
                                    padding=False, return_tensors='pt')
             tokens = encoded['input_ids'].squeeze(0)
             
