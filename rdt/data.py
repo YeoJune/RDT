@@ -1,4 +1,4 @@
-"""Data loading and preprocessing for RDT with disk caching"""
+"""Data loading and preprocessing for RDT"""
 
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset
@@ -8,9 +8,6 @@ import random
 import numpy as np
 from typing import List, Dict, Tuple, Iterator
 from tqdm import tqdm
-import hashlib
-import pickle
-from pathlib import Path
 
 import os
 
@@ -141,11 +138,10 @@ class StreamingTextDataset(IterableDataset):
 
 
 class WikiTextDataset(Dataset):
-    """Map-style dataset with disk caching for memory efficiency"""
+    """Map-style dataset for preloading all data into memory"""
     
     def __init__(self, dataset_name='wikitext-2', split='train', tokenizer_name='bert-base-uncased', 
-                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15, 
-                 samples_per_text=1, streaming=False, cache_dir='./cache'):
+                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15, samples_per_text=1, streaming=False):
         if streaming:
             raise ValueError("Use StreamingTextDataset for streaming mode instead")
         
@@ -155,7 +151,6 @@ class WikiTextDataset(Dataset):
         self.max_chain_length = max_chain_length
         self.visible_loss_ratio = visible_loss_ratio
         self.samples_per_text = samples_per_text
-        self.cache_dir = cache_dir
         
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.mask_token_id = self.tokenizer.mask_token_id
@@ -191,9 +186,9 @@ class WikiTextDataset(Dataset):
             else:
                 raise ValueError(f"Invalid split: {split}")
             
-            self.dataset_builder_name = 'bookcorpus'
-            self.dataset_config_name = 'default'
-            
+            self.tokenized_data = self._prepare_data()
+            print(f"BookCorpus {split} split: {len(self.tokenized_data)} sequences")
+            print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
         elif 'wikipedia' in dataset_name.lower():
             # Wikipedia 20231101.en only has train split, so we need to split it
             full_dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train')
@@ -222,48 +217,27 @@ class WikiTextDataset(Dataset):
             else:
                 raise ValueError(f"Invalid split: {split}")
             
-            self.dataset_builder_name = 'wikipedia'
-            self.dataset_config_name = '20231101.en'
-            
+            self.tokenized_data = self._prepare_data()
+            print(f"Wikipedia 20231101.en {split} split: {len(self.tokenized_data)} sequences")
+            print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
         else:
             # WikiText datasets
             dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
             self.dataset = load_dataset('wikitext', dataset_config, split=split)
-            self.dataset_builder_name = 'wikitext'
-            self.dataset_config_name = dataset_config
-        
-        # Load or create tokenized data with caching
-        self.tokenized_data = self._prepare_data()
-        
-        print(f"Dataset loaded: {len(self.tokenized_data)} sequences")
-        print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
+            self.tokenized_data = self._prepare_data()
+            print(f"Dataset loaded: {len(self.tokenized_data)} sequences")
+            print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
     
     def _prepare_data(self) -> List[torch.Tensor]:
-        """Tokenize dataset using disk cache"""
-        
-        # Create cache directory with dataset-specific naming
-        dataset_identifier = f"{self.dataset_builder_name}_{self.dataset_config_name}_{self.split}_{self.max_seq_length}"
-        dataset_hash = hashlib.md5(dataset_identifier.encode()).hexdigest()[:8]
-        
-        cache_path = Path(self.cache_dir) / self.dataset_builder_name
-        cache_path.mkdir(parents=True, exist_ok=True)
-        
-        cache_file = cache_path / f"tokenized_{self.split}_{dataset_hash}.pkl"
-        
-        # Load from cache if exists
-        if cache_file.exists():
-            print(f"Loading from cache: {cache_file}")
-            with open(cache_file, 'rb') as f:
-                tokenized = pickle.load(f)
-            print(f"Loaded {len(tokenized)} sequences")
-            return tokenized
-        
-        # Tokenize using HuggingFace datasets map with multiprocessing
+        """Tokenize dataset using fast batched processing"""
         print("Tokenizing texts...")
         
+        # Create tokenizer instance with name (not self.tokenizer to avoid pickle issues)
         tokenizer_name = self.tokenizer.name_or_path
         
+        # Use HuggingFace's fast .map() method with batching
         def tokenize_function(examples):
+            # Create tokenizer inside function to avoid multiprocessing pickle issues
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
             return tokenizer(
@@ -273,26 +247,22 @@ class WikiTextDataset(Dataset):
                 padding=False,
             )
         
-        # Use datasets' built-in parallel processing
+        # Apply tokenization with batching (single process to avoid memory/pickle issues)
         tokenized_dataset = self.dataset.map(
             tokenize_function,
             batched=True,
-            batch_size=1000,
+            batch_size=1024,
             num_proc=4,
             remove_columns=self.dataset.column_names,
             desc="Tokenizing"
         )
         
-        # Convert to list of tensors
+        # Convert to list of tensors, filtering out short sequences
         tokenized = []
-        for item in tqdm(tokenized_dataset, desc="Converting to tensors"):
-            if len(item['input_ids']) >= 10:
-                tokenized.append(torch.tensor(item['input_ids'], dtype=torch.long))
-        
-        # Save cache
-        print(f"Saving cache: {cache_file}")
-        with open(cache_file, 'wb') as f:
-            pickle.dump(tokenized, f, protocol=pickle.HIGHEST_PROTOCOL)
+        for item in tqdm(tokenized_dataset, desc="Processing tokens"):
+            tokens = torch.tensor(item['input_ids'], dtype=torch.long)
+            if len(tokens) >= 10:
+                tokenized.append(tokens)
         
         return tokenized
     
@@ -424,7 +394,6 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     data_config = config['data']
     training_config = config['training']
     streaming = data_config.get('streaming', False)
-    cache_dir = data_config.get('cache_dir', './cache')
     
     if streaming:
         # Use StreamingTextDataset for streaming mode
@@ -458,7 +427,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
                                pin_memory=data_config['pin_memory'], 
                                collate_fn=collate_fn)
     else:
-        # Use WikiTextDataset for normal mode with caching
+        # Use WikiTextDataset for normal mode
         train_dataset = WikiTextDataset(
             dataset_name=data_config['dataset_name'],
             split='train',
@@ -468,8 +437,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             max_chain_length=training_config['max_chain_length'],
             visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
             samples_per_text=data_config.get('samples_per_text', 1),
-            streaming=streaming,
-            cache_dir=cache_dir
+            streaming=streaming
         )
         
         val_dataset = WikiTextDataset(
@@ -481,8 +449,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             max_chain_length=training_config['max_chain_length'],
             visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
             samples_per_text=data_config.get('samples_per_text', 1),
-            streaming=streaming,
-            cache_dir=cache_dir
+            streaming=streaming
         )
         
         train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], 
