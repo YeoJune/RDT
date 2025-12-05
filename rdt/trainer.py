@@ -61,6 +61,8 @@ class RDTTrainer:
         log_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=log_dir)
         self.log_every_n_steps = config['output']['log_every_n_steps']
+        self.eval_every_n_epochs = config['output'].get('eval_every_n_epochs', 1)
+        self.eval_every_n_steps = config['output'].get('eval_every_n_steps', 5000)
 
         # AMP
         self.use_amp = config.get('mixed_precision', False)
@@ -361,7 +363,7 @@ class RDTTrainer:
                 progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
             
             # Validation
-            if (epoch + 1) % self.config['output']['eval_every_n_epochs'] == 0:
+            if (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_loss, val_recon, val_gate = self.validate()
                 print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
                 self.writer.add_scalar('val/loss', val_loss, epoch)
@@ -409,7 +411,7 @@ class RDTTrainer:
                     self.writer.add_scalar('train/sampling_prob', sampling_prob, step)
                 
                 # Validation at regular step intervals
-                if step % 5000 == 0:
+                if step % self.eval_every_n_steps == 0:
                     val_loss, val_recon, val_gate = self.validate()
                     print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
                     self.writer.add_scalar('val/loss', val_loss, step)
