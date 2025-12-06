@@ -148,20 +148,34 @@ def visualize_results(mask_ratios, accuracies, steps, save_path=None):
     plt.show()
 
 
-def load_test_texts(tokenizer, split='test', num_samples=100):
-    """Load test texts from WikiText"""
-    from datasets import load_dataset
+def load_test_texts(config, num_samples=100):
+    """Load test texts using WikiTextDataset"""
+    from rdt.data import WikiTextDataset
     
-    print(f"Loading test data...")
-    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
+    print(f"Loading test data from {config['data']['dataset_name']}...")
     
+    # Create dataset using existing WikiTextDataset (same logic as training)
+    dataset = WikiTextDataset(
+        dataset_name=config['data']['dataset_name'],
+        split='test',
+        tokenizer_name=config['data']['tokenizer_name'],
+        max_seq_length=config['data']['max_seq_length'],
+        total_steps=config['training']['total_steps'],
+        max_chain_length=config['training']['max_chain_length'],
+        visible_loss_ratio=config['training'].get('visible_loss_ratio', 0.15),
+        samples_per_text=1,
+        streaming=False  # Use non-streaming for test
+    )
+    
+    # Extract raw texts from tokenized data
     texts = []
-    for item in dataset:
-        text = item['text'].strip()
+    tokenizer = dataset.tokenizer
+    
+    for tokens in dataset.tokenized_data[:num_samples]:
+        # Decode tokens back to text
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
         if len(text) > 50:  # Only use substantial texts
             texts.append(text)
-        if len(texts) >= num_samples:
-            break
     
     return texts
 
@@ -223,7 +237,7 @@ def main():
     print(f"Model loaded (epoch {checkpoint['epoch']}, step {checkpoint['step']})")
     
     # Load test data
-    test_texts = load_test_texts(tokenizer, num_samples=args.num_samples)
+    test_texts = load_test_texts(config, num_samples=args.num_samples)
     print(f"Loaded {len(test_texts)} test texts")
     
     # Define masking ratios (0% to 100%)
