@@ -47,7 +47,7 @@ def calculate_accuracy(pred_tokens, target_tokens, eval_mask):
     return correct / total
 
 
-def test_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, max_steps=20, threshold=20):
+def test_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, max_steps=20, threshold=0.5):
     """Test model across different masking levels"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
@@ -246,7 +246,7 @@ def main():
     # Test model
     accuracies, steps = test_model(
         model, tokenizer, test_texts, mask_ratios, 
-        device, config['data']['max_seq_length'], config['training']['total_steps'], config['model']['threshold']
+        device, config['data']['max_seq_length'], args.max_steps, config['model']['threshold']
     )
     
     # Print results

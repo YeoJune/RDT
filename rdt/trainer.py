@@ -138,7 +138,7 @@ class RDTTrainer:
         targets = batch['targets'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)
         loss_masks = batch['loss_masks'].to(self.device)
-        gate_targets = batch['gate_targets'].to(self.device)
+        gate_targets = batch['gate_targets'].to(self.device)  # [B, L+1] - s_0~s_L의 step
         chain_lengths = batch['chain_lengths']
         
         batch_size, seq_len = input_tokens.shape
@@ -153,12 +153,29 @@ class RDTTrainer:
         sampling_prob = self.get_sampling_prob(self.current_epoch)
         
         with torch.amp.autocast('cuda', enabled=self.use_amp):
-            # 1. First Forward (with Scheduled Sampling)
-            step_gt_timestep = gate_targets[:, 0].unsqueeze(1)  # [B, 1]
+            # 0. Initial embedding and gate prediction for h_0
+            # s_0 -> input_encoder -> h_0
+            # h_0 -> gate -> gate_pred_0 (should predict s_0's step)
+            init_emb = self.model.token_embedding(input_tokens) * math.sqrt(self.model.d_model)
+            init_emb = self.model.pos_encoding(init_emb)
+            src_key_padding_mask = (attention_mask == 0)
+            h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
+            h_0 = self.model.input_norm(h_0)
+            gate_pred_0 = self.model.gate(h_0, attention_mask)
+            
+            # Gate Loss for h_0 (predicting s_0's step)
+            gate_target_0 = gate_targets[:, 0].unsqueeze(1)  # s_0의 step
+            gate_loss_0 = self.gate_criterion(gate_pred_0, gate_target_0)
+            accumulated_loss = self.loss_weight_gate * gate_loss_0
+            total_gate_loss += gate_loss_0.item()
+            num_valid_steps += 1
+            
+            # 1. First main encoder forward: h_0 -> h_1
+            step_gt_timestep = gate_targets[:, 1].unsqueeze(1)  # s_1의 step (for scheduled sampling)
             hidden, gate_pred = self.model(
-                input_tokens,
+                h_0,  # Pass h_0 directly
                 attention_mask=attention_mask,
-                is_first_step=True,
+                is_first_step=False,  # Already processed by input_encoder
                 gt_timestep=step_gt_timestep,
                 sampling_prob=sampling_prob
             )
@@ -169,11 +186,10 @@ class RDTTrainer:
                 
                 step_targets = targets[:, step_idx, :]
                 step_loss_mask = loss_masks[:, step_idx, :]
-                step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
+                step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)  # L+1\uac1c \uc911 1~L\ubc88\uc9f8
                 
                 # 2. Reconstruction Loss (Masked Selection)
                 if step_loss_mask.sum() > 0:
-                    # Use decode method
                     logits = self.model.decode(hidden, attention_mask)
                     selected_logits = logits[step_loss_mask]
                     selected_targets = step_targets[step_loss_mask]
@@ -181,7 +197,7 @@ class RDTTrainer:
                 else:
                     recon_loss = torch.tensor(0.0, device=self.device)
                 
-                # 3. Gate Loss
+                # 3. Gate Loss (h_{step_idx+1}이 s_{step_idx+1}의 step 예측)
                 gate_pred_valid = gate_pred[valid_mask]
                 gate_target_valid = step_gate_targets[valid_mask]
                 gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.device)
@@ -196,7 +212,7 @@ class RDTTrainer:
                 
                 # Next Step (Recursive)
                 if step_idx < actual_max_length - 1:
-                    next_gt_timestep = gate_targets[:, step_idx + 1].unsqueeze(1)  # [B, 1]
+                    next_gt_timestep = gate_targets[:, step_idx + 2].unsqueeze(1)  # [B, 1]
                     hidden, gate_pred = self.model.forward(
                         hidden,
                         attention_mask=attention_mask,
@@ -217,16 +233,35 @@ class RDTTrainer:
                 aux_loss = 0
                 num_aux_steps = 0
                 
-                # Process sub-sampled batch (first aux_batch_size samples)
+                # Process input (s_0)
+                aux_input = input_ids[:aux_batch_size, :]  # [Aux_B, Seq]
+                aux_attention_mask = attention_mask[:aux_batch_size, :]
+                
+                # Input Encoder
+                input_emb = self.model.token_embedding(aux_input) * math.sqrt(self.model.d_model)
+                input_emb = self.model.pos_encoding(input_emb)
+                src_key_padding_mask = (aux_attention_mask == 0)
+                input_hidden = self.model.input_encoder(input_emb, src_key_padding_mask=src_key_padding_mask)
+                
+                # Output Decoder
+                recon_logits = self.model.decode(input_hidden, aux_attention_mask)
+                
+                # Reconstruction Loss (padding excluded)
+                recon_logits_flat = recon_logits.reshape(-1, recon_logits.size(-1))
+                input_flat = aux_input.reshape(-1)
+                step_aux_loss = self.recon_criterion(recon_logits_flat, input_flat)
+                
+                aux_loss += step_aux_loss
+                num_aux_steps += 1
+                
+                # Process sub-sampled batch targets (s_1 ~ s_L)
                 for step_idx in range(actual_max_length):
                     # Sub-sample targets and attention mask
                     step_target = targets[:aux_batch_size, step_idx, :]  # [Aux_B, Seq]
-                    aux_attention_mask = attention_mask[:aux_batch_size, :]
                     
                     # Input Encoder
                     target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
                     target_emb = self.model.pos_encoding(target_emb)
-                    src_key_padding_mask = (aux_attention_mask == 0)
                     target_hidden = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
                     
                     # Output Decoder
@@ -270,7 +305,7 @@ class RDTTrainer:
                 targets = batch['targets'].to(self.device)
                 loss_masks = batch['loss_masks'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
-                gate_targets = batch['gate_targets'].to(self.device)
+                gate_targets = batch['gate_targets'].to(self.device)  # [B, L+1] - s_0~s_L의 step
                 chain_lengths = batch['chain_lengths']
                 
                 actual_max_length = chain_lengths.max().item()
@@ -278,10 +313,24 @@ class RDTTrainer:
                 batch_gate = 0
                 num_valid = 0
                 
+                # 0. Initial embedding and gate prediction for h_0
+                init_emb = self.model.token_embedding(input_tokens) * math.sqrt(self.model.d_model)
+                init_emb = self.model.pos_encoding(init_emb)
+                src_key_padding_mask = (attention_mask == 0)
+                h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
+                h_0 = self.model.input_norm(h_0)
+                gate_pred_0 = self.model.gate(h_0, attention_mask)
+                
+                # Gate Loss for h_0
+                gate_target_0 = gate_targets[:, 0].unsqueeze(1)
+                gate_loss_0 = self.gate_criterion(gate_pred_0, gate_target_0)
+                batch_gate += gate_loss_0.item()
+                num_valid += 1
+                
                 hidden, gate_pred = self.model(
-                    input_tokens, 
+                    h_0,
                     attention_mask=attention_mask, 
-                    is_first_step=True
+                    is_first_step=False
                 )
                 
                 for step_idx in range(actual_max_length):
@@ -290,7 +339,7 @@ class RDTTrainer:
                     
                     step_targets = targets[:, step_idx, :]
                     step_loss_mask = loss_masks[:, step_idx, :]
-                    step_gate_targets = gate_targets[:, step_idx].unsqueeze(1)
+                    step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)  # L+1\uac1c \uc911 1~L\ubc88\uc9f8
                     
                     if step_loss_mask.sum() > 0:
                         logits = self.model.decode(hidden, attention_mask)

@@ -8,7 +8,7 @@ from rdt.model import RDT
 from rdt.utils import load_config, load_checkpoint, get_device
 
 
-def inference_interactive(model, tokenizer, device, max_steps=20, threshold=20):
+def inference_interactive(model, tokenizer, device, max_steps=20, threshold=0.5):
     """Interactive inference mode"""
     model.eval()
     
@@ -57,7 +57,7 @@ def inference_interactive(model, tokenizer, device, max_steps=20, threshold=20):
         print("-" * 50 + "\n")
 
 
-def inference_single(model, tokenizer, device, text, max_steps=20, threshold=20):
+def inference_single(model, tokenizer, device, text, max_steps=20, threshold=0.5):
     """Single text inference"""
     model.eval()
     
