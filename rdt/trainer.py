@@ -234,7 +234,7 @@ class RDTTrainer:
                 num_aux_steps = 0
                 
                 # Process input (s_0)
-                aux_input = input_ids[:aux_batch_size, :]  # [Aux_B, Seq]
+                aux_input = input_tokens[:aux_batch_size, :]  # [Aux_B, Seq]
                 aux_attention_mask = attention_mask[:aux_batch_size, :]
                 
                 # Input Encoder
