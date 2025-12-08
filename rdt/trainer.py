@@ -170,6 +170,9 @@ class RDTTrainer:
             total_gate_loss += gate_loss_0.item()
             num_valid_steps += 1
             
+            # Store hidden states for aux loss (if enabled)
+            hidden_states = [] if self.loss_weight_aux > 0 else None
+            
             # 1. First main encoder forward: h_0 -> h_1
             step_gt_timestep = gate_targets[:, 1].unsqueeze(1)  # s_1의 step (for scheduled sampling)
             hidden, gate_pred = self.model(
@@ -183,6 +186,10 @@ class RDTTrainer:
             for step_idx in range(actual_max_length):
                 valid_mask = chain_lengths > step_idx
                 if valid_mask.sum() == 0: break
+                
+                # Store hidden for aux loss
+                if hidden_states is not None:
+                    hidden_states.append(hidden.detach().clone())
                 
                 step_targets = targets[:, step_idx, :]
                 step_loss_mask = loss_masks[:, step_idx, :]
@@ -225,7 +232,7 @@ class RDTTrainer:
             # Final Loss Calculation
             main_loss = accumulated_loss / max(1, num_valid_steps)
             
-            # === Auxiliary Loss: I/O Reconstruction (Sub-sampling) ===
+            # === Auxiliary Loss: Latent Consistency (Sub-sampling) ===
             if self.loss_weight_aux > 0:
                 # Compute micro-batch size (at least 1 sample)
                 aux_batch_size = max(1, int(batch_size * self.aux_ratio))
@@ -233,46 +240,25 @@ class RDTTrainer:
                 aux_loss = 0
                 num_aux_steps = 0
                 
-                # Process input (s_0)
-                aux_input = input_tokens[:aux_batch_size, :]  # [Aux_B, Seq]
-                aux_attention_mask = attention_mask[:aux_batch_size, :]
+                src_key_padding_mask = (attention_mask[:aux_batch_size, :] == 0)
                 
-                # Input Encoder
-                input_emb = self.model.token_embedding(aux_input) * math.sqrt(self.model.d_model)
-                input_emb = self.model.pos_encoding(input_emb)
-                src_key_padding_mask = (aux_attention_mask == 0)
-                input_hidden = self.model.input_encoder(input_emb, src_key_padding_mask=src_key_padding_mask)
-                
-                # Output Decoder
-                recon_logits = self.model.decode(input_hidden, aux_attention_mask)
-                
-                # Reconstruction Loss (padding excluded)
-                recon_logits_flat = recon_logits.reshape(-1, recon_logits.size(-1))
-                input_flat = aux_input.reshape(-1)
-                step_aux_loss = self.recon_criterion(recon_logits_flat, input_flat)
-                
-                aux_loss += step_aux_loss
-                num_aux_steps += 1
-                
-                # Process sub-sampled batch targets (s_1 ~ s_L)
-                for step_idx in range(actual_max_length):
-                    # Sub-sample targets and attention mask
+                # Latent Consistency Loss for each step
+                for step_idx in range(len(hidden_states)):
+                    # 1. Ground Truth hidden: s_{i+1} -> input_encoder -> h_GT (detached!)
                     step_target = targets[:aux_batch_size, step_idx, :]  # [Aux_B, Seq]
                     
-                    # Input Encoder
-                    target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
-                    target_emb = self.model.pos_encoding(target_emb)
-                    target_hidden = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
+                    with torch.no_grad():
+                        target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
+                        target_emb = self.model.pos_encoding(target_emb)
+                        h_GT = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
+                        h_GT = h_GT.detach()  # Stop gradient!
                     
-                    # Output Decoder
-                    recon_logits = self.model.decode(target_hidden, aux_attention_mask)
+                    # 2. Predicted hidden: h_{i+1} (from main loop, already computed)
+                    h_pred = hidden_states[step_idx][:aux_batch_size]  # [Aux_B, Seq, D]
                     
-                    # Reconstruction Loss (padding excluded)
-                    recon_logits_flat = recon_logits.reshape(-1, recon_logits.size(-1))
-                    target_flat = step_target.reshape(-1)
-                    step_aux_loss = self.recon_criterion(recon_logits_flat, target_flat)
-                    
-                    aux_loss += step_aux_loss
+                    # 3. Latent Consistency Loss (MSE on hidden vectors)
+                    latent_loss = nn.functional.mse_loss(h_pred, h_GT)
+                    aux_loss += latent_loss
                     num_aux_steps += 1
                 
                 aux_loss = aux_loss / max(1, num_aux_steps)
