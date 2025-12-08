@@ -187,9 +187,9 @@ class RDTTrainer:
                 valid_mask = chain_lengths > step_idx
                 if valid_mask.sum() == 0: break
                 
-                # Store hidden for aux loss
+                # Store hidden for aux loss (gradient flow 유지!)
                 if hidden_states is not None:
-                    hidden_states.append(hidden.detach().clone())
+                    hidden_states.append(hidden)
                 
                 step_targets = targets[:, step_idx, :]
                 step_loss_mask = loss_masks[:, step_idx, :]
