@@ -52,7 +52,7 @@ class StreamingTextDataset(IterableDataset):
         restore_order = torch.randperm(seq_len)
         
         # Chain length is fixed, adjust start_step range
-        chain_length = self.max_chain_length
+        chain_length = random.randint(1, self.max_chain_length)
         max_start = self.total_steps
         min_start = chain_length  # s_L이 step 0이 되도록 보장
         start_step = random.randint(min_start, max_start)
