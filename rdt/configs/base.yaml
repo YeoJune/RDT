@@ -21,9 +21,9 @@ model:
 training:
   # Chain & Masking
   max_chain_length: 5 # L: length of training segment
-  total_steps: 20 # N: total denoising steps (100% → 0%)
+  total_steps: 10 # N: total denoising steps (100% → 0%)
   masking_strategy: "shuffle" # 'shuffle' (index-based)
-  visible_loss_ratio: 0.1 # Visible 중에서도 loss 계산할 비율 (안정화)
+  visible_loss_ratio: 0.0 # Visible 중에서도 loss 계산할 비율 (안정화)
 
   # BERT-style masking (for masked tokens)
   bert_masking:
@@ -35,8 +35,8 @@ training:
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
   loss_weight_gate: 1.0 # Gate prediction loss weight
-  loss_weight_aux: 0.1
-  aux_ratio: 0.25 # Auxiliary loss micro-batch ratio (0.0-1.0)
+  loss_weight_aux: 0.5
+  aux_ratio: 1.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
 
   # Optimization
   batch_size: 16
