@@ -1,169 +1,128 @@
 # RDT: Recursive Denoising Transformer
 
-A PyTorch implementation of Recursive Denoising Transformer, a model that learns to progressively denoise masked text through iterative refinement.
+> **An Iterative Text Refinement Framework via Diffusion-inspired Recursive Computation**
 
-## Architecture
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Pytorch](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
 
-- **Shared Encoder**: Recursive transformer encoder that refines latent representations
-- **Shallow Decoder**: Lightweight decoder (linear or 1-layer) for token generation
-- **Gate MLP**: Predicts remaining denoising steps for adaptive computation
+## 📄 Abstract
 
-## Key Features
+**Recursive Denoising Transformer (RDT)** proposes a novel architecture that bridges the gap between **Autoregressive Transformers** and **Denoising Diffusion Models**. Unlike traditional models that process input in a single pass, RDT employs a **state-aware recursive mechanism** to iteratively refine corrupted text representations.
 
-- **Progressive Denoising**: Trains on sequences with gradually decreasing mask ratios
-- **Adaptive Inference**: Gate-controlled recursive steps (easy inputs → fewer steps)
-- **Memory Efficient**: Chain sampling reduces VRAM usage during training
-- **Parameter Efficient**: Single encoder reused recursively
+By leveraging **Adaptive Layer Normalization (AdaLN)** conditioned on self-estimated timesteps, RDT dynamically modulates its computation path. This allows for parameter-efficient deep computation and continuous state refinement, enabling the model to reconstruct complex semantic structures from heavily masked inputs through successive iterations.
 
-## Installation
+---
+
+## 🧩 Methodology
+
+### 1. The Recursive Diffusion Process
+
+The core philosophy of RDT is to treat text generation as a reverse diffusion process ($s_0 \to s_1 \dots \to s_L$), where $s_0$ represents a highly corrupted state and $s_L$ represents the fully restored sequence.
+
+Instead of stacking distinct layers $L_1 \dots L_N$, RDT utilizes a **Shared Recursive Encoder** $\mathcal{F}_\theta$ that is applied repeatedly:
+
+$$ h*{t+1} = \mathcal{F}*\theta(h_t, \text{Emb}(t)) $$
+
+Where $h_t$ is the hidden state at step $t$, and $\text{Emb}(t)$ is the sinusoidal embedding of the current timestep.
+
+### 2. Model Architecture
+
+The architecture integrates concepts from **DiT (Diffusion Transformers)** into a recursive NLP framework.
+
+```mermaid
+graph LR
+    subgraph "Forward Process (Iteration t)"
+        Input[Hidden State h_t] --> Gate{Gate MLP}
+        Gate --"Step Estimation t"--> Time[Timestep Embedder]
+
+        Input --> Block[Recursive Transformer Block]
+        Time --"AdaLN Modulation (γ, β)"--> Block
+
+        Block --> Output[Hidden State h_t+1]
+    end
+
+    Output -.-> Input
+    Output --> Decoder[Token Projection]
+```
+
+#### A. Adaptive Layer Normalization (AdaLN)
+
+To effectively reuse weights across different denoising stages, the model must understand "time". We employ **AdaLN** to zero-initialize the control of the residual block and dynamically shift feature statistics based on the noise level:
+
+$$ \text{AdaLN}(x, t) = (1 + \gamma(t)) \cdot \text{LayerNorm}(x) + \beta(t) $$
+
+This allows the same physical layers to perform coarse structural repairs at early steps and fine-grained detailing at later steps.
+
+#### B. Self-Regulated Gating Mechanism
+
+RDT includes a lightweight **Gate MLP** that acts as an internal clock. It diagnoses the current entropy of the hidden state to predict the restoration progress (timestep $t$). This prediction is fed back into the next iteration as a condition, making the inference process autonomous.
+
+---
+
+## 📉 Optimization Objectives
+
+The model is trained using a multi-task objective function to ensure structural integrity and temporal coherence:
+
+$$ \mathcal{L}_{total} = \mathcal{L}_{recon} + \lambda*{gate}\mathcal{L}*{gate} + \lambda*{aux}\mathcal{L}*{latent} $$
+
+1.  **Reconstruction Loss ($\mathcal{L}_{recon}$)**: Cross-Entropy loss for token prediction at each step.
+2.  **Gate Loss ($\mathcal{L}_{gate}$)**: MSE loss ensuring the Gate MLP accurately estimates the ground-truth timestep.
+3.  **Latent Consistency Loss ($\mathcal{L}_{latent}$)**: Enforces the hidden state trajectory to remain consistent with the ground-truth restoration path.
+
+---
+
+## 🛠️ Installation
 
 ```bash
-# Extract package
-tar -xzf RDT-v0.1.0.tar.gz  # or unzip RDT-v0.1.0.zip
-cd RDT
-
-# Install
+git clone https://github.com/yourusername/rdt.git
+cd rdt
 pip install -e .
-
-# Verify
-python check_compatibility.py
 ```
 
-For detailed installation, see [INSTALL.md](INSTALL.md).
-
-## Quick Start
-```
-
-## Quick Start
+## 🚀 Experiments & Usage
 
 ### Training
 
-Train on WikiText-2 with base configuration:
+Train the model on streaming datasets (e.g., WikiText, BookCorpus) with the dynamic chain generation pipeline.
+
 ```bash
-# Using CLI command (if installed as package)
-rdt-train --config rdt/configs/base.yaml
-
-# Or using Python script directly
-python rdt/scripts/train.py --config configs/base.yaml
+# Train with default hyperparameters
+rdt-train --config configs/train_config.yaml
 ```
 
-Train on WikiText-103 with experiment config:
+### Inference (Iterative Denoising)
+
+Perform inference where the model recursively refines the input until the Gate mechanism signals completion.
+
 ```bash
-rdt-train --config rdt/configs/base.yaml --override rdt/configs/experiment.yaml
+rdt-inference \
+    --model_path checkpoints/best_model.pt \
+    --text "The quick brown [MASK] jumps over the lazy [MASK]." \
+    --threshold 0.02
 ```
 
-Resume from checkpoint:
-```bash
-rdt-train --config rdt/configs/base.yaml --checkpoint checkpoints/checkpoint_epoch_5.pt
-```
+## 📂 Repository Structure
 
-### Inference
+- `rdt/model.py`: Implementation of **DirectionalRecursiveBlock** and **AdaLN**.
+- `rdt/data.py`: Streaming data loader for generating noise-chain trajectories.
+- `rdt/trainer.py`: Training loop implementing the multi-objective loss landscape.
+- `configs/`: Hyperparameter configurations for varying model scales.
 
-Single text inference:
-```bash
-# Using CLI command
-rdt-inference --checkpoint checkpoints/best_model.pt --text "Your text here"
+## 📜 Citation
 
-# Or using Python script directly
-python rdt/scripts/inference.py --checkpoint checkpoints/best_model.pt --text "Your text here"
-```
+If you find this code useful for your research, please cite:
 
-Interactive mode:
-```bash
-rdt-inference --checkpoint checkpoints/best_model.pt --interactive
-```
-
-With custom parameters:
-```bash
-rdt-inference --checkpoint checkpoints/best_model.pt \
-    --text "Sample text" \
-    --max_steps 30 \
-    --threshold 0.05
-```
-
-## Configuration
-
-See `configs/base.yaml` for all configuration options:
-
-### Model Architecture
-- `d_model`: Hidden dimension (default: 512)
-- `n_encoder_layers`: Encoder depth (default: 6)
-- `n_decoder_layers`: Decoder depth (default: 1)
-- `decoder_type`: 'linear' or 'transformer'
-
-### Training Strategy
-- `max_chain_length`: Training segment length (default: 5)
-- `total_steps`: Total denoising steps (default: 10)
-- `masking_strategy`: 'linear' (step k → k*10% masking)
-
-### Data
-- `dataset_name`: 'wikitext-2' or 'wikitext-103'
-- `max_seq_length`: Maximum sequence length (default: 512)
-
-## Project Structure
-
-```
-RDT/
-├── rdt/                      # Main package
-│   ├── __init__.py          # Package exports
-│   ├── model.py             # RDT architecture
-│   ├── data.py              # Data loading & masking
-│   ├── trainer.py           # Training loop
-│   ├── utils.py             # Utilities
-│   ├── configs/             # Configuration files
-│   │   ├── base.yaml
-│   │   └── experiment.yaml
-│   └── scripts/             # Command-line scripts
-│       ├── train.py
-│       └── inference.py
-├── configs/                 # User-editable configs
-│   ├── base.yaml
-│   └── experiment.yaml
-├── checkpoints/             # Model checkpoints
-├── runs/                    # TensorBoard logs
-├── setup.py                 # Package setup (legacy)
-├── pyproject.toml          # Modern package config
-├── requirements.txt
-├── README.md
-├── INSTALL.md              # Detailed installation guide
-├── USAGE_GUIDE.md          # Detailed usage guide
-└── LICENSE
-```
-
-## Monitoring
-
-View training progress with TensorBoard:
-```bash
-tensorboard --logdir runs/
-```
-
-Metrics logged:
-- Train/Val: Total loss, Reconstruction loss, Gate loss
-- Learning rate schedule
-- Per-step losses during recursive forward pass
-
-## Design Philosophy
-
-Based on research showing deep encoders with shallow decoders achieve optimal performance:
-- **MAE (He et al., 2022)**: Encoder extracts features, decoder just reconstructs
-- **ALBERT (Lan et al., 2020)**: Parameter sharing (recursion) maintains performance
-
-In RDT:
-1. Encoder does the "thinking" (recursive refinement)
-2. Decoder is just a "translator" (latent → tokens)
-3. Gate learns when to stop (adaptive computation)
-
-## Citation
-
-If you use this code, please cite:
 ```bibtex
-@software{rdt2024,
-  title={RDT: Recursive Denoising Transformer},
-  author={Your Name},
-  year={2024}
+@misc{rdt2024,
+  title={RDT: Recursive Denoising Transformer with Adaptive Computation},
+  author={RDT Contributors},
+  year={2024},
+  publisher={GitHub},
+  howpublished={\url{https://github.com/yourusername/rdt}}
 }
 ```
 
-## License
+## 📄 License
 
-MIT License
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
