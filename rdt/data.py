@@ -18,7 +18,8 @@ class StreamingTextDataset(IterableDataset):
     """Streaming dataset for on-the-fly loading without preloading all data"""
     
     def __init__(self, dataset_name='wikitext-2', split='train', tokenizer_name='bert-base-uncased',
-                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15):
+                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15,
+                 bert_masking_enabled=True, mask_prob=0.8, random_prob=0.1, keep_prob=0.1):
         self.dataset_name = dataset_name
         self.split = split
         self.max_seq_length = max_seq_length
@@ -26,8 +27,15 @@ class StreamingTextDataset(IterableDataset):
         self.max_chain_length = max_chain_length
         self.visible_loss_ratio = visible_loss_ratio
         
+        # BERT-style masking parameters
+        self.bert_masking_enabled = bert_masking_enabled
+        self.mask_prob = mask_prob
+        self.random_prob = random_prob
+        self.keep_prob = keep_prob
+        
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.mask_token_id = self.tokenizer.mask_token_id
+        self.vocab_size = self.tokenizer.vocab_size
         
         print(f"Loading {dataset_name} ({split}) in streaming mode...")
         
@@ -43,6 +51,29 @@ class StreamingTextDataset(IterableDataset):
             dataset_config = 'wikitext-2-raw-v1' if 'wikitext-2' in dataset_name else 'wikitext-103-raw-v1'
             self.dataset = load_dataset('wikitext', dataset_config, split=split, streaming=True)
             print(f"Dataset loaded in streaming mode")
+    
+    def _apply_bert_masking(self, input_ids: torch.Tensor, masked_indices: torch.Tensor, original_tokens: torch.Tensor) -> torch.Tensor:
+        """Apply BERT-style masking: 80% [MASK], 10% random, 10% keep original"""
+        if len(masked_indices) == 0 or not self.bert_masking_enabled:
+            input_ids[masked_indices] = self.mask_token_id
+            return input_ids
+        
+        # 마스킹할 토큰들에 대해 BERT 스타일 적용
+        rand = torch.rand(len(masked_indices))
+        
+        # 80%: [MASK] 토큰
+        mask_indices = masked_indices[rand < self.mask_prob]
+        input_ids[mask_indices] = self.mask_token_id
+        
+        # 10%: 랜덤 토큰 (special tokens 제외)
+        random_indices = masked_indices[(rand >= self.mask_prob) & (rand < self.mask_prob + self.random_prob)]
+        if len(random_indices) > 0:
+            random_tokens = torch.randint(self.tokenizer.cls_token_id + 1, self.vocab_size, (len(random_indices),))
+            input_ids[random_indices] = random_tokens
+        
+        # 10%: 원본 유지 (keep_prob) - 아무것도 안 함
+        
+        return input_ids
     
     def _process_text(self, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Process a single tokenized text into training sample"""
@@ -65,7 +96,7 @@ class StreamingTextDataset(IterableDataset):
         
         input_ids = tokens.clone()
         if len(masked_indices_0) > 0:
-            input_ids[masked_indices_0] = self.mask_token_id
+            input_ids = self._apply_bert_masking(input_ids, masked_indices_0, tokens)
         
         # Generate targets (s_1, s_2, ..., s_L) and gate_targets (s_0, s_1, ..., s_L)
         targets = []
@@ -169,7 +200,8 @@ class WikiTextDataset(Dataset):
     """Map-style dataset for preloading all data into memory"""
     
     def __init__(self, dataset_name='wikitext-2', split='train', tokenizer_name='bert-base-uncased', 
-                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15, samples_per_text=1, streaming=False):
+                 max_seq_length=512, total_steps=10, max_chain_length=5, visible_loss_ratio=0.15, samples_per_text=1, streaming=False,
+                 bert_masking_enabled=True, mask_prob=0.8, random_prob=0.1, keep_prob=0.1):
         if streaming:
             raise ValueError("Use StreamingTextDataset for streaming mode instead")
         
@@ -180,8 +212,15 @@ class WikiTextDataset(Dataset):
         self.visible_loss_ratio = visible_loss_ratio
         self.samples_per_text = samples_per_text
         
+        # BERT-style masking parameters
+        self.bert_masking_enabled = bert_masking_enabled
+        self.mask_prob = mask_prob
+        self.random_prob = random_prob
+        self.keep_prob = keep_prob
+        
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.mask_token_id = self.tokenizer.mask_token_id
+        self.vocab_size = self.tokenizer.vocab_size
         
         print(f"Loading {dataset_name} ({split})...")
         
@@ -294,6 +333,29 @@ class WikiTextDataset(Dataset):
         
         return tokenized
     
+    def _apply_bert_masking(self, input_ids: torch.Tensor, masked_indices: torch.Tensor, original_tokens: torch.Tensor) -> torch.Tensor:
+        """Apply BERT-style masking: 80% [MASK], 10% random, 10% keep original"""
+        if len(masked_indices) == 0 or not self.bert_masking_enabled:
+            input_ids[masked_indices] = self.mask_token_id
+            return input_ids
+        
+        # 마스킹할 토큰들에 대해 BERT 스타일 적용
+        rand = torch.rand(len(masked_indices))
+        
+        # 80%: [MASK] 토큰
+        mask_indices = masked_indices[rand < self.mask_prob]
+        input_ids[mask_indices] = self.mask_token_id
+        
+        # 10%: 랜덤 토큰 (special tokens 제외)
+        random_indices = masked_indices[(rand >= self.mask_prob) & (rand < self.mask_prob + self.random_prob)]
+        if len(random_indices) > 0:
+            random_tokens = torch.randint(self.tokenizer.cls_token_id + 1, self.vocab_size, (len(random_indices),))
+            input_ids[random_indices] = random_tokens
+        
+        # 10%: 원본 유지 (keep_prob) - 아무것도 안 함
+        
+        return input_ids
+    
     def __len__(self):
         return len(self.tokenized_data) * self.samples_per_text
     
@@ -322,7 +384,7 @@ class WikiTextDataset(Dataset):
         
         input_ids = tokens.clone()
         if len(masked_indices_0) > 0:
-            input_ids[masked_indices_0] = self.mask_token_id
+            input_ids = self._apply_bert_masking(input_ids, masked_indices_0, tokens)
         
         # Generate targets (s_1, s_2, ..., s_L) and gate_targets (s_0, s_1, ..., s_L)
         targets = []
@@ -418,6 +480,13 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     training_config = config['training']
     streaming = data_config.get('streaming', False)
     
+    # BERT masking config
+    bert_config = training_config.get('bert_masking', {})
+    bert_masking_enabled = bert_config.get('enabled', True)
+    mask_prob = bert_config.get('mask_prob', 0.8)
+    random_prob = bert_config.get('random_prob', 0.1)
+    keep_prob = bert_config.get('keep_prob', 0.1)
+    
     if streaming:
         # Use StreamingTextDataset for streaming mode
         train_dataset = StreamingTextDataset(
@@ -427,7 +496,11 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             max_seq_length=data_config['max_seq_length'],
             total_steps=training_config['total_steps'],
             max_chain_length=training_config['max_chain_length'],
-            visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15)
+            visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
+            bert_masking_enabled=bert_masking_enabled,
+            mask_prob=mask_prob,
+            random_prob=random_prob,
+            keep_prob=keep_prob
         )
         
         val_dataset = StreamingTextDataset(
@@ -437,7 +510,11 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             max_seq_length=data_config['max_seq_length'],
             total_steps=training_config['total_steps'],
             max_chain_length=training_config['max_chain_length'],
-            visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15)
+            visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
+            bert_masking_enabled=bert_masking_enabled,
+            mask_prob=mask_prob,
+            random_prob=random_prob,
+            keep_prob=keep_prob
         )
         
         # Streaming datasets do not support shuffle
@@ -460,7 +537,11 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             max_chain_length=training_config['max_chain_length'],
             visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
             samples_per_text=data_config.get('samples_per_text', 1),
-            streaming=streaming
+            streaming=streaming,
+            bert_masking_enabled=bert_masking_enabled,
+            mask_prob=mask_prob,
+            random_prob=random_prob,
+            keep_prob=keep_prob
         )
         
         val_dataset = WikiTextDataset(
@@ -472,7 +553,11 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             max_chain_length=training_config['max_chain_length'],
             visible_loss_ratio=training_config.get('visible_loss_ratio', 0.15),
             samples_per_text=data_config.get('samples_per_text', 1),
-            streaming=streaming
+            streaming=streaming,
+            bert_masking_enabled=bert_masking_enabled,
+            mask_prob=mask_prob,
+            random_prob=random_prob,
+            keep_prob=keep_prob
         )
         
         train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], 
