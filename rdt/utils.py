@@ -120,3 +120,67 @@ def get_device(device_name: str = 'cuda') -> torch.device:
     if device_name == 'cuda' and torch.cuda.is_available():
         return torch.device('cuda')
     return torch.device('cpu')
+
+
+def create_model_from_config(config: Dict, vocab_size: int):
+    """
+    Create RDT model from config with optional BERT initialization.
+    
+    Args:
+        config: Configuration dictionary
+        vocab_size: Vocabulary size
+        
+    Returns:
+        RDT model instance
+    """
+    from .model import RDT
+    
+    model_config = config['model']
+    use_bert_init = model_config.get('use_bert_init', False)
+    
+    if use_bert_init:
+        from .bert_init import initialize_rdt_with_bert
+        
+        bert_model_name = model_config.get('bert_model_name', 'prajjwal1/bert-medium')
+        
+        # Let bert_init auto-detect d_model if needed
+        d_model = model_config.get('d_model', None)
+        
+        print(f"\n{'='*60}")
+        print(f"Initializing RDT with BERT weights")
+        print(f"{'='*60}")
+        
+        model = initialize_rdt_with_bert(
+            vocab_size=vocab_size,
+            bert_model_name=bert_model_name,
+            d_model=d_model,
+            n_heads=model_config['n_heads'],
+            n_encoder_layers=model_config['n_encoder_layers'],
+            n_io_layers=model_config['n_io_layers'],
+            d_ff=model_config['d_ff'],
+            dropout=model_config['dropout'],
+            max_seq_len=config['data']['max_seq_len'],
+            gate_hidden_dim=model_config['gate_hidden_dim'],
+            gate_num_layers=model_config['gate_num_layers'],
+            gate_num_heads=model_config['gate_num_heads'],
+            gradient_checkpointing=model_config.get('gradient_checkpointing', False),
+            verbose=True
+        )
+    else:
+        print(f"\nInitializing RDT with random weights")
+        model = RDT(
+            vocab_size=vocab_size,
+            d_model=model_config['d_model'],
+            n_heads=model_config['n_heads'],
+            n_encoder_layers=model_config['n_encoder_layers'],
+            n_io_layers=model_config['n_io_layers'],
+            d_ff=model_config['d_ff'],
+            dropout=model_config['dropout'],
+            max_seq_len=config['data']['max_seq_len'],
+            gate_hidden_dim=model_config['gate_hidden_dim'],
+            gate_num_layers=model_config['gate_num_layers'],
+            gate_num_heads=model_config['gate_num_heads'],
+            gradient_checkpointing=model_config.get('gradient_checkpointing', False)
+        )
+    
+    return model

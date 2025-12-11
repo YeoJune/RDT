@@ -2,7 +2,7 @@
 
 # Model Architecture
 model:
-  d_model: 512 # Hidden dimension
+  d_model: 512 # Hidden dimension (auto-set from BERT if use_bert_init=true)
   n_heads: 8 # Attention heads (d_model / 64)
   n_encoder_layers: 6 # Shared encoder depth (recursive)
   n_io_layers: 1 # Shallow decoder (MAE-style)
@@ -17,6 +17,14 @@ model:
 
   # Memory optimization
   gradient_checkpointing: false # Enable gradient checkpointing to save memory
+
+  # BERT Weight Initialization
+  use_bert_init: true # Initialize from pretrained BERT
+  bert_model_name: "prajjwal1/bert-medium" # 8 layers, 512-dim (perfect for n_encoder_layers=6)
+  # Options:
+  #   - "prajjwal1/bert-medium": 8 layers, 512-dim → n_encoder_layers=6
+  #   - "bert-base-uncased": 12 layers, 768-dim → n_encoder_layers=6-10
+  #   - "bert-large-uncased": 24 layers, 1024-dim → n_encoder_layers=10-22
 
 # Training Strategy
 training:
