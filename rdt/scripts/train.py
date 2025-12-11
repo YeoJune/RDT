@@ -7,7 +7,7 @@ import torch
 from rdt.model import RDT
 from rdt.data import create_dataloaders
 from rdt.trainer import RDTTrainer
-from rdt.utils import load_config, merge_configs, set_seed, get_device
+from rdt.utils import load_config, merge_configs, set_seed, get_device, create_model_from_config
 from transformers import AutoTokenizer
 
 
@@ -53,22 +53,9 @@ def main():
     vocab_size = tokenizer.vocab_size
     print(f"Vocabulary size: {vocab_size}")
     
-    # Create model
+    # Create model (with optional BERT initialization)
     print("\nInitializing model...")
-    model = RDT(
-        vocab_size=vocab_size,
-        d_model=config['model']['d_model'],
-        n_heads=config['model']['n_heads'],
-        n_encoder_layers=config['model']['n_encoder_layers'],
-        n_io_layers=config['model']['n_io_layers'],
-        d_ff=config['model']['d_ff'],
-        dropout=config['model']['dropout'],
-        max_seq_len=config['data']['max_seq_length'],
-        gate_hidden_dim=config['model']['gate_hidden_dim'],
-        gate_num_layers=config['model']['gate_num_layers'],
-        gate_num_heads=config['model']['gate_num_heads'],
-        gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
-    )
+    model = create_model_from_config(config, vocab_size)
     
     # Create trainer
     trainer = RDTTrainer(
