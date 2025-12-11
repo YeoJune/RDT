@@ -163,55 +163,101 @@ class DirectionalRecursiveBlock(nn.Module):
         
         return x
 
-
 class GateMLP(nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int = 256):
+    """
+    Enhanced Gate with configurable depth
+    - Multi-head attention pooling
+    - N-layer MLP with residual connections
+    - Learnable temperature scaling
+    """
+    def __init__(self, d_model: int, hidden_dim: int = 512, num_layers: int = 3, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
-        # Attention-based pooling
-        self.attention = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         
-        # Gate prediction
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden_dim), 
-            nn.ReLU(), 
-            nn.Linear(hidden_dim, 1)
+        # Multi-head attention pooling
+        self.attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
         )
+        self.query = nn.Parameter(torch.randn(1, 1, d_model))
+        nn.init.normal_(self.query, std=0.02)
+        
+        # N-layer MLP with residual connections
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            self.layers.append(nn.ModuleDict({
+                'linear': nn.Linear(d_model if i == 0 else hidden_dim, hidden_dim),
+                'norm': nn.LayerNorm(hidden_dim),
+                'dropout': nn.Dropout(dropout)
+            }))
+        
+        # Output projection
+        self.output_proj = nn.Linear(hidden_dim, 1)
+        
+        # Learnable temperature for softplus
+        self.temperature = nn.Parameter(torch.ones(1))
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for layer_dict in self.layers:
+            nn.init.xavier_uniform_(layer_dict['linear'].weight)
+            nn.init.zeros_(layer_dict['linear'].bias)
+        
+        nn.init.xavier_uniform_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
     
     def forward(self, x, mask=None):
         """
-        x: [B, L, D]
-        mask: [B, L] (1=valid, 0=padding)
+        x: [B, L, D] - hidden states
+        mask: [B, L] - attention mask (1=valid, 0=padding)
+        Returns: [B, 1] - gate prediction
         """
-        if x.dim() == 2:  # Already pooled
-            return torch.sigmoid(self.mlp(x))
+        batch_size = x.size(0)
         
-        # Attention scores
-        attn_scores = self.attention(x).squeeze(-1)  # [B, L]
+        # Multi-head attention pooling
+        query = self.query.expand(batch_size, -1, -1)
+        key_padding_mask = (mask == 0) if mask is not None else None
         
-        # Mask out padding
-        if mask is not None:
-            # -1e4 is safer than -1e9 for fp16
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e4)
+        pooled, _ = self.attention(
+            query=query,
+            key=x,
+            value=x,
+            key_padding_mask=key_padding_mask,
+            need_weights=False
+        )
+        pooled = pooled.squeeze(1)  # [B, D]
         
-        # Softmax
-        attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, L, 1]
+        # N-layer processing with residual connections
+        h = pooled
+        for i, layer_dict in enumerate(self.layers):
+            h_new = layer_dict['linear'](h)
+            h_new = layer_dict['norm'](h_new)
+            h_new = nn.functional.gelu(h_new)
+            h_new = layer_dict['dropout'](h_new)
+            
+            # Residual connection (skip first layer since dimension changes)
+            if i > 0:
+                h = h + h_new
+            else:
+                h = h_new
         
-        # Weighted sum
-        pooled = (x * attn_weights).sum(dim=1)  # [B, D]
+        # Output projection
+        raw_output = self.output_proj(h)
         
-        raw_output = self.mlp(pooled)
-        gate_output = nn.functional.softplus(raw_output)
+        # Temperature-scaled softplus
+        gate_output = nn.functional.softplus(raw_output / self.temperature.clamp(min=0.1))
         
         return gate_output
 
 class RDT(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_io_layers=1, 
                  d_ff=2048, dropout=0.1, max_seq_len=512,
-                 gate_hidden_dim=256, gradient_checkpointing=False):
+                 gate_hidden_dim=512, gate_num_layers=3, gate_num_heads=8, gradient_checkpointing=False):
         super().__init__()
         self.d_model = d_model
         self.gradient_checkpointing = gradient_checkpointing
@@ -245,7 +291,13 @@ class RDT(nn.Module):
         self.output_decoder = nn.TransformerEncoder(output_decoder_layer, num_layers=n_io_layers)
         self.output_projection = nn.Linear(d_model, vocab_size)
             
-        self.gate = GateMLP(d_model, gate_hidden_dim)
+        self.gate = GateMLP(
+            d_model=d_model, 
+            hidden_dim=gate_hidden_dim, 
+            num_layers=gate_num_layers,
+            num_heads=gate_num_heads,
+            dropout=dropout
+        )
         
         # Weight Tying
         self.output_projection.weight = self.token_embedding.weight

@@ -226,9 +226,12 @@ def main():
         d_ff=config['model']['d_ff'],
         dropout=config['model']['dropout'],
         max_seq_len=config['data']['max_seq_length'],
-        gate_hidden_dim=config['model']['gate_hidden_dim']
+        gate_hidden_dim=config['model']['gate_hidden_dim'],
+        gate_num_layers=config['model']['gate_num_layers'],
+        gate_num_heads=config['model']['gate_num_heads'],
+        gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
     )
-    
+
     # Load weights
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
