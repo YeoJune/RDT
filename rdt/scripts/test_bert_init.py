@@ -148,8 +148,8 @@ def test_weight_verification():
     
     from transformers import AutoModel
     
-    # Load BERT
-    bert = AutoModel.from_pretrained("prajjwal1/bert-medium")
+    # Load BERT (use safetensors)
+    bert = AutoModel.from_pretrained("prajjwal1/bert-medium", use_safetensors=True)
     
     # Create RDT with BERT init
     rdt = initialize_rdt_with_bert(

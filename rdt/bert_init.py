@@ -38,8 +38,8 @@ def load_bert_weights_to_rdt(
         print(f"Loading BERT weights from: {bert_model_name}")
         print(f"{'='*60}\n")
     
-    # Load BERT model and config
-    bert = AutoModel.from_pretrained(bert_model_name)
+    # Load BERT model and config (use safetensors to avoid security warning)
+    bert = AutoModel.from_pretrained(bert_model_name, use_safetensors=True)
     bert_config = AutoConfig.from_pretrained(bert_model_name)
     
     num_bert_layers = bert_config.num_hidden_layers
