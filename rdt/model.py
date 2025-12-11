@@ -197,9 +197,6 @@ class GateMLP(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, 1)
         
-        # Learnable temperature for softplus
-        self.temperature = nn.Parameter(torch.ones(1))
-        
         self._init_weights()
     
     def _init_weights(self):
@@ -249,7 +246,7 @@ class GateMLP(nn.Module):
         raw_output = self.output_proj(h)
         
         # Temperature-scaled softplus
-        gate_output = nn.functional.softplus(raw_output / self.temperature.clamp(min=0.1))
+        gate_output = nn.functional.softplus(raw_output)
         
         return gate_output
 
