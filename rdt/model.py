@@ -5,20 +5,19 @@ import torch.nn as nn
 import math
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
+    """BERT-style learned positional embeddings"""
+    def __init__(self, d_model: int, max_len: int = 512, dropout: float = 0.1):
         super().__init__()
+        self.position_embeddings = nn.Embedding(max_len, d_model)
         self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-    
+        self.max_len = max_len
+        
     def forward(self, x):
         seq_len = x.size(1)
-        pos_emb = self.pe[:seq_len, :].unsqueeze(0)
-        return self.dropout(x + pos_emb)
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=x.device)
+        position_ids = position_ids.unsqueeze(0).expand(x.size(0), -1)
+        position_embeddings = self.position_embeddings(position_ids)
+        return self.dropout(x + position_embeddings)
 
 class TimestepEmbedder(nn.Module):
     """

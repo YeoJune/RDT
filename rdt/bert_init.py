@@ -75,7 +75,7 @@ def load_bert_weights_to_rdt(
     # Step 1: Copy Token Embeddings
     # =========================================================================
     if verbose:
-        print("[1/4] Copying token embeddings...")
+        print("[1/5] Copying token embeddings...")
     
     rdt_model.token_embedding.weight.data.copy_(
         bert.embeddings.word_embeddings.weight.data
@@ -85,10 +85,28 @@ def load_bert_weights_to_rdt(
         print(f"  ✓ Token embedding: {bert.embeddings.word_embeddings.weight.shape}")
     
     # =========================================================================
+    # Step 1.5: Copy Position Embeddings
+    # =========================================================================
+    if verbose:
+        print("\n[2/5] Copying position embeddings...")
+    
+    bert_pos_emb = bert.embeddings.position_embeddings.weight.data
+    rdt_pos_emb = rdt_model.pos_encoding.position_embeddings.weight.data
+    
+    # Copy as much as possible (BERT typically has 512 positions)
+    min_len = min(bert_pos_emb.size(0), rdt_pos_emb.size(0))
+    rdt_pos_emb[:min_len].copy_(bert_pos_emb[:min_len])
+    
+    if verbose:
+        print(f"  ✓ Position embedding: copied {min_len} positions from BERT")
+        if rdt_pos_emb.size(0) > bert_pos_emb.size(0):
+            print(f"    (RDT has {rdt_pos_emb.size(0)} positions, BERT has {bert_pos_emb.size(0)} - extra positions remain random)")
+    
+    # =========================================================================
     # Step 2: Copy Input Encoder (BERT Layer 0)
     # =========================================================================
     if verbose:
-        print("\n[2/4] Copying input encoder (BERT layer 0)...")
+        print("\n[3/5] Copying input encoder (BERT layer 0)...")
     
     bert_layer_0 = bert.encoder.layer[0]
     
@@ -106,7 +124,7 @@ def load_bert_weights_to_rdt(
     # Step 3: Copy Main Encoder (BERT Middle Layers)
     # =========================================================================
     if verbose:
-        print(f"\n[3/4] Copying main encoder (BERT layers 1-{num_rdt_main})...")
+        print(f"\n[4/5] Copying main encoder (BERT layers 1-{num_rdt_main})...")
     
     for i in range(num_rdt_main):
         bert_layer_idx = i + 1  # BERT layers 1, 2, 3, 4, 5, 6
@@ -135,7 +153,7 @@ def load_bert_weights_to_rdt(
     # Step 4: Copy Output Decoder (BERT Last Layer)
     # =========================================================================
     if verbose:
-        print(f"\n[4/4] Copying output decoder (BERT layer {num_bert_layers-1})...")
+        print(f"\n[5/5] Copying output decoder (BERT layer {num_bert_layers-1})...")
     
     bert_last_layer = bert.encoder.layer[num_bert_layers - 1]
     
@@ -157,11 +175,11 @@ def load_bert_weights_to_rdt(
         print(f"{'='*60}")
         print("\nInitialized components:")
         print("  ✓ Token embeddings (tied with output projection)")
+        print("  ✓ Position embeddings (BERT learned positions)")
         print("  ✓ Input encoder (low-level syntactic features)")
         print("  ✓ Main encoder (mid-level semantic features, recursive)")
         print("  ✓ Output decoder (high-level task features)")
         print("\nRandomly initialized components:")
-        print("  • Positional encoding")
         print("  • AdaLN conditioning projections (zero-init)")
         print("  • Timestep embedder (noise level)")
         print("  • Cross-attention (if used)")
