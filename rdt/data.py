@@ -181,25 +181,27 @@ class StreamingTextDataset(IterableDataset):
                     if mod != 39:  # Only take index 39
                         continue
             
-            # 3. Process text - tokenize without truncation to split into chunks
+            # 3. Process text - tokenize with return_overflowing_tokens for standard chunking
             text = item.get('text', '').strip()
             if len(text) == 0:
                 continue
             
-            encoded = self.tokenizer(text, truncation=False, padding=False, return_tensors='pt')
-            tokens = encoded['input_ids'].squeeze(0)
+            # Standard approach: tokenizer handles chunking with stride
+            encoded = self.tokenizer(
+                text,
+                max_length=self.max_seq_length,
+                truncation=True,
+                padding=False,
+                return_overflowing_tokens=True,
+                stride=0,
+                return_tensors='pt'
+            )
             
-            if len(tokens) < 10:
-                continue
-            
-            # Split tokens into chunks of max_seq_length
-            for i in range(0, len(tokens), self.max_seq_length):
-                chunk = tokens[i:min(i + self.max_seq_length, len(tokens))]
-                if len(chunk) < 10:  # Skip very short chunks
+            # encoded['input_ids'] shape: (num_chunks, seq_len)
+            for tokens in encoded['input_ids']:
+                if len(tokens) < 10:
                     continue
-                if len(chunk) > self.max_seq_length:  # Ensure not exceeding max_seq_length
-                    chunk = chunk[:self.max_seq_length]
-                yield self._process_text(chunk)
+                yield self._process_text(tokens)
 
 
 class WikiTextDataset(Dataset):
@@ -308,42 +310,31 @@ class WikiTextDataset(Dataset):
         # Create tokenizer instance with name (not self.tokenizer to avoid pickle issues)
         tokenizer_name = self.tokenizer.name_or_path
         
-        # Use HuggingFace's fast .map() method with batching
-        def tokenize_function(examples):
-            # Create tokenizer inside function to avoid multiprocessing pickle issues
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-            return tokenizer(
-                examples['text'],
-                truncation=False,
-                padding=False,
-            )
+        # Standard approach: use return_overflowing_tokens for chunking
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         
-        # Apply tokenization with batching (single process to avoid memory/pickle issues)
-        tokenized_dataset = self.dataset.map(
-            tokenize_function,
-            batched=True,
-            batch_size=1024,
-            num_proc=4,
-            remove_columns=self.dataset.column_names,
-            desc="Tokenizing"
-        )
-        
-        # Convert to list of tensors and split into chunks of max_seq_length
         tokenized = []
-        for item in tqdm(tokenized_dataset, desc="Processing tokens"):
-            tokens = torch.tensor(item['input_ids'], dtype=torch.long)
-            if len(tokens) < 10:
+        for item in tqdm(self.dataset, desc="Tokenizing and chunking"):
+            text = item['text'].strip()
+            if len(text) == 0:
                 continue
             
-            # Split into chunks of max_seq_length
-            for i in range(0, len(tokens), self.max_seq_length):
-                chunk = tokens[i:min(i + self.max_seq_length, len(tokens))]
-                if len(chunk) < 10:  # Skip very short chunks
-                    continue
-                if len(chunk) > self.max_seq_length:  # Ensure not exceeding max_seq_length
-                    chunk = chunk[:self.max_seq_length]
-                tokenized.append(chunk)
+            # Standard tokenization with chunking
+            encoded = tokenizer(
+                text,
+                max_length=self.max_seq_length,
+                truncation=True,
+                padding=False,
+                return_overflowing_tokens=True,
+                stride=0
+            )
+            
+            # Each chunk as a separate sample
+            for input_ids in encoded['input_ids']:
+                tokens = torch.tensor(input_ids, dtype=torch.long)
+                if len(tokens) >= 10:
+                    tokenized.append(tokens)
         
         return tokenized
     
