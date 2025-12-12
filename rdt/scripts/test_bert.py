@@ -1,10 +1,10 @@
-"""Test BERT-base reconstruction capability across different masking levels"""
+"""Test RoBERTa-base reconstruction capability across different masking levels"""
 
 import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import BertTokenizer, BertForMaskedLM
+from transformers import RobertaTokenizer, RobertaForMaskedLM
 from tqdm import tqdm
 from pathlib import Path
 
@@ -44,8 +44,8 @@ def calculate_accuracy(pred_tokens, target_tokens, eval_mask):
     return correct / total
 
 
-def bert_single_pass_inference(model, input_ids, attention_mask):
-    """Single forward pass through BERT"""
+def roberta_single_pass_inference(model, input_ids, attention_mask):
+    """Single forward pass through RoBERTa"""
     with torch.no_grad():
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits
@@ -53,7 +53,7 @@ def bert_single_pass_inference(model, input_ids, attention_mask):
     return pred_tokens
 
 
-def bert_iterative_inference(model, input_ids, attention_mask, mask_token_id, max_steps=20, threshold=0.95):
+def roberta_iterative_inference(model, input_ids, attention_mask, mask_token_id, max_steps=20, threshold=0.95):
     """Iterative refinement similar to RDT"""
     current_ids = input_ids.clone()
     
@@ -102,8 +102,8 @@ def bert_iterative_inference(model, input_ids, attention_mask, mask_token_id, ma
     return current_ids, max_steps
 
 
-def test_bert(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, mode='single', max_steps=20, threshold=0.95):
-    """Test BERT across different masking levels"""
+def test_roberta(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, mode='single', max_steps=20, threshold=0.95):
+    """Test RoBERTa across different masking levels"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
     
@@ -111,7 +111,7 @@ def test_bert(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, mo
     steps_taken = {ratio: [] for ratio in mask_ratios}
     
     mode_name = "Single-pass" if mode == 'single' else "Iterative"
-    print(f"\nTesting BERT {mode_name} reconstruction (max_seq_len={max_seq_len})...")
+    print(f"\nTesting RoBERTa {mode_name} reconstruction (max_seq_len={max_seq_len})...")
     
     for text in tqdm(test_texts, desc="Processing texts"):
         # Tokenize
@@ -146,10 +146,10 @@ def test_bert(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, mo
             
             # Inference
             if mode == 'single':
-                pred_tokens_full = bert_single_pass_inference(model, input_ids, attn_mask)
+                pred_tokens_full = roberta_single_pass_inference(model, input_ids, attn_mask)
                 num_steps = 1
             else:
-                pred_tokens_full, num_steps = bert_iterative_inference(
+                pred_tokens_full, num_steps = roberta_iterative_inference(
                     model, input_ids, attn_mask, mask_token_id, max_steps, threshold
                 )
             
@@ -188,7 +188,7 @@ def visualize_results(mask_ratios, accuracies, steps, mode='single', save_path=N
     ax1.plot(mask_percentages, list(accuracies.values()), 'g-o', linewidth=2, markersize=8)
     ax1.set_xlabel('Masking Ratio (%)', fontsize=12)
     ax1.set_ylabel('Reconstruction Accuracy', fontsize=12)
-    ax1.set_title(f'BERT-base {mode_name} Reconstruction Accuracy', fontsize=14, fontweight='bold')
+    ax1.set_title(f'RoBERTa-base {mode_name} Reconstruction Accuracy', fontsize=14, fontweight='bold')
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim([0, 1.05])
     
@@ -239,7 +239,7 @@ def load_test_texts(tokenizer, split='test', num_samples=100):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Test BERT-base Masking Reconstruction')
+    parser = argparse.ArgumentParser(description='Test RoBERTa-base Masking Reconstruction')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use')
     parser.add_argument('--num_samples', type=int, default=100,
@@ -252,7 +252,7 @@ def main():
                         help='Maximum inference steps (for iterative mode)')
     parser.add_argument('--threshold', type=float, default=0.95,
                         help='Confidence threshold (for iterative mode)')
-    parser.add_argument('--output', type=str, default='bert_baseline_results.png',
+    parser.add_argument('--output', type=str, default='roberta_baseline_results.png',
                         help='Output visualization path')
     
     args = parser.parse_args()
@@ -260,10 +260,10 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load BERT model and tokenizer
-    print("Loading BERT-base model...")
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    model = BertForMaskedLM.from_pretrained('bert-base-uncased')
+    # Load RoBERTa model and tokenizer
+    print("Loading RoBERTa-base model...")
+    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+    model = RobertaForMaskedLM.from_pretrained('roberta-base')
     model = model.to(device)
     model.eval()
     print("Model loaded")
@@ -276,7 +276,7 @@ def main():
     mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     
     # Test model
-    accuracies, steps = test_bert(
+    accuracies, steps = test_roberta(
         model, tokenizer, test_texts, mask_ratios, 
         device, args.max_seq_len, args.mode, args.max_steps, args.threshold
     )
@@ -284,7 +284,7 @@ def main():
     # Print results
     mode_name = "Single-pass" if args.mode == 'single' else "Iterative"
     print("\n" + "="*60)
-    print(f"BERT-base {mode_name} Test Results")
+    print(f"RoBERTa-base {mode_name} Test Results")
     print("="*60)
     print(f"{'Masking %':<12} {'Accuracy':<12} {'Avg Steps':<12}")
     print("-"*60)
