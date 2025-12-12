@@ -194,9 +194,11 @@ class StreamingTextDataset(IterableDataset):
             
             # Split tokens into chunks of max_seq_length
             for i in range(0, len(tokens), self.max_seq_length):
-                chunk = tokens[i:i + self.max_seq_length]
+                chunk = tokens[i:min(i + self.max_seq_length, len(tokens))]
                 if len(chunk) < 10:  # Skip very short chunks
                     continue
+                if len(chunk) > self.max_seq_length:  # Ensure not exceeding max_seq_length
+                    chunk = chunk[:self.max_seq_length]
                 yield self._process_text(chunk)
 
 
@@ -336,9 +338,12 @@ class WikiTextDataset(Dataset):
             
             # Split into chunks of max_seq_length
             for i in range(0, len(tokens), self.max_seq_length):
-                chunk = tokens[i:i + self.max_seq_length]
-                if len(chunk) >= 10:  # Keep chunks with at least 10 tokens
-                    tokenized.append(chunk)
+                chunk = tokens[i:min(i + self.max_seq_length, len(tokens))]
+                if len(chunk) < 10:  # Skip very short chunks
+                    continue
+                if len(chunk) > self.max_seq_length:  # Ensure not exceeding max_seq_length
+                    chunk = chunk[:self.max_seq_length]
+                tokenized.append(chunk)
         
         return tokenized
     
