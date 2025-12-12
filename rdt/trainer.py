@@ -244,13 +244,12 @@ class RDTTrainer:
                 
                 # Latent Consistency Loss for each step
                 for step_idx in range(len(hidden_states)):
-                    with torch.no_grad():
-                        # 1. Ground Truth hidden: s_{i+1} -> input_encoder -> h_GT (detached!)
-                        step_target = targets[:aux_batch_size, step_idx, :]  # [Aux_B, Seq]
-                        
-                        target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
-                        target_emb = self.model.pos_encoding(target_emb)
-                        h_GT = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask).detach()
+                    # 1. Ground Truth hidden: s_{i+1} -> input_encoder -> h_GT (detached!)
+                    step_target = targets[:aux_batch_size, step_idx, :]  # [Aux_B, Seq]
+                    
+                    target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
+                    target_emb = self.model.pos_encoding(target_emb)
+                    h_GT = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
                     
                     # 2. Predicted hidden: h_{i+1} (from main loop, already computed)
                     h_pred = hidden_states[step_idx][:aux_batch_size]  # [Aux_B, Seq, D]
