@@ -190,8 +190,6 @@ def main():
                         help='Device to use')
     parser.add_argument('--num_samples', type=int, default=100,
                         help='Number of test samples')
-    parser.add_argument('--max_steps', type=int, default=20,
-                        help='Maximum inference steps')
     parser.add_argument('--output', type=str, default='masking_test_results.png',
                         help='Output visualization path')
     
@@ -249,7 +247,7 @@ def main():
     # Test model
     accuracies, steps = test_model(
         model, tokenizer, test_texts, mask_ratios, 
-        device, config['data']['max_seq_length'], args.max_steps, config['model']['threshold']
+        device, config['data']['max_seq_length'], config['training']['total_steps'], config['model']['threshold']
     )
     
     # Print results
