@@ -447,11 +447,10 @@ class WikiTextDataset(Dataset):
             'chain_length': chain_length
         }
 
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+def collate_fn(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
     max_seq_len = max(item['input'].size(0) for item in batch)  # input\uc774 \uc774\uc81c 1D
     max_chain_len = max(item['chain_length'] for item in batch)
     batch_size = len(batch)
-    pad_token_id = 0
     
     inputs = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long)
     targets = torch.full((batch_size, max_chain_len, max_seq_len), pad_token_id, dtype=torch.long)
@@ -522,15 +521,18 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             keep_prob=keep_prob
         )
         
+        # Get pad_token_id from tokenizer
+        pad_token_id = train_dataset.tokenizer.pad_token_id if train_dataset.tokenizer.pad_token_id is not None else 0
+        
         # Streaming datasets do not support shuffle
         train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], 
                                  num_workers=data_config['num_workers'], 
                                  pin_memory=data_config['pin_memory'], 
-                                 collate_fn=collate_fn)
+                                 collate_fn=lambda batch: collate_fn(batch, pad_token_id))
         val_loader = DataLoader(val_dataset, batch_size=training_config['batch_size'], 
                                num_workers=data_config['num_workers'], 
                                pin_memory=data_config['pin_memory'], 
-                               collate_fn=collate_fn)
+                               collate_fn=lambda batch: collate_fn(batch, pad_token_id))
     else:
         # Use WikiTextDataset for normal mode
         train_dataset = WikiTextDataset(
@@ -565,13 +567,16 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             keep_prob=keep_prob
         )
         
+        # Get pad_token_id from tokenizer
+        pad_token_id = train_dataset.tokenizer.pad_token_id if train_dataset.tokenizer.pad_token_id is not None else 0
+        
         train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], 
                                  shuffle=True, num_workers=data_config['num_workers'], 
                                  pin_memory=data_config['pin_memory'], 
-                                 collate_fn=collate_fn)
+                                 collate_fn=lambda batch: collate_fn(batch, pad_token_id))
         val_loader = DataLoader(val_dataset, batch_size=training_config['batch_size'], 
                                shuffle=False, num_workers=data_config['num_workers'], 
                                pin_memory=data_config['pin_memory'], 
-                               collate_fn=collate_fn)
+                               collate_fn=lambda batch: collate_fn(batch, pad_token_id))
     
     return train_loader, val_loader
