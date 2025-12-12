@@ -225,7 +225,7 @@ def load_test_texts(tokenizer, split='test', num_samples=100):
     from datasets import load_dataset
     
     print(f"Loading test data...")
-    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split)
+    dataset = load_dataset('wikitext', 'wikitext-103-raw-v1', split=split)
     
     texts = []
     for item in dataset:
