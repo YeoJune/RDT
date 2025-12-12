@@ -181,19 +181,23 @@ class StreamingTextDataset(IterableDataset):
                     if mod != 39:  # Only take index 39
                         continue
             
-            # 3. Process text
+            # 3. Process text - tokenize without truncation to split into chunks
             text = item.get('text', '').strip()
             if len(text) == 0:
                 continue
             
-            encoded = self.tokenizer(text, max_length=self.max_seq_length, truncation=True,
-                                   padding=False, return_tensors='pt')
+            encoded = self.tokenizer(text, truncation=False, padding=False, return_tensors='pt')
             tokens = encoded['input_ids'].squeeze(0)
             
             if len(tokens) < 10:
                 continue
             
-            yield self._process_text(tokens)
+            # Split tokens into chunks of max_seq_length
+            for i in range(0, len(tokens), self.max_seq_length):
+                chunk = tokens[i:i + self.max_seq_length]
+                if len(chunk) < 10:  # Skip very short chunks
+                    continue
+                yield self._process_text(chunk)
 
 
 class WikiTextDataset(Dataset):
@@ -296,7 +300,7 @@ class WikiTextDataset(Dataset):
             print(f"Total samples (with samples_per_text={samples_per_text}): {len(self.tokenized_data) * samples_per_text}")
     
     def _prepare_data(self) -> List[torch.Tensor]:
-        """Tokenize dataset using fast batched processing"""
+        """Tokenize dataset using fast batched processing and split into chunks"""
         print("Tokenizing texts...")
         
         # Create tokenizer instance with name (not self.tokenizer to avoid pickle issues)
@@ -309,8 +313,7 @@ class WikiTextDataset(Dataset):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
             return tokenizer(
                 examples['text'],
-                max_length=self.max_seq_length,
-                truncation=True,
+                truncation=False,
                 padding=False,
             )
         
@@ -324,12 +327,18 @@ class WikiTextDataset(Dataset):
             desc="Tokenizing"
         )
         
-        # Convert to list of tensors, filtering out short sequences
+        # Convert to list of tensors and split into chunks of max_seq_length
         tokenized = []
         for item in tqdm(tokenized_dataset, desc="Processing tokens"):
             tokens = torch.tensor(item['input_ids'], dtype=torch.long)
-            if len(tokens) >= 10:
-                tokenized.append(tokens)
+            if len(tokens) < 10:
+                continue
+            
+            # Split into chunks of max_seq_length
+            for i in range(0, len(tokens), self.max_seq_length):
+                chunk = tokens[i:i + self.max_seq_length]
+                if len(chunk) >= 10:  # Keep chunks with at least 10 tokens
+                    tokenized.append(chunk)
         
         return tokenized
     
