@@ -169,6 +169,7 @@ class GateMLP(nn.Module):
         self.d_model = d_model
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.gate_scale = 20.0  # Initial gate score scale
         
         # Multi-head attention pooling
         self.attention = nn.MultiheadAttention(
@@ -248,7 +249,7 @@ class GateMLP(nn.Module):
             # First step: predict decrease from max (20)
             raw_output = self.first_step_proj(h)
             decrease = nn.functional.softplus(raw_output)
-            gate_output = torch.clamp(20.0 - decrease, min=0.0, max=20.0)
+            gate_output = torch.clamp(self.gate_scale - decrease, min=0.0, max=20.0)
         else:
             # Subsequent steps: predict delta decrease
             raw_output = self.delta_proj(h)
