@@ -203,7 +203,7 @@ class GateMLP(nn.Module):
         
         # First step head
         nn.init.xavier_uniform_(self.first_step_proj.weight)
-        nn.init.constant_(self.first_step_proj.bias, 10.0)
+        nn.init.constant_(self.first_step_proj.bias, self.gate_scale / 2)
         
         # Delta head
         nn.init.xavier_uniform_(self.delta_proj.weight)
