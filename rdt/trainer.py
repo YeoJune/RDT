@@ -161,7 +161,8 @@ class RDTTrainer:
             src_key_padding_mask = (attention_mask == 0)
             h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
             h_0 = self.model.input_norm(h_0)
-            gate_pred_0 = self.model.gate(h_0, attention_mask)
+            # First gate prediction (no previous prediction, so prev_pred=None)
+            gate_pred_0 = self.model.gate(h_0, attention_mask, prev_pred=None)
             
             # Gate Loss for h_0 (predicting s_0's step)
             gate_target_0 = gate_targets[:, 0].unsqueeze(1)  # s_0의 step
@@ -303,7 +304,8 @@ class RDTTrainer:
                 src_key_padding_mask = (attention_mask == 0)
                 h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
                 h_0 = self.model.input_norm(h_0)
-                gate_pred_0 = self.model.gate(h_0, attention_mask)
+                # First gate prediction (no previous prediction, so prev_pred=None)
+                gate_pred_0 = self.model.gate(h_0, attention_mask, prev_pred=None)
                 
                 # Gate Loss for h_0
                 gate_target_0 = gate_targets[:, 0].unsqueeze(1)

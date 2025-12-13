@@ -207,11 +207,15 @@ class GateMLP(nn.Module):
         nn.init.xavier_uniform_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
     
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, prev_pred=None):
         """
         x: [B, L, D] - hidden states
         mask: [B, L] - attention mask (1=valid, 0=padding)
+        prev_pred: [B, 1] - previous step's gate prediction (None for first step)
         Returns: [B, 1] - gate prediction
+        
+        When prev_pred is None: predict timestep directly
+        When prev_pred exists: predict residual and add to prev_pred
         """
         batch_size = x.size(0)
         
@@ -245,8 +249,16 @@ class GateMLP(nn.Module):
         # Output projection
         raw_output = self.output_proj(h)
         
-        # Temperature-scaled softplus
-        gate_output = nn.functional.softplus(raw_output)
+        # Apply activation
+        output = nn.functional.softplus(raw_output)
+        
+        # Residual prediction logic
+        if prev_pred is None:
+            # First step: predict timestep directly
+            gate_output = torch.clamp(20.0 - output, min=0.0)
+        else:
+            # Subsequent steps: predict residual and add to previous prediction
+            gate_output = torch.clamp(prev_pred - output, min=0.0)
         
         return gate_output
 
@@ -330,7 +342,8 @@ class RDT(nn.Module):
         hidden = self.input_norm(hidden)
 
         # 2. Gate Diagnosis
-        predicted_gate = last_gate_score if last_gate_score is not None else self.gate(hidden, attention_mask)
+        # Pass last_gate_score to gate network for residual prediction
+        predicted_gate = self.gate(hidden, attention_mask, prev_pred=last_gate_score)
         
         # 3. Scheduled Sampling (Training Stabilization)
         if self.training and gt_timestep is not None:
@@ -380,7 +393,8 @@ class RDT(nn.Module):
                 )
 
         # 7. Next Gate Prediction
-        next_gate_pred = self.gate(hidden, attention_mask)
+        # Pass current predicted_gate for residual prediction
+        next_gate_pred = self.gate(hidden, attention_mask, prev_pred=predicted_gate)
         
         return hidden, next_gate_pred
     
