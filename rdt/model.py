@@ -174,6 +174,7 @@ class GateMLP(nn.Module):
         self.d_model = d_model
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.step_scale = 20
         
         # Multi-head attention pooling
         self.attention = nn.MultiheadAttention(
@@ -255,7 +256,7 @@ class GateMLP(nn.Module):
         # Residual prediction logic
         if prev_pred is None:
             # First step: predict timestep directly
-            gate_output = torch.clamp(20.0 - output, min=0.0)
+            gate_output = torch.clamp(self.step_scale - output, min=0.0)
         else:
             # Subsequent steps: predict residual and add to previous prediction
             gate_output = torch.clamp(prev_pred - output, min=0.0)
