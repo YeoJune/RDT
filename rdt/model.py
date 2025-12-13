@@ -163,18 +163,12 @@ class DirectionalRecursiveBlock(nn.Module):
         return x
 
 class GateMLP(nn.Module):
-    """
-    Enhanced Gate with configurable depth
-    - Multi-head attention pooling
-    - N-layer MLP with residual connections
-    - Learnable temperature scaling
-    """
-    def __init__(self, d_model: int, hidden_dim: int = 512, num_layers: int = 3, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, d_model: int, hidden_dim: int = 512, num_layers: int = 3, 
+                 num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.step_scale = 20
         
         # Multi-head attention pooling
         self.attention = nn.MultiheadAttention(
@@ -195,8 +189,9 @@ class GateMLP(nn.Module):
                 'dropout': nn.Dropout(dropout)
             }))
         
-        # Output projection
-        self.output_proj = nn.Linear(hidden_dim, 1)
+        # Separate output heads
+        self.first_step_proj = nn.Linear(hidden_dim, 1)
+        self.delta_proj = nn.Linear(hidden_dim, 1)
         
         self._init_weights()
     
@@ -205,18 +200,20 @@ class GateMLP(nn.Module):
             nn.init.xavier_uniform_(layer_dict['linear'].weight)
             nn.init.zeros_(layer_dict['linear'].bias)
         
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        # First step head
+        nn.init.xavier_uniform_(self.first_step_proj.weight)
+        nn.init.constant_(self.first_step_proj.bias, 10.0)
+        
+        # Delta head
+        nn.init.xavier_uniform_(self.delta_proj.weight)
+        nn.init.constant_(self.delta_proj.bias, 1.0)
     
     def forward(self, x, mask=None, prev_pred=None):
         """
         x: [B, L, D] - hidden states
         mask: [B, L] - attention mask (1=valid, 0=padding)
-        prev_pred: [B, 1] - previous step's gate prediction (None for first step)
+        prev_pred: [B, 1] - previous step's gate prediction
         Returns: [B, 1] - gate prediction
-        
-        When prev_pred is None: predict timestep directly
-        When prev_pred exists: predict residual and add to prev_pred
         """
         batch_size = x.size(0)
         
@@ -233,7 +230,7 @@ class GateMLP(nn.Module):
         )
         pooled = pooled.squeeze(1)  # [B, D]
         
-        # N-layer processing with residual connections
+        # N-layer MLP processing
         h = pooled
         for i, layer_dict in enumerate(self.layers):
             h_new = layer_dict['linear'](h)
@@ -241,28 +238,25 @@ class GateMLP(nn.Module):
             h_new = nn.functional.gelu(h_new)
             h_new = layer_dict['dropout'](h_new)
             
-            # Residual connection (skip first layer since dimension changes)
             if i > 0:
                 h = h + h_new
             else:
                 h = h_new
         
-        # Output projection
-        raw_output = self.output_proj(h)
-        
-        # Apply activation
-        output = nn.functional.softplus(raw_output)
-        
-        # Residual prediction logic
+        # Output prediction
         if prev_pred is None:
-            # First step: predict timestep directly
-            gate_output = torch.clamp(self.step_scale - output, min=0.0)
+            # First step: predict decrease from max (20)
+            raw_output = self.first_step_proj(h)
+            decrease = nn.functional.softplus(raw_output)
+            gate_output = torch.clamp(20.0 - decrease, min=0.0, max=20.0)
         else:
-            # Subsequent steps: predict residual and add to previous prediction
-            gate_output = torch.clamp(prev_pred - output, min=0.0)
+            # Subsequent steps: predict delta decrease
+            raw_output = self.delta_proj(h)
+            delta = nn.functional.softplus(raw_output)
+            gate_output = torch.clamp(prev_pred - delta, min=0.0)
         
         return gate_output
-
+    
 class RDT(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_io_layers=1, 
                  d_ff=2048, dropout=0.1, max_seq_len=512,
