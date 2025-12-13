@@ -175,7 +175,7 @@ class RDTTrainer:
             hidden_states = [] if self.loss_weight_aux > 0 else None
             
             # 1. First main encoder forward: h_0 -> h_1
-            step_gt_timestep = gate_targets[:, 1].unsqueeze(1)  # s_1의 step (for scheduled sampling)
+            step_gt_timestep = gate_targets[:, 0].unsqueeze(1)  # s_0의 step (for scheduled sampling)
             hidden, gate_pred, pooled = self.model(
                 h_0,  # Pass h_0 directly
                 attention_mask=attention_mask,
@@ -221,7 +221,7 @@ class RDTTrainer:
                 
                 # Next Step (Recursive)
                 if step_idx < actual_max_length - 1:
-                    next_gt_timestep = gate_targets[:, step_idx + 2].unsqueeze(1)  # [B, 1]
+                    next_gt_timestep = gate_targets[:, step_idx + 1].unsqueeze(1)  # [B, 1]
                     hidden, gate_pred, pooled = self.model.forward(
                         hidden,
                         attention_mask=attention_mask,
