@@ -161,8 +161,8 @@ class RDTTrainer:
             src_key_padding_mask = (attention_mask == 0)
             h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
             h_0 = self.model.input_norm(h_0)
-            # First gate prediction (no previous prediction, so prev_pred=None)
-            gate_pred_0 = self.model.gate(h_0, attention_mask, prev_pred=None)
+            # First gate prediction (no previous prediction, so prev_pooled=None, prev_gate=None)
+            gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask, prev_pooled=None, prev_gate=None)
             
             # Gate Loss for h_0 (predicting s_0's step)
             gate_target_0 = gate_targets[:, 0].unsqueeze(1)  # s_0의 step
@@ -176,9 +176,10 @@ class RDTTrainer:
             
             # 1. First main encoder forward: h_0 -> h_1
             step_gt_timestep = gate_targets[:, 1].unsqueeze(1)  # s_1의 step (for scheduled sampling)
-            hidden, gate_pred = self.model(
+            hidden, gate_pred, pooled = self.model(
                 h_0,  # Pass h_0 directly
                 attention_mask=attention_mask,
+                last_pooled=pooled_0,  # Pass pooled features from h_0
                 is_first_step=False,  # Already processed by input_encoder
                 gt_timestep=step_gt_timestep,
                 sampling_prob=sampling_prob
@@ -221,10 +222,11 @@ class RDTTrainer:
                 # Next Step (Recursive)
                 if step_idx < actual_max_length - 1:
                     next_gt_timestep = gate_targets[:, step_idx + 2].unsqueeze(1)  # [B, 1]
-                    hidden, gate_pred = self.model.forward(
+                    hidden, gate_pred, pooled = self.model.forward(
                         hidden,
                         attention_mask=attention_mask,
                         last_gate_score=gate_pred,
+                        last_pooled=pooled,
                         is_first_step=False,
                         gt_timestep=next_gt_timestep,
                         sampling_prob=sampling_prob
@@ -304,8 +306,8 @@ class RDTTrainer:
                 src_key_padding_mask = (attention_mask == 0)
                 h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
                 h_0 = self.model.input_norm(h_0)
-                # First gate prediction (no previous prediction, so prev_pred=None)
-                gate_pred_0 = self.model.gate(h_0, attention_mask, prev_pred=None)
+                # First gate prediction (no previous prediction, so prev_pooled=None, prev_gate=None)
+                gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask, prev_pooled=None, prev_gate=None)
                 
                 # Gate Loss for h_0
                 gate_target_0 = gate_targets[:, 0].unsqueeze(1)
@@ -313,9 +315,10 @@ class RDTTrainer:
                 batch_gate += gate_loss_0.item()
                 num_valid += 1
                 
-                hidden, gate_pred = self.model(
+                hidden, gate_pred, pooled = self.model(
                     h_0,
-                    attention_mask=attention_mask, 
+                    attention_mask=attention_mask,
+                    last_pooled=pooled_0,
                     is_first_step=False
                 )
                 
@@ -344,10 +347,11 @@ class RDTTrainer:
                     num_valid += 1
                     
                     if step_idx < actual_max_length - 1:
-                        hidden, gate_pred = self.model.forward(
+                        hidden, gate_pred, pooled = self.model.forward(
                             hidden,
                             attention_mask=attention_mask,
                             last_gate_score=gate_pred,
+                            last_pooled=pooled,
                             is_first_step=False
                         )
                 

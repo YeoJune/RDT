@@ -163,13 +163,18 @@ class DirectionalRecursiveBlock(nn.Module):
         return x
 
 class GateMLP(nn.Module):
+    """
+    Gate with residual prediction using concatenated features
+    - Concatenates current and previous pooled features
+    - Uses separate heads for first step vs delta prediction
+    """
     def __init__(self, d_model: int, hidden_dim: int = 512, num_layers: int = 3, 
                  num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.gate_scale = 20.0  # Initial gate score scale
+        self.gate_scale = 20.0  # Max gate score
         
         # Multi-head attention pooling
         self.attention = nn.MultiheadAttention(
@@ -181,11 +186,14 @@ class GateMLP(nn.Module):
         self.query = nn.Parameter(torch.randn(1, 1, d_model))
         nn.init.normal_(self.query, std=0.02)
         
+        # Fusion layer: concat [current, previous] → hidden_dim
+        self.fusion = nn.Linear(d_model * 2, hidden_dim)
+        
         # N-layer MLP with residual connections
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             self.layers.append(nn.ModuleDict({
-                'linear': nn.Linear(d_model if i == 0 else hidden_dim, hidden_dim),
+                'linear': nn.Linear(hidden_dim, hidden_dim),
                 'norm': nn.LayerNorm(hidden_dim),
                 'dropout': nn.Dropout(dropout)
             }))
@@ -197,29 +205,39 @@ class GateMLP(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
+        # Fusion layer
+        nn.init.xavier_uniform_(self.fusion.weight)
+        nn.init.zeros_(self.fusion.bias)
+        
+        # MLP layers
         for layer_dict in self.layers:
             nn.init.xavier_uniform_(layer_dict['linear'].weight)
             nn.init.zeros_(layer_dict['linear'].bias)
         
-        # First step head
+        # First step head: bias towards mid-range decrease (~gate_scale/2)
         nn.init.xavier_uniform_(self.first_step_proj.weight)
         nn.init.constant_(self.first_step_proj.bias, self.gate_scale / 2)
         
-        # Delta head
+        # Delta head: bias towards small decrease (~1)
         nn.init.xavier_uniform_(self.delta_proj.weight)
         nn.init.constant_(self.delta_proj.bias, 1.0)
     
-    def forward(self, x, mask=None, prev_pred=None):
+    def forward(self, x, mask=None, prev_pooled=None, prev_gate=None):
         """
-        x: [B, L, D] - hidden states
-        mask: [B, L] - attention mask (1=valid, 0=padding)
-        prev_pred: [B, 1] - previous step's gate prediction
-        Returns: [B, 1] - gate prediction
+        Args:
+            x: [B, L, D] - current hidden states
+            mask: [B, L] - attention mask (1=valid, 0=padding)
+            prev_pooled: [B, D] - previous step's pooled features (None for first)
+            prev_gate: [B, 1] - previous step's gate prediction (None for first)
+        
+        Returns:
+            gate_output: [B, 1] - current gate prediction
+            pooled: [B, D] - current pooled features (for next step)
         """
         batch_size = x.size(0)
         
         # Multi-head attention pooling
-        query = self.query.expand(batch_size, -1, -1)
+        query = self.query.expand(batch_size, -1, -1)  # [B, 1, D]
         key_padding_mask = (mask == 0) if mask is not None else None
         
         pooled, _ = self.attention(
@@ -231,33 +249,44 @@ class GateMLP(nn.Module):
         )
         pooled = pooled.squeeze(1)  # [B, D]
         
-        # N-layer MLP processing
-        h = pooled
+        # Concatenate with previous pooled features
+        if prev_pooled is None:
+            # First step: use zero tensor
+            prev_pooled = torch.zeros_like(pooled)
+        
+        combined = torch.cat([pooled, prev_pooled], dim=-1)  # [B, 2D]
+        
+        # Fusion layer
+        h = self.fusion(combined)  # [B, 2D] → [B, hidden_dim]
+        h = nn.functional.gelu(h)
+        
+        # N-layer MLP processing with residual connections
         for i, layer_dict in enumerate(self.layers):
             h_new = layer_dict['linear'](h)
             h_new = layer_dict['norm'](h_new)
             h_new = nn.functional.gelu(h_new)
             h_new = layer_dict['dropout'](h_new)
             
+            # Residual connection for layers after the first
             if i > 0:
                 h = h + h_new
             else:
                 h = h_new
         
-        # Output prediction
-        if prev_pred is None:
+        # Output prediction with separate heads
+        if prev_gate is None:
             # First step: predict decrease from max (20)
-            raw_output = self.first_step_proj(h)
-            decrease = nn.functional.softplus(raw_output)
-            gate_output = torch.clamp(self.gate_scale - decrease, min=0.0, max=20.0)
+            raw = self.first_step_proj(h)
+            decrease = nn.functional.softplus(raw)
+            gate_output = torch.clamp(self.gate_scale - decrease, min=0.0)
         else:
             # Subsequent steps: predict delta decrease
-            raw_output = self.delta_proj(h)
-            delta = nn.functional.softplus(raw_output)
-            gate_output = torch.clamp(prev_pred - delta, min=0.0)
+            raw = self.delta_proj(h)
+            delta = nn.functional.softplus(raw)
+            gate_output = torch.clamp(prev_gate - delta, min=0.0)
         
-        return gate_output
-    
+        return gate_output, pooled
+        
 class RDT(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_io_layers=1, 
                  d_ff=2048, dropout=0.1, max_seq_len=512,
@@ -314,9 +343,10 @@ class RDT(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x, context=None, attention_mask=None, context_mask=None, 
-                last_gate_score=None, is_first_step=True, gt_timestep=None, sampling_prob=0.0):
+                last_gate_score=None, last_pooled=None, is_first_step=True, gt_timestep=None, sampling_prob=0.0):
         """
         x: [B, L] (tokens) or [B, L, D] (hidden)
+        last_pooled: [B, D] - previous step's pooled features from gate network
         gt_timestep: [B, 1] Ground truth timestep (0~1), training 시 제공
         sampling_prob: Scheduled sampling probability (0~1)
                        - 0.0: 항상 predicted gate 사용 (inference)
@@ -338,8 +368,8 @@ class RDT(nn.Module):
         hidden = self.input_norm(hidden)
 
         # 2. Gate Diagnosis
-        # Pass last_gate_score to gate network for residual prediction
-        predicted_gate = self.gate(hidden, attention_mask, prev_pred=last_gate_score)
+        # Pass last_gate_score and last_pooled to gate network for residual prediction
+        predicted_gate, current_pooled = self.gate(hidden, attention_mask, prev_pooled=last_pooled, prev_gate=last_gate_score)
         
         # 3. Scheduled Sampling (Training Stabilization)
         if self.training and gt_timestep is not None:
@@ -389,10 +419,10 @@ class RDT(nn.Module):
                 )
 
         # 7. Next Gate Prediction
-        # Pass current predicted_gate for residual prediction
-        next_gate_pred = self.gate(hidden, attention_mask, prev_pred=predicted_gate)
+        # Pass current predicted_gate and current_pooled for residual prediction
+        next_gate_pred, next_pooled = self.gate(hidden, attention_mask, prev_pooled=current_pooled, prev_gate=predicted_gate)
         
-        return hidden, next_gate_pred
+        return hidden, next_gate_pred, next_pooled
     
     def decode(self, hidden, attention_mask=None):
         """
@@ -409,13 +439,14 @@ class RDT(nn.Module):
     def inference(self, x, context=None, max_steps=20, threshold=0.02):
         self.eval()
         with torch.no_grad():
-            hidden, gate_pred = self.forward(x, context=context, is_first_step=True)
+            hidden, gate_pred, pooled = self.forward(x, context=context, is_first_step=True)
             step = 1
             while step < max_steps and gate_pred.mean().item() > threshold:
-                hidden, gate_pred = self.forward(
+                hidden, gate_pred, pooled = self.forward(
                     hidden, 
                     context=context, 
                     last_gate_score=gate_pred,
+                    last_pooled=pooled,
                     is_first_step=False
                 )
                 step += 1
