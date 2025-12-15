@@ -168,6 +168,7 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase):
                 continue
             
             # Standard approach: tokenizer handles chunking with stride
+            # Don't use return_tensors='pt' with return_overflowing_tokens to avoid length mismatch
             encoded = self.tokenizer(
                 text,
                 max_length=self.max_seq_length,
@@ -175,13 +176,20 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase):
                 padding=False,
                 return_overflowing_tokens=True,
                 stride=0,
-                return_tensors='pt'
+                return_tensors=None  # Get list of lists instead of tensor
             )
             
-            # encoded['input_ids'] shape: (num_chunks, seq_len)
-            for tokens in encoded['input_ids']:
+            # encoded['input_ids'] is a list of token lists, each with potentially different lengths
+            for token_ids in encoded['input_ids']:
+                # Convert to tensor and ensure minimum length
+                tokens = torch.tensor(token_ids, dtype=torch.long)
                 if len(tokens) < 10:
                     continue
+                
+                # Slice to exact max_seq_length if needed (handles any remaining edge cases)
+                if len(tokens) > self.max_seq_length:
+                    tokens = tokens[:self.max_seq_length]
+                
                 yield self._process_text(tokens)
 
 
