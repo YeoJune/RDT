@@ -240,6 +240,10 @@ def load_test_texts(tokenizer, split='test', num_samples=100):
 
 def main():
     parser = argparse.ArgumentParser(description='Test RoBERTa-base Masking Reconstruction')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to fine-tuned checkpoint (optional, uses pretrained if not provided)')
+    parser.add_argument('--model_name', type=str, default='roberta-base',
+                        help='Pretrained model name (used if no checkpoint)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use')
     parser.add_argument('--num_samples', type=int, default=100,
@@ -261,12 +265,20 @@ def main():
     print(f"Using device: {device}")
     
     # Load RoBERTa model and tokenizer
-    print("Loading RoBERTa-base model...")
-    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
-    model = RobertaForMaskedLM.from_pretrained('roberta-base')
+    if args.checkpoint:
+        print(f"Loading fine-tuned model from {args.checkpoint}...")
+        tokenizer = RobertaTokenizer.from_pretrained(args.checkpoint)
+        model = RobertaForMaskedLM.from_pretrained(args.checkpoint)
+        model_desc = f"fine-tuned from {args.checkpoint}"
+    else:
+        print(f"Loading pretrained {args.model_name}...")
+        tokenizer = RobertaTokenizer.from_pretrained(args.model_name)
+        model = RobertaForMaskedLM.from_pretrained(args.model_name)
+        model_desc = f"pretrained {args.model_name}"
+    
     model = model.to(device)
     model.eval()
-    print("Model loaded")
+    print(f"Model loaded: {model_desc}")
     
     # Load test data
     test_texts = load_test_texts(tokenizer, num_samples=args.num_samples)
