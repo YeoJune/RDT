@@ -11,7 +11,7 @@ model:
 # Training Strategy
 training:
   # Basic settings
-  batch_size: 64
+  batch_size: 128
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 3
   max_training_steps: 100000 # Used when training_mode is 'step'
