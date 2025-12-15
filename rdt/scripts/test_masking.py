@@ -330,22 +330,20 @@ def load_test_texts_roberta(tokenizer, num_samples=100):
 
 def main():
     parser = argparse.ArgumentParser(description='Test Masking Reconstruction for RDT and RoBERTa')
-    parser.add_argument('--model_type', type=str, required=True, choices=['rdt', 'roberta'],
-                        help='Model type: rdt or roberta')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, default=None,
-                        help='Path to config file (required for RDT)')
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to config file')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use')
     parser.add_argument('--num_samples', type=int, default=100,
                         help='Number of test samples')
     parser.add_argument('--max_seq_len', type=int, default=None,
-                        help='Maximum sequence length (optional for RoBERTa, uses config for RDT)')
-    parser.add_argument('--max_steps', type=int, default=20,
-                        help='Maximum inference steps')
+                        help='Maximum sequence length (optional override)')
+    parser.add_argument('--max_steps', type=int, default=None,
+                        help='Maximum inference steps (optional override)')
     parser.add_argument('--threshold', type=float, default=None,
-                        help='Confidence threshold (default: 0.5 for RDT, 0.95 for RoBERTa)')
+                        help='Confidence threshold (optional override)')
     parser.add_argument('--mode', type=str, default='single', choices=['single', 'iterative'],
                         help='RoBERTa inference mode: single-pass or iterative')
     parser.add_argument('--output', type=str, default=None,
@@ -353,24 +351,23 @@ def main():
     
     args = parser.parse_args()
     
+    # Load config
+    config = load_config(args.config)
+    model_type = config.get('model_type', 'rdt').lower()
+    print(f"\nModel type: {model_type.upper()}")
+    
     # Set default output path
     if args.output is None:
-        args.output = f'{args.model_type}_masking_results.png'
+        args.output = f'{model_type}_masking_results.png'
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    if args.model_type == 'rdt':
+    if model_type == 'rdt':
         # ===== RDT Model =====
         # Load checkpoint
         print(f"Loading RDT checkpoint from {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, map_location='cpu')
-        
-        # Get config
-        if args.config:
-            config = load_config(args.config)
-        else:
-            config = checkpoint['config']
         
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
@@ -407,9 +404,9 @@ def main():
         # Define masking ratios
         mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
-        # Set threshold
-        threshold = args.threshold if args.threshold else config['model']['threshold']
-        max_steps = args.max_steps if args.max_steps else config['training']['total_steps']
+        # Set threshold and max_steps
+        threshold = args.threshold if args.threshold is not None else config['model']['threshold']
+        max_steps = args.max_steps if args.max_steps is not None else config['training']['total_steps']
         
         # Test model
         accuracies, steps = test_rdt_model(
@@ -435,10 +432,11 @@ def main():
         # Visualize
         visualize_results(mask_ratios, accuracies, steps, 'rdt', args.mode, args.output)
     
-    else:
-        # ===== RoBERTa Model =====
+    elif model_type == 'mlm':
+        # ===== RoBERTa/BERT Model =====
         # Load model and tokenizer
-        print(f"Loading RoBERTa model from {args.checkpoint}...")
+        model_name = config['model']['name']
+        print(f"Loading MLM model from {args.checkpoint}...")
         tokenizer = RobertaTokenizer.from_pretrained(args.checkpoint)
         model = RobertaForMaskedLM.from_pretrained(args.checkpoint)
         model = model.to(device)
@@ -454,19 +452,20 @@ def main():
         mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
         # Set default parameters
-        max_seq_len = args.max_seq_len if args.max_seq_len else 128
-        threshold = args.threshold if args.threshold else 0.95
+        max_seq_len = args.max_seq_len if args.max_seq_len is not None else config['data'].get('max_seq_length', 128)
+        threshold = args.threshold if args.threshold is not None else 0.95
+        max_steps = args.max_steps if args.max_steps is not None else 20
         
         # Test model
         accuracies, steps = test_roberta_model(
             model, tokenizer, test_texts, mask_ratios, 
-            device, max_seq_len, args.mode, args.max_steps, threshold
+            device, max_seq_len, args.mode, max_steps, threshold
         )
         
         # Print results
         mode_name = "Single-pass" if args.mode == 'single' else "Iterative"
         print("\n" + "="*60)
-        print(f"RoBERTa-base {mode_name} Test Results")
+        print(f"{model_name} {mode_name} Test Results")
         print("="*60)
         print(f"{'Masking %':<12} {'Accuracy':<12} {'Avg Steps':<12}")
         print("-"*60)
@@ -481,6 +480,9 @@ def main():
         
         # Visualize
         visualize_results(mask_ratios, accuracies, steps, 'roberta', args.mode, args.output)
+    
+    else:
+        raise ValueError(f"Unknown model type: {model_type}. Must be 'rdt' or 'mlm'")
 
 
 if __name__ == '__main__':
