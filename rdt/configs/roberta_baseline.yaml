@@ -11,7 +11,7 @@ model:
 # Training Strategy
 training:
   # Basic settings
-  batch_size: 128
+  batch_size: 64
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 3
   max_training_steps: 100000 # Used when training_mode is 'step'
@@ -34,7 +34,7 @@ training:
 
 # Data
 data:
-  dataset_name: "wikitext-103" # 'wikitext-2' or 'wikitext-103'
+  dataset_name: "wikitext-2" # 'wikitext-2' or 'wikitext-103'
   streaming: false
   max_seq_length: 128
   mlm_probability: 0.15 # Standard BERT/RoBERTa masking ratio
