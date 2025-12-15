@@ -6,94 +6,9 @@ import torch
 from transformers import AutoTokenizer
 
 from rdt.models import RDT, BaselineMLM
-from rdt.data import create_dataloaders
-from rdt.data.collators import get_collator
+from rdt.data import create_dataloaders, create_mlm_dataloaders
 from rdt.training import RDTTrainer, BaselineTrainer
 from rdt.utils import load_config, merge_configs, set_seed, get_device, create_model_from_config
-
-
-def create_mlm_dataloaders(config):
-    """Create dataloaders for MLM training"""
-    from torch.utils.data import DataLoader
-    from datasets import load_dataset
-    
-    data_config = config['data']
-    training_config = config['training']
-    
-    tokenizer = AutoTokenizer.from_pretrained(data_config['tokenizer_name'])
-    
-    # Load dataset
-    dataset_name = data_config['dataset_name']
-    if 'wikitext-2' in dataset_name:
-        dataset_config = 'wikitext-2-raw-v1'
-    else:
-        dataset_config = 'wikitext-103-raw-v1'
-    
-    print(f"Loading {dataset_name} dataset...")
-    train_dataset = load_dataset('wikitext', dataset_config, split='train')
-    val_dataset = load_dataset('wikitext', dataset_config, split='validation')
-    
-    # Tokenization function
-    def tokenize_function(examples):
-        texts = [text for text in examples['text'] if len(text.strip()) > 50]
-        if not texts:
-            return {'input_ids': [], 'attention_mask': []}
-        
-        return tokenizer(
-            texts,
-            truncation=True,
-            max_length=data_config['max_seq_length'],
-            padding='max_length',
-            return_special_tokens_mask=True
-        )
-    
-    print("Tokenizing datasets...")
-    train_dataset = train_dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=train_dataset.column_names,
-        desc="Tokenizing train"
-    )
-    val_dataset = val_dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=val_dataset.column_names,
-        desc="Tokenizing validation"
-    )
-    
-    # Filter empty examples
-    train_dataset = train_dataset.filter(lambda x: len(x['input_ids']) > 0)
-    val_dataset = val_dataset.filter(lambda x: len(x['input_ids']) > 0)
-    
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-    
-    # Create collator
-    collator = get_collator(
-        model_type='mlm',
-        tokenizer=tokenizer,
-        mlm_probability=data_config.get('mlm_probability', 0.15)
-    )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=training_config['batch_size'],
-        shuffle=True,
-        num_workers=data_config['num_workers'],
-        pin_memory=data_config['pin_memory'],
-        collate_fn=collator
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=training_config['batch_size'],
-        shuffle=False,
-        num_workers=data_config['num_workers'],
-        pin_memory=data_config['pin_memory'],
-        collate_fn=collator
-    )
-    
-    return train_loader, val_loader
 
 
 def main():

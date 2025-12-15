@@ -6,73 +6,9 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 from rdt.models import RDT, BaselineMLM
-from rdt.data import create_dataloaders
+from rdt.data import create_dataloaders, create_mlm_dataloaders
 from rdt.evaluation import Evaluator
 from rdt.utils import load_config, load_checkpoint, get_device, create_model_from_config
-
-
-def create_mlm_dataloaders(config):
-    """Create dataloaders for MLM evaluation"""
-    from torch.utils.data import DataLoader
-    from datasets import load_dataset
-    from rdt.data.collators import get_collator
-    
-    data_config = config['data']
-    
-    tokenizer = AutoTokenizer.from_pretrained(data_config['tokenizer_name'])
-    
-    # Load dataset
-    dataset_name = data_config['dataset_name']
-    if 'wikitext-2' in dataset_name:
-        dataset_config = 'wikitext-2-raw-v1'
-    else:
-        dataset_config = 'wikitext-103-raw-v1'
-    
-    print(f"Loading {dataset_name} test set...")
-    test_dataset = load_dataset('wikitext', dataset_config, split='test')
-    
-    # Tokenization
-    def tokenize_function(examples):
-        texts = [text for text in examples['text'] if len(text.strip()) > 50]
-        if not texts:
-            return {'input_ids': [], 'attention_mask': []}
-        
-        return tokenizer(
-            texts,
-            truncation=True,
-            max_length=data_config['max_seq_length'],
-            padding='max_length',
-            return_special_tokens_mask=True
-        )
-    
-    test_dataset = test_dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=test_dataset.column_names,
-        desc="Tokenizing test"
-    )
-    test_dataset = test_dataset.filter(lambda x: len(x['input_ids']) > 0)
-    
-    print(f"Test samples: {len(test_dataset)}")
-    
-    # Create collator
-    collator = get_collator(
-        model_type='mlm',
-        tokenizer=tokenizer,
-        mlm_probability=data_config.get('mlm_probability', 0.15)
-    )
-    
-    # Create dataloader
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=False,
-        num_workers=data_config['num_workers'],
-        pin_memory=data_config['pin_memory'],
-        collate_fn=collator
-    )
-    
-    return test_loader
 
 
 def main():
