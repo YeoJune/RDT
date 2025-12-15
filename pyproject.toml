@@ -46,6 +46,7 @@ dev = [
 
 [project.scripts]
 rdt-train = "rdt.scripts.train:main"
+rdt-evaluate = "rdt.scripts.evaluate:main"
 rdt-inference = "rdt.scripts.inference:main"
 rdt-test-masking = "rdt.scripts.test_masking:main"
 

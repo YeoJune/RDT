@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Dict, Tuple
 import math
 
-from .model import RDT
-from .utils import save_checkpoint, cleanup_checkpoints, count_parameters
+from ..models.rdt_model import RDT
+from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters
 
 
 class RDTTrainer:

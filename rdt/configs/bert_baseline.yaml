@@ -1,0 +1,50 @@
+# BERT Baseline Configuration (Unified Format)
+
+# Model Type
+model_type: "mlm"
+
+# Model Architecture
+model:
+  name: "bert-base-uncased"
+
+# Training Strategy
+training:
+  batch_size: 64
+  training_mode: "epoch"
+  num_epochs: 3
+  max_training_steps: 100000
+
+  learning_rate: 0.0001 # 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+
+  scheduler: "cosine"
+  max_grad_norm: 1.0
+
+  save_every_n_epochs: 1
+  save_every_n_steps: 1000
+  keep_last_n_checkpoints: 3
+
+# Data
+data:
+  dataset_name: "wikitext-103"
+  streaming: false
+  max_seq_length: 128
+  mlm_probability: 0.15
+
+  tokenizer_name: "bert-base-uncased"
+  num_workers: 4
+  pin_memory: true
+
+# Logging & Checkpoints
+output:
+  checkpoint_dir: "checkpoints/bert_baseline"
+  log_dir: "runs/bert_baseline"
+  log_every_n_steps: 100
+  eval_every_n_epochs: 1
+  eval_every_n_steps: 1000
+
+# Hardware
+device: "cuda"
+mixed_precision: true
+seed: 42

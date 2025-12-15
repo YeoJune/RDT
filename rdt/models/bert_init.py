@@ -345,7 +345,7 @@ def initialize_rdt_with_bert(
     Returns:
         RDT model with BERT-initialized weights
     """
-    from .model import RDT
+    from .rdt_model import RDT
     
     # Load BERT config for validation
     bert_config = AutoConfig.from_pretrained(bert_model_name)

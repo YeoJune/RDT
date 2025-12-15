@@ -6,15 +6,18 @@ Enhanced with noise-level conditioning and directional recursive blocks.
 
 __version__ = "0.2.0"
 
-from .model import (
-    RDT,
-    PositionalEncoding,
-    TimestepEmbedder,
-    DirectionalRecursiveBlock,
-    GateMLP,
-)
-from .data import WikiTextDataset, create_dataloaders
-from .trainer import RDTTrainer
+# Import main modules
+from . import models
+from . import data  
+from . import training
+from . import evaluation
+from . import utils
+
+# Import commonly used classes for convenience
+from .models import RDT, BaselineMLM
+from .data import create_dataloaders
+from .training import RDTTrainer, BaselineTrainer
+from .evaluation import Evaluator
 from .utils import (
     load_config,
     merge_configs,
@@ -26,23 +29,28 @@ from .utils import (
 )
 
 __all__ = [
-    # Model components
-    "RDT",
-    "PositionalEncoding",
-    "TimestepEmbedder",
-    "DirectionalRecursiveBlock",
-    "GateMLP",
+    # Modules
+    'models',
+    'data',
+    'training',
+    'evaluation',
+    'utils',
+    # Models
+    'RDT',
+    'BaselineMLM',
     # Data
-    "WikiTextDataset",
-    "create_dataloaders",
+    'create_dataloaders',
     # Training
-    "RDTTrainer",
+    'RDTTrainer',
+    'BaselineTrainer',
+    # Evaluation
+    'Evaluator',
     # Utilities
-    "load_config",
-    "merge_configs",
-    "set_seed",
-    "save_checkpoint",
-    "load_checkpoint",
-    "get_device",
-    "count_parameters",
+    'load_config',
+    'merge_configs',
+    'set_seed',
+    'save_checkpoint',
+    'load_checkpoint',
+    'get_device',
+    'count_parameters',
 ]

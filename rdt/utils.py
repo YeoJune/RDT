@@ -133,13 +133,13 @@ def create_model_from_config(config: Dict, vocab_size: int):
     Returns:
         RDT model instance
     """
-    from .model import RDT
+    from .models.rdt_model import RDT
     
     model_config = config['model']
     use_bert_init = model_config.get('use_bert_init', False)
     
     if use_bert_init:
-        from .bert_init import initialize_rdt_with_bert
+        from .models.bert_init import initialize_rdt_with_bert
         
         bert_model_name = model_config.get('bert_model_name', 'prajjwal1/bert-medium')
         

@@ -46,7 +46,6 @@ runs/
 *.log
 
 # Data
-data/
 *.csv
 *.json
 

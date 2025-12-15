@@ -1,5 +1,8 @@
 # RDT Base Configuration (Document Recommended Settings)
 
+# Model Type
+model_type: "rdt" # 'rdt' or 'mlm'
+
 # Model Architecture
 model:
   d_model: 512 # Hidden dimension (auto-set from BERT if use_bert_init=true)

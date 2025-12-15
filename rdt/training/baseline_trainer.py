@@ -1,0 +1,339 @@
+"""Baseline trainer for standard MLM models (BERT, RoBERTa, etc.)"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
+from pathlib import Path
+from typing import Dict
+import math
+
+
+class BaselineTrainer:
+    """
+    Trainer for standard Masked Language Model baselines.
+    Compatible with HuggingFace models wrapped in BaselineMLM.
+    """
+    
+    def __init__(
+        self,
+        model,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        config: Dict,
+        device: torch.device
+    ):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
+        self.device = device
+        
+        # Training config
+        self.training_mode = config['training'].get('training_mode', 'epoch')
+        self.num_epochs = config['training'].get('num_epochs', 10)
+        self.max_training_steps = config['training'].get('max_training_steps', 100000)
+        self.max_grad_norm = config['training']['max_grad_norm']
+        
+        # Optimizer
+        self.optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config['training']['learning_rate'],
+            weight_decay=config['training']['weight_decay']
+        )
+        
+        # Scheduler
+        self.scheduler = self._create_scheduler()
+        
+        # Logging
+        log_dir = Path(config['output']['log_dir'])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=log_dir)
+        self.log_every_n_steps = config['output']['log_every_n_steps']
+        self.eval_every_n_epochs = config['output'].get('eval_every_n_epochs', 1)
+        self.eval_every_n_steps = config['output'].get('eval_every_n_steps', 5000)
+        
+        # AMP
+        self.use_amp = config.get('mixed_precision', False)
+        self.scaler = GradScaler() if self.use_amp else None
+        
+        # Checkpointing
+        self.checkpoint_dir = Path(config['output']['checkpoint_dir'])
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if self.training_mode == 'epoch':
+            self.save_every_n_epochs = config['training'].get('save_every_n_epochs', 1)
+            self.save_every_n_steps = None
+        else:
+            self.save_every_n_steps = config['training'].get('save_every_n_steps', 10000)
+            self.save_every_n_epochs = None
+        self.keep_last_n_checkpoints = config['training']['keep_last_n_checkpoints']
+        
+        # State
+        self.global_step = 0
+        self.current_epoch = 0
+        self.best_val_loss = float('inf')
+        
+        # Print info
+        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Model parameters: {num_params:,}")
+    
+    def _create_scheduler(self):
+        """Create learning rate scheduler"""
+        if self.training_mode == 'epoch':
+            total_steps = len(self.train_loader) * self.num_epochs
+        else:
+            total_steps = self.max_training_steps
+        
+        warmup_steps = int(total_steps * self.config['training'].get('warmup_ratio', 0.1))
+        
+        if self.config['training']['scheduler'] == 'cosine':
+            return optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=self.config['training']['learning_rate'],
+                total_steps=total_steps,
+                pct_start=warmup_steps / total_steps,
+                anneal_strategy='cos'
+            )
+        else:  # linear
+            return optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=lambda step: min(1.0, step / warmup_steps) if step < warmup_steps 
+                else max(0.0, (total_steps - step) / (total_steps - warmup_steps))
+            )
+    
+    def train_step(self, batch):
+        """Single training step for MLM"""
+        self.model.train()
+        
+        # Move batch to device
+        input_ids = batch['input_ids'].to(self.device)
+        attention_mask = batch.get('attention_mask')
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+        labels = batch['labels'].to(self.device)
+        
+        # Forward pass with AMP
+        if self.use_amp:
+            with autocast():
+                loss, logits = self.model(input_ids, attention_mask, labels)
+        else:
+            loss, logits = self.model(input_ids, attention_mask, labels)
+        
+        # Backward pass
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+        
+        self.optimizer.zero_grad()
+        self.scheduler.step()
+        
+        # Calculate accuracy (on masked tokens only)
+        mask = labels != -100
+        if mask.sum() > 0:
+            pred_tokens = logits.argmax(dim=-1)
+            correct = (pred_tokens == labels) & mask
+            accuracy = correct.sum().float() / mask.sum().float()
+        else:
+            accuracy = torch.tensor(0.0)
+        
+        return {
+            'loss': loss.item(),
+            'accuracy': accuracy.item(),
+            'lr': self.scheduler.get_last_lr()[0]
+        }
+    
+    def evaluate(self):
+        """Evaluate on validation set"""
+        self.model.eval()
+        total_loss = 0
+        total_accuracy = 0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch.get('attention_mask')
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                if self.use_amp:
+                    with autocast():
+                        loss, logits = self.model(input_ids, attention_mask, labels)
+                else:
+                    loss, logits = self.model(input_ids, attention_mask, labels)
+                
+                # Calculate accuracy
+                mask = labels != -100
+                if mask.sum() > 0:
+                    pred_tokens = logits.argmax(dim=-1)
+                    correct = (pred_tokens == labels) & mask
+                    accuracy = correct.sum().float() / mask.sum().float()
+                else:
+                    accuracy = torch.tensor(0.0)
+                
+                total_loss += loss.item()
+                total_accuracy += accuracy.item()
+                num_batches += 1
+        
+        avg_loss = total_loss / num_batches
+        avg_accuracy = total_accuracy / num_batches
+        perplexity = math.exp(avg_loss)
+        
+        return {
+            'val_loss': avg_loss,
+            'val_accuracy': avg_accuracy,
+            'val_perplexity': perplexity
+        }
+    
+    def save_checkpoint(self, filename=None):
+        """Save checkpoint"""
+        if filename is None:
+            if self.training_mode == 'epoch':
+                filename = f"checkpoint_epoch_{self.current_epoch}_step_{self.global_step}.pt"
+            else:
+                filename = f"checkpoint_step_{self.global_step}.pt"
+        
+        checkpoint_path = self.checkpoint_dir / filename
+        
+        torch.save({
+            'epoch': self.current_epoch,
+            'step': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'config': self.config,
+            'best_val_loss': self.best_val_loss
+        }, checkpoint_path)
+        
+        print(f"Checkpoint saved: {checkpoint_path}")
+        
+        # Cleanup old checkpoints
+        self._cleanup_checkpoints()
+        
+        return checkpoint_path
+    
+    def _cleanup_checkpoints(self):
+        """Keep only last N checkpoints"""
+        checkpoints = sorted(
+            self.checkpoint_dir.glob("checkpoint_*.pt"),
+            key=lambda x: x.stat().st_mtime
+        )
+        
+        if len(checkpoints) > self.keep_last_n_checkpoints:
+            for ckpt in checkpoints[:-self.keep_last_n_checkpoints]:
+                ckpt.unlink()
+    
+    def train(self):
+        """Main training loop"""
+        print("\n" + "="*60)
+        print("Starting Baseline MLM Training")
+        print("="*60)
+        print(f"Training mode: {self.training_mode}")
+        if self.training_mode == 'epoch':
+            print(f"Epochs: {self.num_epochs}")
+        else:
+            print(f"Max steps: {self.max_training_steps}")
+        print("="*60 + "\n")
+        
+        if self.training_mode == 'epoch':
+            self._train_by_epoch()
+        else:
+            self._train_by_step()
+        
+        print("\n" + "="*60)
+        print("Training completed!")
+        print("="*60)
+    
+    def _train_by_epoch(self):
+        """Train by epochs"""
+        for epoch in range(self.current_epoch, self.num_epochs):
+            self.current_epoch = epoch
+            print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
+            
+            # Training loop
+            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}")
+            for batch in pbar:
+                metrics = self.train_step(batch)
+                self.global_step += 1
+                
+                # Logging
+                if self.global_step % self.log_every_n_steps == 0:
+                    for key, value in metrics.items():
+                        self.writer.add_scalar(f'train/{key}', value, self.global_step)
+                    pbar.set_postfix(loss=f"{metrics['loss']:.4f}", 
+                                    acc=f"{metrics['accuracy']:.4f}")
+            
+            # Evaluation
+            if (epoch + 1) % self.eval_every_n_epochs == 0:
+                val_metrics = self.evaluate()
+                for key, value in val_metrics.items():
+                    self.writer.add_scalar(key, value, self.global_step)
+                
+                print(f"\nValidation - Loss: {val_metrics['val_loss']:.4f}, "
+                      f"Accuracy: {val_metrics['val_accuracy']:.4f}, "
+                      f"Perplexity: {val_metrics['val_perplexity']:.2f}")
+                
+                # Save best model
+                if val_metrics['val_loss'] < self.best_val_loss:
+                    self.best_val_loss = val_metrics['val_loss']
+                    self.save_checkpoint('best_model.pt')
+            
+            # Save checkpoint
+            if (epoch + 1) % self.save_every_n_epochs == 0:
+                self.save_checkpoint()
+    
+    def _train_by_step(self):
+        """Train by steps"""
+        pbar = tqdm(total=self.max_training_steps, desc="Training")
+        pbar.update(self.global_step)
+        
+        epoch = 0
+        while self.global_step < self.max_training_steps:
+            for batch in self.train_loader:
+                if self.global_step >= self.max_training_steps:
+                    break
+                
+                metrics = self.train_step(batch)
+                self.global_step += 1
+                pbar.update(1)
+                
+                # Logging
+                if self.global_step % self.log_every_n_steps == 0:
+                    for key, value in metrics.items():
+                        self.writer.add_scalar(f'train/{key}', value, self.global_step)
+                    pbar.set_postfix(loss=f"{metrics['loss']:.4f}",
+                                    acc=f"{metrics['accuracy']:.4f}")
+                
+                # Evaluation
+                if self.global_step % self.eval_every_n_steps == 0:
+                    val_metrics = self.evaluate()
+                    for key, value in val_metrics.items():
+                        self.writer.add_scalar(key, value, self.global_step)
+                    
+                    print(f"\nStep {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}, "
+                          f"Accuracy: {val_metrics['val_accuracy']:.4f}, "
+                          f"Perplexity: {val_metrics['val_perplexity']:.2f}")
+                    
+                    # Save best model
+                    if val_metrics['val_loss'] < self.best_val_loss:
+                        self.best_val_loss = val_metrics['val_loss']
+                        self.save_checkpoint('best_model.pt')
+                
+                # Save checkpoint
+                if self.global_step % self.save_every_n_steps == 0:
+                    self.save_checkpoint()
+            
+            epoch += 1
+        
+        pbar.close()
