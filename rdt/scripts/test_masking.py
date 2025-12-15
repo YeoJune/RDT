@@ -310,12 +310,27 @@ def load_test_texts_rdt(config, num_samples=100):
     return texts
 
 
-def load_test_texts_roberta(tokenizer, num_samples=100):
-    """Load test texts from WikiText for RoBERTa"""
+def load_test_texts_roberta(config, tokenizer, num_samples=100):
+    """Load test texts from WikiText for RoBERTa/MLM models"""
     from datasets import load_dataset
     
-    print(f"Loading test data from WikiText-103...")
-    dataset = load_dataset('wikitext', 'wikitext-103-raw-v1', split='test')
+    # Get dataset name from config
+    dataset_name = config['data'].get('dataset_name', 'wikitext-2')
+    
+    # Map simplified names to full dataset names
+    dataset_map = {
+        'wikitext-2': 'wikitext-2-raw-v1',
+        'wikitext-103': 'wikitext-103-raw-v1'
+    }
+    
+    # Handle both formats
+    if dataset_name in dataset_map:
+        full_dataset_name = dataset_map[dataset_name]
+    else:
+        full_dataset_name = dataset_name
+    
+    print(f"Loading test data from {full_dataset_name}...")
+    dataset = load_dataset('wikitext', full_dataset_name, split='test')
     
     texts = []
     for item in dataset:
@@ -470,13 +485,13 @@ def main():
         print(f"Model loaded: {model_name}")
         
         # Load test data
-        test_texts = load_test_texts_roberta(tokenizer, num_samples=args.num_samples)
+        test_texts = load_test_texts_roberta(config, tokenizer, num_samples=args.num_samples)
         print(f"Loaded {len(test_texts)} test texts")
         
         # Define masking ratios
         mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
-        # Set default parameters
+        # Set default parameters from config
         max_seq_len = args.max_seq_len if args.max_seq_len is not None else config['data'].get('max_seq_length', 128)
         threshold = args.threshold if args.threshold is not None else 0.95
         max_steps = args.max_steps if args.max_steps is not None else 20
