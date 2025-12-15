@@ -105,7 +105,6 @@ def main():
         fp16=torch.cuda.is_available(),
         dataloader_num_workers=training_config.get('num_workers', 4),
         report_to='none',
-        evaluation_strategy='no',
     )
     
     # Trainer
