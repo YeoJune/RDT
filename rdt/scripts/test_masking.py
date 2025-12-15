@@ -4,7 +4,7 @@ import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import AutoTokenizer, RobertaTokenizer, RobertaForMaskedLM
+from transformers import AutoTokenizer, RobertaForMaskedLM
 from tqdm import tqdm
 from pathlib import Path
 
@@ -434,15 +434,40 @@ def main():
     
     elif model_type == 'mlm':
         # ===== RoBERTa/BERT Model =====
-        # Load model and tokenizer
         model_name = config['model']['name']
-        print(f"Loading MLM model from {args.checkpoint}...")
-        tokenizer = RobertaTokenizer.from_pretrained(args.checkpoint)
-        model = RobertaForMaskedLM.from_pretrained(args.checkpoint)
+        
+        # Check if checkpoint is a directory or file
+        checkpoint_path = Path(args.checkpoint)
+        is_checkpoint_dir = checkpoint_path.is_dir()
+        
+        if is_checkpoint_dir:
+            # Load from HuggingFace checkpoint directory
+            print(f"Loading MLM model from checkpoint directory: {args.checkpoint}")
+            tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
+            model = RobertaForMaskedLM.from_pretrained(args.checkpoint)
+        else:
+            # Load from custom checkpoint file
+            print(f"Loading tokenizer from {model_name}")
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            print(f"Loading model from checkpoint: {args.checkpoint}")
+            model = RobertaForMaskedLM.from_pretrained(model_name)
+            
+            # Load state dict if .pt file exists
+            if checkpoint_path.suffix == '.pt':
+                checkpoint = torch.load(args.checkpoint, map_location='cpu')
+                if 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                elif 'state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['state_dict'])
+                else:
+                    model.load_state_dict(checkpoint)
+                print(f"Loaded weights from {args.checkpoint}")
+        
         model = model.to(device)
         model.eval()
         
-        print(f"Model loaded from {args.checkpoint}")
+        print(f"Model loaded: {model_name}")
         
         # Load test data
         test_texts = load_test_texts_roberta(tokenizer, num_samples=args.num_samples)
