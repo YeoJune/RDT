@@ -167,46 +167,60 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
 
 def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, mode='single', max_steps=20, threshold=0.95):
     """Test RoBERTa model across different masking levels"""
-    """Test model across different masking levels"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
     
     results = {ratio: [] for ratio in mask_ratios}
     steps_taken = {ratio: [] for ratio in mask_ratios}
     
-    print(f"\nTesting reconstruction capability (max_seq_len={max_seq_len})...")
+    mode_name = "Single-pass" if mode == 'single' else "Iterative"
+    print(f"\nTesting RoBERTa {mode_name} reconstruction (max_seq_len={max_seq_len})...")
     
     for text in tqdm(test_texts, desc="Processing texts"):
-        # Tokenize with config max_length
+        # Tokenize
         encoded = tokenizer(
             text, 
             return_tensors='pt', 
             truncation=True, 
             max_length=max_seq_len,
-            padding=False
+            padding='max_length'
         )
         tokens = encoded['input_ids'].squeeze(0)
+        attention_mask = encoded['attention_mask'].squeeze(0)
         
-        if len(tokens) < 10:
+        # Filter out padding for evaluation
+        valid_positions = attention_mask.bool()
+        valid_tokens = tokens[valid_positions]
+        
+        if len(valid_tokens) < 10:
             continue
         
         # Test each masking ratio
         for ratio in mask_ratios:
-            # Create masked input
-            masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id)
-            input_ids = masked_tokens.unsqueeze(0).to(device)
+            # Create masked input (only on valid positions)
+            masked_tokens, eval_mask = create_masked_input(valid_tokens, ratio, mask_token_id)
+            
+            # Put back into full sequence
+            full_masked = tokens.clone()
+            full_masked[valid_positions] = masked_tokens
+            
+            input_ids = full_masked.unsqueeze(0).to(device)
+            attn_mask = attention_mask.unsqueeze(0).to(device)
             
             # Inference
-            with torch.no_grad():
-                output_ids, num_steps = model.inference(
-                    input_ids,
-                    max_steps=max_steps,
-                    threshold=threshold
+            if mode == 'single':
+                pred_tokens_full = roberta_single_pass_inference(model, input_ids, attn_mask)
+                num_steps = 1
+            else:
+                pred_tokens_full, num_steps = roberta_iterative_inference(
+                    model, input_ids, attn_mask, mask_token_id, max_steps, threshold
                 )
             
+            # Extract predictions on valid positions
+            pred_tokens = pred_tokens_full.squeeze(0).cpu()[valid_positions]
+            
             # Calculate accuracy
-            pred_tokens = output_ids.squeeze(0).cpu()
-            accuracy = calculate_accuracy(pred_tokens, tokens, eval_mask)
+            accuracy = calculate_accuracy(pred_tokens, valid_tokens, eval_mask)
             
             results[ratio].append(accuracy)
             steps_taken[ratio].append(num_steps)
