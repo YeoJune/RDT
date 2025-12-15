@@ -257,7 +257,7 @@ def visualize_results(mask_ratios, accuracies, steps, model_type='rdt', mode='si
     
     # Plot 1: Accuracy vs Masking Ratio
     mask_percentages = [r * 100 for r in mask_ratios]
-    ax1.plot(mask_percentages, list(accuracies.values()), f'{color_acc}-o', linewidth=2, markersize=8)
+    ax1.plot(mask_percentages, list(accuracies.values()), marker='o', color=color_acc, linewidth=2, markersize=8)
     ax1.set_xlabel('Masking Ratio (%)', fontsize=12)
     ax1.set_ylabel('Reconstruction Accuracy', fontsize=12)
     ax1.set_title(f'{title_prefix} Reconstruction Accuracy', fontsize=14, fontweight='bold')
@@ -271,7 +271,7 @@ def visualize_results(mask_ratios, accuracies, steps, model_type='rdt', mode='si
                     xytext=(0,10), ha='center', fontsize=9)
     
     # Plot 2: Steps Taken vs Masking Ratio
-    ax2.plot(mask_percentages, list(steps.values()), f'{color_steps}-s', linewidth=2, markersize=8)
+    ax2.plot(mask_percentages, list(steps.values()), marker='s', color=color_steps, linewidth=2, markersize=8)
     ax2.set_xlabel('Masking Ratio (%)', fontsize=12)
     ax2.set_ylabel('Average Steps Taken', fontsize=12)
     ax2.set_title('Inference Steps by Masking Level', fontsize=14, fontweight='bold')
