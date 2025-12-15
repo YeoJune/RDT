@@ -14,7 +14,7 @@ training:
   output_dir: "./checkpoints/roberta-wikitext"
   epochs: 3
   batch_size: 32
-  learning_rate: 2e-5
+  learning_rate: 0.00005
   warmup_steps: 500
   weight_decay: 0.01
   logging_steps: 100
