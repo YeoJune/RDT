@@ -86,6 +86,16 @@ pip install -e .
 python check_compatibility.py
 ```
 
+**Setup Weights & Biases (W&B) for experiment tracking:**
+
+```bash
+# Login to W&B (first time only)
+wandb login
+
+# Or disable W&B by adding to your config:
+# use_wandb: false
+```
+
 ## 🚀 Quick Start
 
 ### Training RDT
@@ -192,7 +202,111 @@ Root files:
 - **`evaluation/evaluator.py`**: Unified evaluation for both RDT and baseline models
 - **`scripts/train.py`**: Single entry point for training any model type
 
-## 📜 Citation
+## 📊 Logging and Results
+
+### Training Logs
+
+Training automatically generates CSV logs alongside W&B tracking:
+
+```bash
+# Logs saved to outputs/logs/train_YYYYMMDD_HHMMSS.csv
+rdt-train --config rdt/configs/base.yaml
+```
+
+**Log contents**: epoch, step, loss, recon_loss, gate_loss, aux_loss, lr, val_loss, etc.
+
+### Evaluation Results
+
+Evaluation saves detailed results as JSON:
+
+```bash
+# Save to custom path
+rdt-evaluate --checkpoint checkpoints/best_model.pt \
+             --config rdt/configs/base.yaml \
+             --output outputs/results/eval_results.json
+```
+
+**Result format**:
+
+```json
+{
+  "timestamp": "2024-12-15T10:30:00",
+  "model_type": "rdt",
+  "results": {
+    "loss": 2.34,
+    "accuracy": 0.65,
+    "perplexity": 10.38
+  }
+}
+```
+
+### Visualization
+
+Generate plots from logs:
+
+```bash
+# Plot training curves
+rdt-plot --log outputs/logs/train_20241215_103000.csv
+
+# Compare multiple experiments
+rdt-plot --compare outputs/results/rdt_eval.json \
+                    outputs/results/roberta_eval.json \
+         --output-dir outputs/visualizations
+```
+
+**Generated plots**:
+
+- `training_curves.png`: Loss, accuracy, learning rate over time
+- `comparison.png`: Side-by-side model comparison
+
+## � Experiment Tracking with W&B
+
+RDT uses [Weights & Biases](https://wandb.ai/) for experiment tracking and visualization.
+
+### Setup
+
+```bash
+# Install W&B
+pip install wandb
+
+# Login (first time only)
+wandb login
+```
+
+### Configuration
+
+Add W&B settings to your config file (e.g., `rdt/configs/base.yaml`):
+
+```yaml
+use_wandb: true # Enable/disable W&B (default: true)
+wandb_project: "rdt" # Your W&B project name
+wandb_run_name: "experiment-1" # Optional: custom run name
+```
+
+### What gets tracked:
+
+- **Training metrics**: loss, reconstruction loss, gate loss, auxiliary loss
+- **Learning rate**: current learning rate and scheduler state
+- **Validation metrics**: perplexity, accuracy, top-k accuracy
+- **Model architecture**: automatic model graph and gradients
+- **Hardware usage**: GPU utilization, memory, system metrics
+
+### Disable W&B
+
+To train without W&B:
+
+```yaml
+use_wandb: false
+```
+
+Or use environment variable:
+
+```bash
+export WANDB_MODE=disabled
+rdt-train --config rdt/configs/base.yaml
+```
+
+## �📜 Citation
 
 If you find this code useful for your research, please cite:
 

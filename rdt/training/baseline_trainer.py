@@ -3,13 +3,16 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 import math
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils import CSVLogger
 
 
 class BaselineTrainer:
@@ -48,10 +51,21 @@ class BaselineTrainer:
         # Scheduler
         self.scheduler = self._create_scheduler()
         
-        # Logging
-        log_dir = Path(config['output']['log_dir'])
-        log_dir.mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=log_dir)
+        # Logging with W&B
+        self.use_wandb = config.get('use_wandb', True)
+        if self.use_wandb:
+            wandb.init(
+                project=config.get('wandb_project', 'rdt-baselines'),
+                name=config.get('wandb_run_name', None),
+                config=config,
+                resume='allow'
+            )
+            wandb.watch(model, log='all', log_freq=config['output'].get('log_every_n_steps', 100))
+        
+        # CSV Logger
+        log_dir = Path(config['output'].get('log_dir', 'outputs/logs'))
+        self.csv_logger = CSVLogger(str(log_dir))
+        
         self.log_every_n_steps = config['output']['log_every_n_steps']
         self.eval_every_n_epochs = config['output'].get('eval_every_n_epochs', 1)
         self.eval_every_n_steps = config['output'].get('eval_every_n_steps', 5000)
@@ -269,16 +283,24 @@ class BaselineTrainer:
                 
                 # Logging
                 if self.global_step % self.log_every_n_steps == 0:
-                    for key, value in metrics.items():
-                        self.writer.add_scalar(f'train/{key}', value, self.global_step)
+                    log_data = {'epoch': epoch, 'step': self.global_step, **metrics}
+                    self.csv_logger.log(log_data)
+                    
+                    if self.use_wandb:
+                        wandb.log({f'train/{key}': value for key, value in metrics.items()})
+                        wandb.log({'global_step': self.global_step})
                     pbar.set_postfix(loss=f"{metrics['loss']:.4f}", 
                                     acc=f"{metrics['accuracy']:.4f}")
             
             # Evaluation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_metrics = self.evaluate()
-                for key, value in val_metrics.items():
-                    self.writer.add_scalar(key, value, self.global_step)
+                val_data = {'epoch': epoch, 'step': self.global_step, **val_metrics}
+                self.csv_logger.log(val_data)
+                
+                if self.use_wandb:
+                    wandb.log({key: value for key, value in val_metrics.items()})
+                    wandb.log({'epoch': epoch})
                 
                 print(f"\nValidation - Loss: {val_metrics['val_loss']:.4f}, "
                       f"Accuracy: {val_metrics['val_accuracy']:.4f}, "
@@ -310,16 +332,24 @@ class BaselineTrainer:
                 
                 # Logging
                 if self.global_step % self.log_every_n_steps == 0:
-                    for key, value in metrics.items():
-                        self.writer.add_scalar(f'train/{key}', value, self.global_step)
+                    log_data = {'epoch': epoch, 'step': self.global_step, **metrics}
+                    self.csv_logger.log(log_data)
+                    
+                    if self.use_wandb:
+                        wandb.log({f'train/{key}': value for key, value in metrics.items()})
+                        wandb.log({'step': self.global_step})
                     pbar.set_postfix(loss=f"{metrics['loss']:.4f}",
                                     acc=f"{metrics['accuracy']:.4f}")
                 
                 # Evaluation
                 if self.global_step % self.eval_every_n_steps == 0:
                     val_metrics = self.evaluate()
-                    for key, value in val_metrics.items():
-                        self.writer.add_scalar(key, value, self.global_step)
+                    val_data = {'epoch': epoch, 'step': self.global_step, **val_metrics}
+                    self.csv_logger.log(val_data)
+                    
+                    if self.use_wandb:
+                        wandb.log({key: value for key, value in val_metrics.items()})
+                        wandb.log({'step': self.global_step})
                     
                     print(f"\nStep {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}, "
                           f"Accuracy: {val_metrics['val_accuracy']:.4f}, "

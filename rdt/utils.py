@@ -4,9 +4,49 @@ import yaml
 import torch
 import random
 import numpy as np
+import csv
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from datetime import datetime
 import os
+
+
+class CSVLogger:
+    """Simple CSV logger for tracking training metrics"""
+    
+    def __init__(self, log_dir: str, filename: Optional[str] = None):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        
+        if filename is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'train_{timestamp}.csv'
+        
+        self.log_path = self.log_dir / filename
+        self.writer = None
+        self.file = None
+        self.fieldnames = None
+        
+    def log(self, metrics: Dict[str, float]):
+        """Log metrics to CSV"""
+        if self.writer is None:
+            self.fieldnames = list(metrics.keys())
+            self.file = open(self.log_path, 'w', newline='')
+            self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
+            self.writer.writeheader()
+            print(f"Logging to: {self.log_path}")
+        
+        self.writer.writerow(metrics)
+        self.file.flush()
+    
+    def close(self):
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+            self.writer = None
+    
+    def __del__(self):
+        self.close()
 
 
 def load_config(config_path: str) -> Dict[str, Any]:

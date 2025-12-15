@@ -127,7 +127,7 @@ def main():
         ('transformers', '4.30.0'),
         ('datasets', '2.14.0'),
         ('yaml', None),  # pyyaml
-        ('tensorboard', '2.13.0'),
+        ('wandb', '0.16.0'),
         ('tqdm', '4.65.0'),
         ('numpy', '1.24.0'),
     ]

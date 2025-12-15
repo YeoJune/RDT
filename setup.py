@@ -36,7 +36,7 @@ setup(
         'datasets>=2.14.0',
         'transformers>=4.30.0',
         'pyyaml>=6.0',
-        'tensorboard>=2.13.0',
+        'wandb>=0.16.0',
         'tqdm>=4.65.0',
         'numpy>=1.24.0',
     ],

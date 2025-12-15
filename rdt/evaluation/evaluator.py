@@ -6,6 +6,8 @@ from tqdm import tqdm
 from typing import Dict, Optional
 import json
 from pathlib import Path
+from datetime import datetime
+
 
 from .metrics import calculate_metrics
 
@@ -191,13 +193,30 @@ class Evaluator:
         else:  # mlm
             return self.evaluate_mlm(dataloader)
     
-    def save_results(self, results: Dict, save_path: str):
-        """Save evaluation results to JSON file"""
+    def save_results(self, results: Dict, save_path: str, add_metadata: bool = True):
+        """
+        Save evaluation results to JSON file with metadata.
+        
+        Args:
+            results: Evaluation results dictionary
+            save_path: Path to save results
+            add_metadata: Whether to add timestamp and metadata
+        """
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         
+        if add_metadata:
+            # Add metadata
+            output = {
+                'timestamp': datetime.now().isoformat(),
+                'model_type': self.model_type,
+                'results': results
+            }
+        else:
+            output = results
+        
         with open(save_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(output, f, indent=2)
         
         print(f"Results saved to: {save_path}")
     

@@ -3,16 +3,16 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import math
 
 from ..models.rdt_model import RDT
-from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters
+from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters, CSVLogger
 
 
 class RDTTrainer:
@@ -56,10 +56,21 @@ class RDTTrainer:
         self.recon_criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding
         self.gate_criterion = nn.MSELoss()
         
-        # Logging
-        log_dir = Path(config['output']['log_dir'])
-        log_dir.mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=log_dir)
+        # Logging with W&B
+        self.use_wandb = config.get('use_wandb', True)
+        if self.use_wandb:
+            wandb.init(
+                project=config.get('wandb_project', 'rdt'),
+                name=config.get('wandb_run_name', None),
+                config=config,
+                resume='allow'
+            )
+            wandb.watch(model, log='all', log_freq=config['output'].get('log_every_n_steps', 100))
+        
+        # CSV Logger
+        log_dir = Path(config['output'].get('log_dir', 'outputs/logs'))
+        self.csv_logger = CSVLogger(str(log_dir))
+        
         self.log_every_n_steps = config['output']['log_every_n_steps']
         self.eval_every_n_epochs = config['output'].get('eval_every_n_epochs', 1)
         self.eval_every_n_steps = config['output'].get('eval_every_n_steps', 5000)
@@ -392,12 +403,24 @@ class RDTTrainer:
                 self.global_step += 1
                 
                 if self.global_step % self.log_every_n_steps == 0:
-                    self.writer.add_scalar('train/loss', loss, self.global_step)
-                    self.writer.add_scalar('train/recon_loss', recon, self.global_step)
-                    self.writer.add_scalar('train/gate_loss', gate, self.global_step)
-                    self.writer.add_scalar('train/aux_loss', aux, self.global_step)
-                    self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
-                    self.writer.add_scalar('train/sampling_prob', sampling_prob, self.global_step)
+                    log_data = {
+                        'epoch': epoch,
+                        'step': self.global_step,
+                        'loss': loss,
+                        'recon_loss': recon,
+                        'gate_loss': gate,
+                        'aux_loss': aux,
+                        'lr': self.optimizer.param_groups[0]['lr'],
+                        'sampling_prob': sampling_prob
+                    }
+                    
+                    # CSV logging
+                    self.csv_logger.log(log_data)
+                    
+                    # W&B logging
+                    if self.use_wandb:
+                        wandb.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
+                                  for k, v in log_data.items()})
                 
                 progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
             
@@ -405,7 +428,18 @@ class RDTTrainer:
             if (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_loss, val_recon, val_gate = self.validate()
                 print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
-                self.writer.add_scalar('val/loss', val_loss, epoch)
+                
+                val_data = {
+                    'epoch': epoch,
+                    'step': self.global_step,
+                    'val_loss': val_loss,
+                    'val_recon': val_recon,
+                    'val_gate': val_gate
+                }
+                self.csv_logger.log(val_data)
+                
+                if self.use_wandb:
+                    wandb.log({'val/loss': val_loss, 'epoch': epoch})
                 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -442,18 +476,39 @@ class RDTTrainer:
                 self.global_step = step
                 
                 if step % self.log_every_n_steps == 0:
-                    self.writer.add_scalar('train/loss', loss, step)
-                    self.writer.add_scalar('train/recon_loss', recon, step)
-                    self.writer.add_scalar('train/gate_loss', gate, step)
-                    self.writer.add_scalar('train/aux_loss', aux, step)
-                    self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], step)
-                    self.writer.add_scalar('train/sampling_prob', sampling_prob, step)
+                    log_data = {
+                        'epoch': epoch,
+                        'step': step,
+                        'loss': loss,
+                        'recon_loss': recon,
+                        'gate_loss': gate,
+                        'aux_loss': aux,
+                        'lr': self.optimizer.param_groups[0]['lr'],
+                        'sampling_prob': sampling_prob
+                    }
+                    
+                    self.csv_logger.log(log_data)
+                    
+                    if self.use_wandb:
+                        wandb.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
+                                  for k, v in log_data.items()})
                 
                 # Validation at regular step intervals
                 if step % self.eval_every_n_steps == 0:
                     val_loss, val_recon, val_gate = self.validate()
                     print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
-                    self.writer.add_scalar('val/loss', val_loss, step)
+                    
+                    val_data = {
+                        'epoch': epoch,
+                        'step': step,
+                        'val_loss': val_loss,
+                        'val_recon': val_recon,
+                        'val_gate': val_gate
+                    }
+                    self.csv_logger.log(val_data)
+                    
+                    if self.use_wandb:
+                        wandb.log({'val/loss': val_loss, 'step': step})
                     
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
