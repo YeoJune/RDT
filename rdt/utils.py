@@ -25,19 +25,45 @@ class CSVLogger:
         self.log_path = self.log_dir / filename
         self.writer = None
         self.file = None
-        self.fieldnames = None
+        self.fieldnames = set()
+        self.rows = []
         
     def log(self, metrics: Dict[str, float]):
         """Log metrics to CSV"""
-        if self.writer is None:
-            self.fieldnames = list(metrics.keys())
-            self.file = open(self.log_path, 'w', newline='')
-            self.writer = csv.DictWriter(self.file, fieldnames=self.fieldnames)
-            self.writer.writeheader()
-            print(f"Logging to: {self.log_path}")
+        # Update fieldnames
+        new_fields = set(metrics.keys()) - self.fieldnames
+        if new_fields:
+            self.fieldnames.update(new_fields)
+            self._rewrite_csv()
         
-        self.writer.writerow(metrics)
-        self.file.flush()
+        # Add row
+        self.rows.append(metrics)
+        
+        # Write row
+        if self.writer is not None:
+            self.writer.writerow(metrics)
+            self.file.flush()
+    
+    def _rewrite_csv(self):
+        """Rewrite CSV with updated fieldnames"""
+        if self.file is not None:
+            self.file.close()
+        
+        # Sort fieldnames for consistent order
+        sorted_fields = sorted(self.fieldnames, key=lambda x: (
+            0 if x == 'epoch' else 1 if x == 'step' else 2
+        ))
+        
+        self.file = open(self.log_path, 'w', newline='')
+        self.writer = csv.DictWriter(self.file, fieldnames=sorted_fields, extrasaction='ignore')
+        self.writer.writeheader()
+        
+        # Rewrite existing rows
+        for row in self.rows[:-1]:  # Skip last row, will be written in log()
+            self.writer.writerow(row)
+        
+        if len(self.rows) == 1:
+            print(f"Logging to: {self.log_path}")
     
     def close(self):
         if self.file is not None:
