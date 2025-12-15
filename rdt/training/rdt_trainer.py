@@ -451,7 +451,7 @@ class RDTTrainer:
                 cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
         
         print("\nTraining completed!")
-        self.writer.close()
+        self.csv_logger.close()
     
     def _train_by_step(self):
         print(f"\nStarting step-based training for {self.max_training_steps} steps...")
@@ -524,4 +524,4 @@ class RDTTrainer:
             epoch += 1
         
         print("\nTraining completed!")
-        self.writer.close()
+        self.csv_logger.close()
