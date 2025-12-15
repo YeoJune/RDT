@@ -4,7 +4,7 @@ import argparse
 import torch
 from transformers import AutoTokenizer
 
-from rdt.model import RDT
+from rdt.models import RDT
 from rdt.utils import load_config, load_checkpoint, get_device
 
 

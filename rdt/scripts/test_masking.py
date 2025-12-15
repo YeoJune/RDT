@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 from pathlib import Path
 
-from rdt.model import RDT
+from rdt.models import RDT
 from rdt.utils import load_config, get_device
 
 

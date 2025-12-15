@@ -1,7 +1,7 @@
 """Quick test script to verify model implementation"""
 
 import torch
-from rdt.model import RDT
+from rdt.models import RDT
 from rdt.utils import count_parameters
 
 def test_model():

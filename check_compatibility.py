@@ -72,17 +72,25 @@ def check_package_structure() -> List[Tuple[bool, str]]:
         checks.append((True, f"✓ rdt package found (v{rdt.__version__})"))
         
         # Check main modules
-        modules = ['model', 'data', 'trainer', 'utils']
-        for module_name in modules:
+        modules = [
+            ('models', 'RDT model'),
+            ('data', 'Data loading'),
+            ('training', 'Training logic'),
+            ('evaluation', 'Evaluation tools'),
+            ('utils', 'Utilities')
+        ]
+        for module_name, desc in modules:
             try:
                 module = importlib.import_module(f'rdt.{module_name}')
-                checks.append((True, f"✓ rdt.{module_name} importable"))
+                checks.append((True, f"✓ rdt.{module_name} ({desc})"))
             except ImportError as e:
                 checks.append((False, f"✗ rdt.{module_name} import failed: {e}"))
         
         # Check if main classes are accessible
         try:
-            from rdt import RDT, WikiTextDataset, RDTTrainer
+            from rdt.models import RDT
+            from rdt.data import WikiTextDataset
+            from rdt.training import RDTTrainer
             checks.append((True, "✓ Main classes accessible (RDT, WikiTextDataset, RDTTrainer)"))
         except ImportError as e:
             checks.append((False, f"✗ Main classes import failed: {e}"))

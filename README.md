@@ -80,34 +80,117 @@ cd rdt
 pip install -e .
 ```
 
-## 🚀 Experiments & Usage
-
-### Training
-
-Train the model on streaming datasets (e.g., WikiText, BookCorpus) with the dynamic chain generation pipeline.
+**Check compatibility:**
 
 ```bash
-# Train with default hyperparameters
-rdt-train --config configs/train_config.yaml
+python check_compatibility.py
+```
+
+## 🚀 Quick Start
+
+### Training RDT
+
+Train RDT model with the unified training script:
+
+```bash
+# Train RDT (default)
+rdt-train --config rdt/configs/base.yaml
+
+# Train with custom settings
+rdt-train --config rdt/configs/experiment.yaml --output_dir ./outputs
+```
+
+### Training Baseline Models
+
+Train BERT or RoBERTa baselines using the same data pipeline:
+
+```bash
+# Train RoBERTa baseline
+rdt-train --config rdt/configs/roberta_baseline.yaml
+
+# Train BERT baseline
+rdt-train --config rdt/configs/bert_baseline.yaml
+```
+
+### Evaluation
+
+Evaluate trained models:
+
+```bash
+# Evaluate any model (auto-detects RDT vs MLM)
+rdt-evaluate --checkpoint checkpoints/best_model.pt --config rdt/configs/base.yaml
+
+# Evaluate on specific dataset
+rdt-evaluate --checkpoint checkpoints/best_model.pt --config rdt/configs/base.yaml --dataset wikitext-2
 ```
 
 ### Inference (Iterative Denoising)
 
-Perform inference where the model recursively refines the input until the Gate mechanism signals completion.
+Run inference with RDT's adaptive stopping mechanism:
 
 ```bash
-rdt-inference \
-    --model_path checkpoints/best_model.pt \
+python rdt/scripts/inference.py \
+    --checkpoint checkpoints/best_model.pt \
+    --config rdt/configs/base.yaml \
     --text "The quick brown [MASK] jumps over the lazy [MASK]." \
     --threshold 0.02
 ```
 
-## 📂 Repository Structure
+### Testing
 
-- `rdt/model.py`: Implementation of **DirectionalRecursiveBlock** and **AdaLN**.
-- `rdt/data.py`: Streaming data loader for generating noise-chain trajectories.
-- `rdt/trainer.py`: Training loop implementing the multi-objective loss landscape.
-- `configs/`: Hyperparameter configurations for varying model scales.
+Quick model verification:
+
+```bash
+# Test model implementation
+python test_model.py
+
+# Test masking behavior
+python rdt/scripts/test_masking.py --config rdt/configs/base.yaml
+```
+
+## 📂 Project Structure
+
+```
+rdt/
+├── models/              # Model architectures
+│   ├── rdt_model.py        # RDT implementation (AdaLN, Gate MLP, Recursive blocks)
+│   ├── baseline_models.py  # Baseline wrappers (BERT, RoBERTa)
+│   └── bert_init.py        # BERT weight initialization
+├── data/                # Data loading and processing
+│   ├── datasets.py         # StreamingTextDataset, WikiTextDataset
+│   └── collators.py        # Data collators (RDT chains, MLM masking)
+├── training/            # Training logic
+│   ├── rdt_trainer.py      # RDT trainer (multi-objective loss)
+│   └── baseline_trainer.py # Standard MLM trainer
+├── evaluation/          # Evaluation tools
+│   ├── metrics.py          # Perplexity, accuracy, top-k metrics
+│   └── evaluator.py        # Unified evaluation interface
+├── scripts/             # Runnable scripts
+│   ├── train.py            # Unified training script (RDT + baselines)
+│   ├── evaluate.py         # Evaluation script
+│   ├── inference.py        # Interactive inference
+│   ├── test_masking.py     # Masking behavior tests
+│   └── test_bert.py        # BERT compatibility tests
+├── configs/             # Configuration files
+│   ├── base.yaml           # RDT config
+│   ├── experiment.yaml     # RDT experiment config
+│   ├── roberta_baseline.yaml  # RoBERTa config
+│   └── bert_baseline.yaml  # BERT config
+└── utils.py             # Shared utilities
+
+Root files:
+├── test_model.py        # Quick model tests
+├── check_compatibility.py  # Dependency checker
+└── pyproject.toml       # Package configuration
+```
+
+### Key Components
+
+- **`models/rdt_model.py`**: Core RDT architecture with DirectionalRecursiveBlock and AdaLN
+- **`data/datasets.py`**: Streaming data pipeline with chain trajectory generation
+- **`training/rdt_trainer.py`**: Multi-objective training (reconstruction + gate + latent consistency)
+- **`evaluation/evaluator.py`**: Unified evaluation for both RDT and baseline models
+- **`scripts/train.py`**: Single entry point for training any model type
 
 ## 📜 Citation
 
