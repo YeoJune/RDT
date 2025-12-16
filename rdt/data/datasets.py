@@ -191,12 +191,12 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase):
                 truncation=True,
                 padding=False,
                 return_overflowing_tokens=True,
-                stride=0,
-                return_tensors='pt'
+                stride=0
             )
             
-            # encoded['input_ids'] shape: (num_chunks, seq_len)
-            for tokens in encoded['input_ids']:
+            # encoded['input_ids'] is a list of token id lists
+            for token_ids in encoded['input_ids']:
+                tokens = torch.tensor(token_ids, dtype=torch.long)
                 if len(tokens) < 10:
                     continue
                 yield self._process_text(tokens)
