@@ -78,33 +78,50 @@ class RDTDatasetBase:
         if len(masked_indices_0) > 0:
             input_ids = self._apply_bert_masking(input_ids, masked_indices_0, tokens)
         
-        # Generate chain
+        # Generate targets (s_1, s_2, ..., s_L) and gate_targets
         targets = []
-        loss_masks = []
         gate_targets = []
+        gate_targets.append(step_0 / self.total_steps * 20)  # s_0의 gate
         
+        # s_1 ~ s_L 생성
+        for offset in range(1, chain_length + 1):
+            step = start_step - offset
+            num_visible = int(seq_len * (1 - step / self.total_steps))
+            
+            visible_indices = restore_order[:num_visible]
+            masked_indices = restore_order[num_visible:]
+            
+            target_ids = tokens.clone()
+            if len(masked_indices) > 0:
+                target_ids[masked_indices] = self.mask_token_id
+            
+            targets.append(target_ids)
+            gate_targets.append(step / self.total_steps * 20)
+        
+        # Generate loss masks
+        loss_masks = []
         for i in range(chain_length):
-            current_step = start_step - i - 1
-            next_step = max(0, current_step - 1)
+            current_step = start_step - i
+            next_step = start_step - (i + 1)
             
-            num_visible_current = int(seq_len * (1 - current_step / self.total_steps))
-            num_visible_next = int(seq_len * (1 - next_step / self.total_steps))
+            current_visible = int(seq_len * (1 - current_step / self.total_steps))
+            next_visible = int(seq_len * (1 - next_step / self.total_steps))
             
-            newly_visible = restore_order[num_visible_current:num_visible_next]
+            # Delta: 새로 드러나는 위치
+            delta_indices = restore_order[current_visible:next_visible]
             
-            target = tokens.clone()
-            loss_mask = torch.zeros(seq_len, dtype=torch.bool)
+            mask_bool = torch.zeros(seq_len, dtype=torch.bool)
+            if len(delta_indices) > 0:
+                mask_bool[delta_indices] = True
             
-            if len(newly_visible) > 0:
-                num_loss_tokens = max(1, int(len(newly_visible) * self.visible_loss_ratio))
-                loss_indices = newly_visible[torch.randperm(len(newly_visible))[:num_loss_tokens]]
-                loss_mask[loss_indices] = True
+            # Maintenance: 이미 드러난 것 중 일부
+            if current_visible > 0 and self.visible_loss_ratio > 0:
+                num_maint = max(1, int(current_visible * self.visible_loss_ratio))
+                perm = torch.randperm(current_visible)[:num_maint]
+                maint_indices = restore_order[perm]
+                mask_bool[maint_indices] = True
             
-            targets.append(target)
-            loss_masks.append(loss_mask)
-            gate_targets.append(current_step / self.total_steps)
-        
-        gate_targets.append(0.0)
+            loss_masks.append(mask_bool)
         
         return {
             'input': input_ids,
@@ -168,7 +185,6 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase):
                 continue
             
             # Standard approach: tokenizer handles chunking with stride
-            # Don't use return_tensors='pt' with return_overflowing_tokens to avoid length mismatch
             encoded = self.tokenizer(
                 text,
                 max_length=self.max_seq_length,
@@ -176,20 +192,13 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase):
                 padding=False,
                 return_overflowing_tokens=True,
                 stride=0,
-                return_tensors=None  # Get list of lists instead of tensor
+                return_tensors='pt'
             )
             
-            # encoded['input_ids'] is a list of token lists, each with potentially different lengths
-            for token_ids in encoded['input_ids']:
-                # Convert to tensor and ensure minimum length
-                tokens = torch.tensor(token_ids, dtype=torch.long)
+            # encoded['input_ids'] shape: (num_chunks, seq_len)
+            for tokens in encoded['input_ids']:
                 if len(tokens) < 10:
                     continue
-                
-                # Slice to exact max_seq_length if needed (handles any remaining edge cases)
-                if len(tokens) > self.max_seq_length:
-                    tokens = tokens[:self.max_seq_length]
-                
                 yield self._process_text(tokens)
 
 
