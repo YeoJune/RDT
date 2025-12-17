@@ -290,12 +290,17 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
         dataset_counters = {i: 0 for i in range(len(self.dataset_names))}
         
         # Track yielded samples for validation/test limits
+        # Adjust max_samples for num_workers to get correct total
         yielded_samples = 0
         max_samples = None
         if self.split == 'validation':
             max_samples = self.max_val_samples
+            if worker_info is not None:
+                max_samples = max_samples // worker_info.num_workers
         elif self.split == 'test':
             max_samples = self.max_test_samples
+            if worker_info is not None:
+                max_samples = max_samples // worker_info.num_workers
         
         for idx, item in enumerate(self.dataset):
             # Multi-worker handling: each worker processes different subset
