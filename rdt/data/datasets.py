@@ -371,7 +371,8 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
     
     def __init__(self, dataset_name: Union[str, List[str]] = 'wikitext-2', 
                  split='train', samples_per_text=1, streaming=False,
-                 dataset_probabilities: Optional[List[float]] = None, **kwargs):
+                 dataset_probabilities: Optional[List[float]] = None,
+                 max_val_samples: int = 5000, max_test_samples: int = 10000, **kwargs):
         super().__init__(**kwargs)
         
         if streaming:
@@ -379,6 +380,8 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
         
         self.split = split
         self.samples_per_text = samples_per_text
+        self.max_val_samples = max_val_samples
+        self.max_test_samples = max_test_samples
         
         # Normalize to list
         if isinstance(dataset_name, str):
@@ -436,6 +439,14 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
             
             self.tokenized_data = self._prepare_data_from_dataset(dataset, name)
             print(f"  Loaded: {name} ({len(self.tokenized_data)} sequences)")
+        
+        # Apply max_samples limit for validation/test
+        if split == 'validation' and len(self.tokenized_data) > max_val_samples:
+            print(f"  Limiting validation to {max_val_samples} samples (from {len(self.tokenized_data)})")
+            self.tokenized_data = self.tokenized_data[:max_val_samples]
+        elif split == 'test' and len(self.tokenized_data) > max_test_samples:
+            print(f"  Limiting test to {max_test_samples} samples (from {len(self.tokenized_data)})")
+            self.tokenized_data = self.tokenized_data[:max_test_samples]
         
         print(f"Total samples (with samples_per_text={samples_per_text}): "
               f"{len(self.tokenized_data) * samples_per_text}")
@@ -599,6 +610,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             split='validation',
             samples_per_text=1,
             streaming=False,  # Force map-style
+            max_val_samples=max_val_samples,
+            max_test_samples=max_test_samples,
             **common_kwargs
         )
         
@@ -630,6 +643,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             split='train',
             samples_per_text=data_config.get('samples_per_text', 1),
             streaming=False,
+            max_val_samples=max_val_samples,
+            max_test_samples=max_test_samples,
             **common_kwargs
         )
         
@@ -638,6 +653,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             split='validation',
             samples_per_text=data_config.get('samples_per_text', 1),
             streaming=False,
+            max_val_samples=max_val_samples,
+            max_test_samples=max_test_samples,
             **common_kwargs
         )
         
