@@ -562,6 +562,10 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     dataset_name = data_config['dataset_name']
     dataset_probabilities = data_config.get('dataset_probabilities', None)
     
+    # Sample limits for streaming validation/test
+    max_val_samples = data_config.get('max_val_samples', 5000)
+    max_test_samples = data_config.get('max_test_samples', 10000)
+    
     # Common kwargs
     common_kwargs = {
         'tokenizer_name': data_config['tokenizer_name'],
@@ -577,23 +581,31 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     }
     
     if streaming:
-        # Streaming datasets
+        # STANDARD PRACTICE: Train streaming, Val/Test map-style
+        print("\nDataset mode: Train=Streaming, Val/Test=Map-style (standard)")
+        
+        # Train: Streaming for memory efficiency
         train_dataset = StreamingTextDataset(
             dataset_name=dataset_name,
             split='train',
+            max_val_samples=max_val_samples,
+            max_test_samples=max_test_samples,
             **common_kwargs
         )
         
-        val_dataset = StreamingTextDataset(
+        # Val/Test: Map-style for speed and reproducibility
+        val_dataset = WikiTextDataset(
             dataset_name=dataset_name,
             split='validation',
+            samples_per_text=1,
+            streaming=False,  # Force map-style
             **common_kwargs
         )
         
         # Get pad_token_id
         pad_token_id = train_dataset.tokenizer.pad_token_id or 0
         
-        # Create dataloaders (no shuffle for streaming)
+        # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=training_config['batch_size'],
@@ -605,13 +617,14 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         val_loader = DataLoader(
             val_dataset,
             batch_size=training_config['batch_size'],
+            shuffle=False,  # No shuffle for validation
             num_workers=data_config['num_workers'],
             pin_memory=data_config['pin_memory'],
             collate_fn=lambda batch: collate_fn(batch, pad_token_id)
         )
         
     else:
-        # Map-style datasets
+        # All map-style datasets
         train_dataset = WikiTextDataset(
             dataset_name=dataset_name,
             split='train',
