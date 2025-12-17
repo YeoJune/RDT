@@ -440,13 +440,7 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
             self.tokenized_data = self._prepare_data_from_dataset(dataset, name)
             print(f"  Loaded: {name} ({len(self.tokenized_data)} sequences)")
         
-        # Apply max_samples limit for validation/test
-        if split == 'validation' and len(self.tokenized_data) > max_val_samples:
-            print(f"  Limiting validation to {max_val_samples} samples (from {len(self.tokenized_data)})")
-            self.tokenized_data = self.tokenized_data[:max_val_samples]
-        elif split == 'test' and len(self.tokenized_data) > max_test_samples:
-            print(f"  Limiting test to {max_test_samples} samples (from {len(self.tokenized_data)})")
-            self.tokenized_data = self.tokenized_data[:max_test_samples]
+        # Note: max_samples limit already applied during tokenization via early stopping
         
         print(f"Total samples (with samples_per_text={samples_per_text}): "
               f"{len(self.tokenized_data) * samples_per_text}")
@@ -487,8 +481,19 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         
+        # Determine max samples for early stopping
+        max_samples = None
+        if self.split == 'validation':
+            max_samples = self.max_val_samples
+        elif self.split == 'test':
+            max_samples = self.max_test_samples
+        
         tokenized = []
         for item in tqdm(dataset, desc=f"Tokenizing {dataset_name}"):
+            # Early stopping for validation/test
+            if max_samples is not None and len(tokenized) >= max_samples:
+                break
+            
             text = item['text'].strip()
             if len(text) == 0:
                 continue
@@ -508,6 +513,10 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
                 tokens = torch.tensor(input_ids, dtype=torch.long)
                 if len(tokens) >= 10:
                     tokenized.append(tokens)
+                    
+                    # Check again after adding each chunk
+                    if max_samples is not None and len(tokenized) >= max_samples:
+                        break
         
         return tokenized
     
