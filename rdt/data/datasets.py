@@ -136,15 +136,20 @@ class DatasetLoaderMixin:
     
     @staticmethod
     def _load_single_dataset(dataset_name: str, split: str, streaming: bool):
-        """Load a single dataset by name"""
+        """
+        Load a single dataset by name.
+        
+        Note: For BookCorpus and Wikipedia, always loads 'train' split.
+        Actual split filtering is done in __iter__ using modulo-based approach.
+        """
         dataset_name_lower = dataset_name.lower()
         
         if 'bookcorpus' in dataset_name_lower:
-            # BookCorpus only has train split
+            # BookCorpus only has train split - split filtering done in __iter__
             dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=streaming)
             
         elif 'wikipedia' in dataset_name_lower:
-            # Wikipedia only has train split
+            # Wikipedia only has train split - split filtering done in __iter__
             dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train', streaming=streaming)
             
         else:
@@ -159,6 +164,32 @@ class DatasetLoaderMixin:
             dataset = load_dataset('wikitext', config, split=split, streaming=streaming)
         
         return dataset
+    
+    @staticmethod
+    def _needs_split_filtering(dataset_name: str) -> bool:
+        """Check if dataset needs manual split filtering (BookCorpus, Wikipedia)"""
+        dataset_name_lower = dataset_name.lower()
+        return 'bookcorpus' in dataset_name_lower or 'wikipedia' in dataset_name_lower
+    
+    @staticmethod
+    def _apply_split_filter(idx: int, split: str) -> bool:
+        """
+        Apply modulo-based split filtering for datasets without built-in splits.
+        
+        Returns:
+            True if this sample should be included in the split, False otherwise
+        """
+        # Modulo-based split: 95% train, 2.5% val, 2.5% test
+        mod = idx % 40
+        
+        if split == 'train':
+            return mod < 38  # Indices 0-37 (95%)
+        elif split == 'validation':
+            return mod == 38  # Index 38 (2.5%)
+        elif split == 'test':
+            return mod == 39  # Index 39 (2.5%)
+        else:
+            return True
 
 
 class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
@@ -176,6 +207,10 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
         
         self.split = split
         self.is_multi_dataset = len(self.dataset_names) > 1
+        
+        # Track which datasets need split filtering
+        self.needs_filtering = [self._needs_split_filtering(name) for name in self.dataset_names]
+        self.any_needs_filtering = any(self.needs_filtering)
         
         print(f"Loading dataset(s) in streaming mode (split={split})...")
         
@@ -207,8 +242,20 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
                     print(f"    - {name}: {prob*100:.1f}%")
             
             # Interleave datasets
+            # IMPORTANT: When interleaving, we lose track of which dataset each sample came from
+            # So we need to add dataset index to each sample
+            datasets_with_index = []
+            for dataset_idx, ds in enumerate(datasets):
+                # Add dataset index to each sample
+                def add_dataset_index(example, idx=dataset_idx):
+                    example['__dataset_index__'] = idx
+                    return example
+                
+                ds_with_index = ds.map(add_dataset_index)
+                datasets_with_index.append(ds_with_index)
+            
             self.dataset = interleave_datasets(
-                datasets,
+                datasets_with_index,
                 probabilities=self.probabilities,  # None = proportional to size
                 seed=42,
                 stopping_strategy='all_exhausted'
@@ -226,28 +273,34 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
         # Multi-worker support: prevent data duplication
         worker_info = torch.utils.data.get_worker_info()
         
+        # Track indices per dataset for split filtering
+        dataset_counters = {i: 0 for i in range(len(self.dataset_names))}
+        
         for idx, item in enumerate(self.dataset):
             # Multi-worker handling: each worker processes different subset
             if worker_info is not None:
                 if idx % worker_info.num_workers != worker_info.id:
                     continue
             
-            # For datasets without built-in splits, apply manual split
-            # (Only needed for single-dataset mode; interleaving handles this)
-            if not self.is_multi_dataset:
-                dataset_name = self.dataset_names[0]
-                if 'bookcorpus' in dataset_name.lower() or 'wikipedia' in dataset_name.lower():
-                    # Modulo-based split: 95% train, 2.5% val, 2.5% test
-                    mod = idx % 40
+            # For datasets without built-in splits, apply manual split filtering
+            if self.any_needs_filtering:
+                if self.is_multi_dataset:
+                    # Multi-dataset mode: check which dataset this sample came from
+                    dataset_idx = item.get('__dataset_index__', 0)
                     
-                    if self.split == 'train':
-                        if mod >= 38:  # Skip indices 38, 39
+                    # Only filter if this specific dataset needs filtering
+                    if self.needs_filtering[dataset_idx]:
+                        # Get counter for this specific dataset
+                        sample_idx = dataset_counters[dataset_idx]
+                        dataset_counters[dataset_idx] += 1
+                        
+                        # Apply split filter
+                        if not self._apply_split_filter(sample_idx, self.split):
                             continue
-                    elif self.split == 'validation':
-                        if mod != 38:  # Only take index 38
-                            continue
-                    elif self.split == 'test':
-                        if mod != 39:  # Only take index 39
+                else:
+                    # Single-dataset mode
+                    if self.needs_filtering[0]:
+                        if not self._apply_split_filter(idx, self.split):
                             continue
             
             # Process text
