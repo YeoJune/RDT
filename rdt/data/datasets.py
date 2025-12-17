@@ -159,32 +159,6 @@ class DatasetLoaderMixin:
             dataset = load_dataset('wikitext', config, split=split, streaming=streaming)
         
         return dataset
-    
-    @staticmethod
-    def _get_dataset_config(dataset_names: Union[str, List[str]], 
-                           probabilities: Optional[List[float]] = None) -> tuple:
-        """
-        Get standardized dataset configuration.
-        
-        Returns:
-            (dataset_names_list, probabilities_list)
-        """
-        # Normalize to list
-        if isinstance(dataset_names, str):
-            dataset_names = [dataset_names]
-        
-        # Normalize probabilities
-        if probabilities is None:
-            probabilities = [1.0 / len(dataset_names)] * len(dataset_names)
-        elif len(probabilities) != len(dataset_names):
-            raise ValueError(f"Number of probabilities ({len(probabilities)}) must match "
-                           f"number of datasets ({len(dataset_names)})")
-        
-        # Normalize probabilities to sum to 1.0
-        prob_sum = sum(probabilities)
-        probabilities = [p / prob_sum for p in probabilities]
-        
-        return dataset_names, probabilities
 
 
 class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
@@ -194,10 +168,12 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
                  split='train', dataset_probabilities: Optional[List[float]] = None, **kwargs):
         super().__init__(**kwargs)
         
-        # Normalize dataset configuration
-        self.dataset_names, self.probabilities = self._get_dataset_config(
-            dataset_name, dataset_probabilities
-        )
+        # Normalize to list
+        if isinstance(dataset_name, str):
+            self.dataset_names = [dataset_name]
+        else:
+            self.dataset_names = dataset_name
+        
         self.split = split
         self.is_multi_dataset = len(self.dataset_names) > 1
         
@@ -207,17 +183,35 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
             # Load multiple datasets and interleave
             print(f"  Mixed {len(self.dataset_names)} datasets:")
             datasets = []
-            for name, prob in zip(self.dataset_names, self.probabilities):
+            
+            # Load datasets first
+            for name in self.dataset_names:
                 ds = self._load_single_dataset(name, split, streaming=True)
                 datasets.append(ds)
-                print(f"    - {name}: {prob*100:.1f}%")
             
-            # Interleave datasets with specified probabilities
+            # Calculate probabilities based on dataset sizes if not provided
+            if dataset_probabilities is None:
+                # For streaming datasets, use interleave_datasets default behavior
+                # which samples proportionally to dataset sizes
+                self.probabilities = None
+                print("  Using dataset-size proportional sampling (default)")
+            else:
+                # Normalize provided probabilities
+                if len(dataset_probabilities) != len(self.dataset_names):
+                    raise ValueError(f"Number of probabilities ({len(dataset_probabilities)}) must match "
+                                   f"number of datasets ({len(self.dataset_names)})")
+                prob_sum = sum(dataset_probabilities)
+                self.probabilities = [p / prob_sum for p in dataset_probabilities]
+                
+                for name, prob in zip(self.dataset_names, self.probabilities):
+                    print(f"    - {name}: {prob*100:.1f}%")
+            
+            # Interleave datasets
             self.dataset = interleave_datasets(
                 datasets,
-                probabilities=self.probabilities,
+                probabilities=self.probabilities,  # None = proportional to size
                 seed=42,
-                stopping_strategy='all_exhausted'  # Continue until all datasets exhausted
+                stopping_strategy='all_exhausted'
             )
         else:
             # Single dataset
@@ -293,10 +287,12 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
         self.split = split
         self.samples_per_text = samples_per_text
         
-        # Normalize dataset configuration
-        self.dataset_names, self.probabilities = self._get_dataset_config(
-            dataset_name, dataset_probabilities
-        )
+        # Normalize to list
+        if isinstance(dataset_name, str):
+            self.dataset_names = [dataset_name]
+        else:
+            self.dataset_names = dataset_name
+        
         self.is_multi_dataset = len(self.dataset_names) > 1
         
         print(f"Loading dataset(s) (split={split})...")
@@ -305,6 +301,7 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
             # Load and combine multiple datasets
             print(f"  Loading {len(self.dataset_names)} datasets:")
             all_tokenized = []
+            dataset_sizes = []
             
             for name in self.dataset_names:
                 dataset = self._load_single_dataset(name, split, streaming=False)
@@ -315,7 +312,22 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
                 
                 tokenized = self._prepare_data_from_dataset(dataset, name)
                 all_tokenized.extend(tokenized)
+                dataset_sizes.append(len(tokenized))
                 print(f"    - {name}: {len(tokenized)} sequences")
+            
+            # Show actual proportions
+            total_size = sum(dataset_sizes)
+            print(f"  Actual proportions:")
+            for name, size in zip(self.dataset_names, dataset_sizes):
+                proportion = size / total_size * 100
+                print(f"    - {name}: {proportion:.1f}%")
+            
+            # Note: For map-style, we just concatenate all data
+            # The actual sampling will be uniform across all samples
+            # (which naturally gives size-proportional sampling from each dataset)
+            if dataset_probabilities is not None:
+                print("  Warning: dataset_probabilities is ignored for map-style datasets.")
+                print("  Samples are naturally proportional to dataset sizes.")
             
             self.tokenized_data = all_tokenized
             print(f"  Total: {len(self.tokenized_data)} sequences")
