@@ -176,18 +176,22 @@ class DatasetLoaderMixin:
         """
         Apply modulo-based split filtering for datasets without built-in splits.
         
+        Split ratio: 99% train, 0.5% validation, 0.5% test
+        Uses modulo 1000 for large datasets to ensure validation/test sets 
+        are kept manageable in size.
+        
         Returns:
             True if this sample should be included in the split, False otherwise
         """
-        # Modulo-based split: 95% train, 2.5% val, 2.5% test
-        mod = idx % 40
+        # Modulo-based split: 99% train, 0.5% val, 0.5% test
+        mod = idx % 1000
         
         if split == 'train':
-            return mod < 38  # Indices 0-37 (95%)
+            return mod < 990  # Indices 0-989 (99%)
         elif split == 'validation':
-            return mod == 38  # Index 38 (2.5%)
+            return 990 <= mod < 995  # Indices 990-994 (0.5%)
         elif split == 'test':
-            return mod == 39  # Index 39 (2.5%)
+            return 995 <= mod < 1000  # Indices 995-999 (0.5%)
         else:
             return True
 
@@ -196,7 +200,8 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
     """Streaming dataset for on-the-fly loading with multi-dataset support"""
     
     def __init__(self, dataset_name: Union[str, List[str]] = 'wikitext-2', 
-                 split='train', dataset_probabilities: Optional[List[float]] = None, **kwargs):
+                 split='train', dataset_probabilities: Optional[List[float]] = None,
+                 max_val_samples: int = 5000, max_test_samples: int = 10000, **kwargs):
         super().__init__(**kwargs)
         
         # Normalize to list
@@ -208,11 +213,19 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
         self.split = split
         self.is_multi_dataset = len(self.dataset_names) > 1
         
+        # Sample limits for validation/test (streaming datasets only)
+        self.max_val_samples = max_val_samples
+        self.max_test_samples = max_test_samples
+        
         # Track which datasets need split filtering
         self.needs_filtering = [self._needs_split_filtering(name) for name in self.dataset_names]
         self.any_needs_filtering = any(self.needs_filtering)
         
         print(f"Loading dataset(s) in streaming mode (split={split})...")
+        if split == 'validation':
+            print(f"  Validation limited to {max_val_samples} samples")
+        elif split == 'test':
+            print(f"  Test limited to {max_test_samples} samples")
         
         if self.is_multi_dataset:
             # Load multiple datasets and interleave
@@ -276,13 +289,26 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
         # Track indices per dataset for split filtering
         dataset_counters = {i: 0 for i in range(len(self.dataset_names))}
         
+        # Track yielded samples for validation/test limits
+        yielded_samples = 0
+        max_samples = None
+        if self.split == 'validation':
+            max_samples = self.max_val_samples
+        elif self.split == 'test':
+            max_samples = self.max_test_samples
+        
         for idx, item in enumerate(self.dataset):
             # Multi-worker handling: each worker processes different subset
             if worker_info is not None:
                 if idx % worker_info.num_workers != worker_info.id:
                     continue
             
+            # For validation/test with max_samples, stop early
+            if max_samples is not None and yielded_samples >= max_samples:
+                return
+            
             # For datasets without built-in splits, apply manual split filtering
+            should_include = True
             if self.any_needs_filtering:
                 if self.is_multi_dataset:
                     # Multi-dataset mode: check which dataset this sample came from
@@ -296,12 +322,15 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
                         
                         # Apply split filter
                         if not self._apply_split_filter(sample_idx, self.split):
-                            continue
+                            should_include = False
                 else:
                     # Single-dataset mode
                     if self.needs_filtering[0]:
                         if not self._apply_split_filter(idx, self.split):
-                            continue
+                            should_include = False
+            
+            if not should_include:
+                continue
             
             # Process text
             text = item.get('text', '').strip()
@@ -323,6 +352,12 @@ class StreamingTextDataset(IterableDataset, RDTDatasetBase, DatasetLoaderMixin):
                 tokens = torch.tensor(token_ids, dtype=torch.long)
                 if len(tokens) < 10:
                     continue
+                
+                # Check limit again before yielding
+                if max_samples is not None and yielded_samples >= max_samples:
+                    return
+                
+                yielded_samples += 1
                 yield self._process_text(tokens)
 
 
@@ -401,10 +436,13 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
               f"{len(self.tokenized_data) * samples_per_text}")
     
     def _split_dataset(self, dataset, split: str):
-        """Split datasets that only have train split (BookCorpus, Wikipedia)"""
+        """
+        Split datasets that only have train split (BookCorpus, Wikipedia).
+        Uses 99% train, 0.5% validation, 0.5% test split to match streaming behavior.
+        """
         total_size = len(dataset)
-        train_size = int(0.95 * total_size)
-        val_size = int(0.025 * total_size)
+        train_size = int(0.99 * total_size)
+        val_size = int(0.005 * total_size)
         test_size = total_size - train_size - val_size
         
         # First split: train vs (val + test)
@@ -412,7 +450,7 @@ class WikiTextDataset(Dataset, RDTDatasetBase, DatasetLoaderMixin):
         train_data = splits['train']
         remaining = splits['test']
         
-        # Second split: val vs test
+        # Second split: val vs test  
         val_test_splits = remaining.train_test_split(test_size=test_size, seed=42)
         val_data = val_test_splits['train']
         test_data = val_test_splits['test']
