@@ -127,18 +127,25 @@ class RDTTrainer:
         
         return scheduler
     
-    def get_sampling_prob(self, epoch: int) -> float:
+    def get_sampling_prob(self, epoch: int = 0, step: int = 0) -> float:
         """
         Scheduled Sampling Probability Scheduler
-        - Epoch 0 ~ num_epochs: 1.0 -> 0.0 (Linear Decay)
+        - Epoch mode: 1.0 -> 0.0 (Linear Decay over epochs)
+        - Step mode: 1.0 -> 0.0 (Linear Decay over steps)
         - Early training: Use GT timestep for stability
         - Late training: Use predicted gate for inference alignment
         """
-        if self.num_epochs <= 1:
-            return 0.0  # Single epoch -> no scheduling
+        if self.training_mode == 'epoch':
+            if self.num_epochs <= 1:
+                return 0.0  # Single epoch -> no scheduling
+            # Linear decay: 1.0 -> 0.0
+            sampling_prob = max(0.0, 1.0 - (epoch / (self.num_epochs - 1)))
+        else:  # step mode
+            if self.max_training_steps <= 1:
+                return 0.0
+            # Linear decay: 1.0 -> 0.0 based on current step
+            sampling_prob = max(0.0, 1.0 - (step / self.max_training_steps))
         
-        # Linear decay: 1.0 -> 0.0
-        sampling_prob = max(0.0, 1.0 - (epoch / (self.num_epochs - 1)))
         return sampling_prob
     
     def train_step(self, batch: Dict) -> Tuple[float, float, float]:
@@ -391,7 +398,7 @@ class RDTTrainer:
         
         for epoch in range(self.num_epochs):
             self.current_epoch = epoch
-            sampling_prob = self.get_sampling_prob(epoch)
+            sampling_prob = self.get_sampling_prob(epoch=epoch)
             print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
             
             epoch_loss = 0; epoch_recon = 0; epoch_gate = 0; epoch_aux = 0
@@ -462,7 +469,7 @@ class RDTTrainer:
         
         while step < self.max_training_steps:
             self.current_epoch = epoch
-            sampling_prob = self.get_sampling_prob(epoch)
+            sampling_prob = self.get_sampling_prob(step=step)
             print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
             
             progress_bar = tqdm(self.train_loader, desc=f"Training (Step {step})")
