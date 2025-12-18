@@ -229,6 +229,7 @@ def create_model_from_config(config: Dict, vocab_size: int):
             gate_hidden_dim=model_config['gate_hidden_dim'],
             gate_num_layers=model_config['gate_num_layers'],
             gate_num_heads=model_config['gate_num_heads'],
+            gate_dropout=model_config.get('gate_dropout', 0.1),
             gradient_checkpointing=model_config.get('gradient_checkpointing', False),
             verbose=True
         )
@@ -246,6 +247,7 @@ def create_model_from_config(config: Dict, vocab_size: int):
             gate_hidden_dim=model_config['gate_hidden_dim'],
             gate_num_layers=model_config['gate_num_layers'],
             gate_num_heads=model_config['gate_num_heads'],
+            gate_dropout=model_config.get('gate_dropout', 0.1),
             gradient_checkpointing=model_config.get('gradient_checkpointing', False)
         )
     
