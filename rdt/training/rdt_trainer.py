@@ -298,11 +298,12 @@ class RDTTrainer:
         
         return final_loss.item(), total_recon_loss / max(1, num_valid_steps), total_gate_loss / max(1, num_valid_steps), aux_loss.item()
     
-    def validate(self) -> Tuple[float, float, float]:
+    def validate(self) -> Tuple[float, float, float, float]:
         self.model.eval()
         total_loss = 0
         total_recon = 0
         total_gate = 0
+        total_aux = 0
         num_batches = 0
         
         with torch.no_grad():
@@ -314,10 +315,14 @@ class RDTTrainer:
                 gate_targets = batch['gate_targets'].to(self.device)  # [B, L+1] - s_0~s_L의 step
                 chain_lengths = batch['chain_lengths']
                 
+                batch_size = input_tokens.shape[0]
                 actual_max_length = chain_lengths.max().item()
                 batch_recon = 0
                 batch_gate = 0
                 num_valid = 0
+                
+                # Store hidden states for aux loss
+                hidden_states = [] if self.loss_weight_aux > 0 else None
                 
                 # 0. Initial embedding and gate prediction for h_0
                 init_emb = self.model.token_embedding(input_tokens) * math.sqrt(self.model.d_model)
@@ -345,6 +350,10 @@ class RDTTrainer:
                 for step_idx in range(actual_max_length):
                     valid_mask = chain_lengths > step_idx
                     if valid_mask.sum() == 0: break
+                    
+                    # Store hidden for aux loss
+                    if hidden_states is not None:
+                        hidden_states.append(hidden.clone())
                     
                     step_targets = targets[:, step_idx, :]
                     step_loss_mask = loss_masks[:, step_idx, :]
@@ -375,18 +384,42 @@ class RDTTrainer:
                             is_first_step=False
                         )
                 
+                # Compute auxiliary loss
+                batch_aux = 0
+                if self.loss_weight_aux > 0 and len(hidden_states) > 0:
+                    aux_batch_size = max(1, int(batch_size * self.aux_ratio))
+                    num_aux_steps = 0
+                    src_key_padding_mask = (attention_mask[:aux_batch_size, :] == 0)
+                    
+                    for step_idx in range(len(hidden_states)):
+                        step_target = targets[:aux_batch_size, step_idx, :]
+                        
+                        target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
+                        target_emb = self.model.pos_encoding(target_emb)
+                        h_GT = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
+                        
+                        h_pred = hidden_states[step_idx][:aux_batch_size]
+                        latent_loss = nn.functional.mse_loss(h_pred, h_GT)
+                        batch_aux += latent_loss.item()
+                        num_aux_steps += 1
+                    
+                    batch_aux = batch_aux / max(1, num_aux_steps)
+                
                 if num_valid > 0:
                     avg_recon = batch_recon / num_valid
                     avg_gate = batch_gate / num_valid
                     avg_total = self.loss_weight_recon * avg_recon + self.loss_weight_gate * avg_gate
+                    if self.loss_weight_aux > 0:
+                        avg_total += self.loss_weight_aux * batch_aux
                     
                     total_loss += avg_total
                     total_recon += avg_recon
                     total_gate += avg_gate
+                    total_aux += batch_aux
                     num_batches += 1
         
-        if num_batches == 0: return 0, 0, 0
-        return total_loss / num_batches, total_recon / num_batches, total_gate / num_batches
+        if num_batches == 0: return 0, 0, 0, 0
+        return total_loss / num_batches, total_recon / num_batches, total_gate / num_batches, total_aux / num_batches
 
     def train(self):
         if self.training_mode == 'epoch':
