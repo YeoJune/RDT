@@ -234,6 +234,7 @@ class GateMLP(nn.Module):
             gate_output: [B, 1] - current gate prediction
             pooled: [B, D] - current pooled features (for next step)
         """
+        x = x.detach()  # No gradients through x
         batch_size = x.size(0)
         
         # Multi-head attention pooling
@@ -253,6 +254,8 @@ class GateMLP(nn.Module):
         if prev_pooled is None:
             # First step: use zero tensor
             prev_pooled = torch.zeros_like(pooled)
+
+        prev_pooled = prev_pooled.detach()  # No gradients through prev_pooled
         
         combined = torch.cat([pooled, prev_pooled], dim=-1)  # [B, 2D]
         

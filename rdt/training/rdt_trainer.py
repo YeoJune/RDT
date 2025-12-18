@@ -197,6 +197,7 @@ class RDTTrainer:
             hidden, gate_pred, pooled = self.model(
                 h_0,  # Pass h_0 directly
                 attention_mask=attention_mask,
+                last_gate_score=gate_pred_0,
                 last_pooled=pooled_0,  # Pass pooled features from h_0
                 is_first_step=False,  # Already processed by input_encoder
                 gt_timestep=step_gt_timestep,
@@ -336,6 +337,7 @@ class RDTTrainer:
                 hidden, gate_pred, pooled = self.model(
                     h_0,
                     attention_mask=attention_mask,
+                    last_gate_score=gate_pred_0,
                     last_pooled=pooled_0,
                     is_first_step=False
                 )
