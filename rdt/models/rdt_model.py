@@ -175,7 +175,6 @@ class GateMLP(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.gate_scale = 20.0  # Max gate score
-        print(f"======{dropout}")
         
         # Multi-head attention pooling
         self.attention = nn.MultiheadAttention(
