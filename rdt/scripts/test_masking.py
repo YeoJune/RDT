@@ -416,6 +416,7 @@ def main():
             gate_hidden_dim=config['model']['gate_hidden_dim'],
             gate_num_layers=config['model']['gate_num_layers'],
             gate_num_heads=config['model']['gate_num_heads'],
+            gate_dropout=config['model']['gate_dropout'],
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
         
