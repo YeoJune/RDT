@@ -16,7 +16,7 @@ model:
   gate_hidden_dim: 256
   gate_num_layers: 2
   gate_num_heads: 8
-  gate_dropout: 0.3
+  gate_dropout: 0.2
   threshold: 0.5 # Gate threshold for stopping criterion
 
   # Memory optimization
