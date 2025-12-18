@@ -435,20 +435,27 @@ class RDTTrainer:
             
             # Validation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
-                val_loss, val_recon, val_gate = self.validate()
-                print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
+                val_loss, val_recon, val_gate, val_aux = self.validate()
+                print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}, Aux: {val_aux:.4f}")
                 
                 val_data = {
                     'epoch': epoch,
                     'step': self.global_step,
                     'val_loss': val_loss,
                     'val_recon': val_recon,
-                    'val_gate': val_gate
+                    'val_gate': val_gate,
+                    'val_aux': val_aux
                 }
                 self.csv_logger.log(val_data)
                 
                 if self.use_wandb:
-                    wandb.log({'val/loss': val_loss, 'epoch': epoch})
+                    wandb.log({
+                        'val/loss': val_loss,
+                        'val/recon_loss': val_recon,
+                        'val/gate_loss': val_gate,
+                        'val/aux_loss': val_aux,
+                        'epoch': epoch
+                    })
                 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -504,20 +511,27 @@ class RDTTrainer:
                 
                 # Validation at regular step intervals
                 if step % self.eval_every_n_steps == 0:
-                    val_loss, val_recon, val_gate = self.validate()
-                    print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
+                    val_loss, val_recon, val_gate, val_aux = self.validate()
+                    print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}, Aux: {val_aux:.4f}")
                     
                     val_data = {
                         'epoch': epoch,
                         'step': step,
                         'val_loss': val_loss,
                         'val_recon': val_recon,
-                        'val_gate': val_gate
+                        'val_gate': val_gate,
+                        'val_aux': val_aux
                     }
                     self.csv_logger.log(val_data)
                     
                     if self.use_wandb:
-                        wandb.log({'val/loss': val_loss, 'step': step})
+                        wandb.log({
+                            'val/loss': val_loss,
+                            'val/recon_loss': val_recon,
+                            'val/gate_loss': val_gate,
+                            'val/aux_loss': val_aux,
+                            'step': step
+                        })
                     
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
