@@ -13,9 +13,10 @@ model:
   dropout: 0.1
 
   # Gate MLP
-  gate_hidden_dim: 512
-  gate_num_layers: 3
+  gate_hidden_dim: 256
+  gate_num_layers: 2
   gate_num_heads: 8
+  gate_dropout: 0.1
   threshold: 0.5 # Gate threshold for stopping criterion
 
   # Memory optimization
@@ -46,18 +47,18 @@ training:
 
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
-  loss_weight_gate: 0.3 # Gate prediction loss weight
+  loss_weight_gate: 0.5 # Gate prediction loss weight
   loss_weight_aux: 0.3
   aux_ratio: 1.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
 
   # Optimization
   batch_size: 64
-  training_mode: "epoch" # 'epoch' or 'step'
+  training_mode: "step" # 'epoch' or 'step'
   num_epochs: 10 # Used when training_mode is 'epoch'
-  max_training_steps: 100000 # Used when training_mode is 'step'
+  max_training_steps: 400000 # Used when training_mode is 'step'
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
-  warmup_ratio: 0.1 # 10% of total steps
+  warmup_ratio: 0.03 # 3% of total steps
 
   # Scheduler
   scheduler: "cosine" # 'cosine' or 'linear'
@@ -72,8 +73,8 @@ training:
 
 # Data
 data:
-  dataset_name: "wikitext-2" # 'wikitext-2' or 'wikitext-103'
-  streaming: false # true: buffer-based on-the-fly loading, false: download all at once
+  dataset_name: ["wikipedia", "bookcorpus"] # 'wikitext-2' or 'wikitext-103'
+  streaming: true # true: buffer-based on-the-fly loading, false: download all at once
   max_seq_length: 128 # Maximum sequence length
   mask_token: "[MASK]"
   samples_per_text: 1 # Number of random samples to generate per text
@@ -92,7 +93,7 @@ output:
   log_dir: "runs"
   log_every_n_steps: 100
   eval_every_n_epochs: 1 # Used when training_mode is 'epoch'
-  eval_every_n_steps: 5000 # Used when training_mode is 'step'
+  eval_every_n_steps: 10000 # Used when training_mode is 'step'
 
 # Hardware
 device: "cuda" # 'cuda' or 'cpu'

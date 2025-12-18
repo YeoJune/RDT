@@ -175,6 +175,7 @@ class GateMLP(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.gate_scale = 20.0  # Max gate score
+        print(f"======{dropout}")
         
         # Multi-head attention pooling
         self.attention = nn.MultiheadAttention(
@@ -290,7 +291,7 @@ class GateMLP(nn.Module):
 class RDT(nn.Module):
     def __init__(self, vocab_size, d_model=512, n_heads=8, n_encoder_layers=6, n_io_layers=1, 
                  d_ff=2048, dropout=0.1, max_seq_len=512,
-                 gate_hidden_dim=512, gate_num_layers=3, gate_num_heads=8, gradient_checkpointing=False):
+                 gate_hidden_dim=512, gate_num_layers=3, gate_num_heads=8, gate_dropout = 0.3, gradient_checkpointing=False):
         super().__init__()
         self.d_model = d_model
         self.gradient_checkpointing = gradient_checkpointing
@@ -329,7 +330,7 @@ class RDT(nn.Module):
             hidden_dim=gate_hidden_dim, 
             num_layers=gate_num_layers,
             num_heads=gate_num_heads,
-            dropout=dropout
+            dropout=gate_dropout
         )
         
         # Weight Tying
