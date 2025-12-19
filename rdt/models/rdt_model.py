@@ -280,12 +280,12 @@ class GateMLP(nn.Module):
         if prev_gate is None:
             # First step: predict decrease from max (20)
             raw = self.first_step_proj(h)
-            decrease = nn.functional.softplus(raw)
+            decrease = raw
             gate_output = torch.clamp(self.gate_scale - decrease, min=0.0)
         else:
             # Subsequent steps: predict delta decrease
             raw = self.delta_proj(h)
-            delta = nn.functional.softplus(raw)
+            delta = raw
             gate_output = torch.clamp(prev_gate - delta, min=0.0)
         
         return gate_output, pooled
