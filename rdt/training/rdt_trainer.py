@@ -535,7 +535,7 @@ class RDTTrainer:
                         'gate_loss': gate,
                         'aux_loss': aux,
                         'lr': self.optimizer.param_groups[0]['lr'],
-                        'sampling_prob': sampling_prob
+                        'sampling_prob': self.get_sampling_prob(step=step)
                     }
                     
                     self.csv_logger.log(log_data)
