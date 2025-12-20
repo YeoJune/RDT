@@ -304,7 +304,6 @@ class RDTTrainer:
         total_loss = 0
         total_recon = 0
         total_gate = 0
-        total_aux = 0
         num_batches = 0
         
         with torch.no_grad():
@@ -388,7 +387,7 @@ class RDTTrainer:
                     num_batches += 1
         
         if num_batches == 0: return 0, 0, 0, 0
-        return total_loss / num_batches, total_recon / num_batches, total_gate / num_batches, total_aux / num_batches
+        return total_loss / num_batches, total_recon / num_batches, total_gate / num_batches
 
     def train(self):
         if self.training_mode == 'epoch':
@@ -437,16 +436,15 @@ class RDTTrainer:
             
             # Validation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
-                val_loss, val_recon, val_gate, val_aux = self.validate()
-                print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}, Aux: {val_aux:.4f}")
+                val_loss, val_recon, val_gate = self.validate()
+                print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
                 
                 val_data = {
                     'epoch': epoch,
                     'step': self.global_step,
                     'val_loss': val_loss,
                     'val_recon': val_recon,
-                    'val_gate': val_gate,
-                    'val_aux': val_aux
+                    'val_gate': val_gate
                 }
                 self.csv_logger.log(val_data)
                 
@@ -455,7 +453,6 @@ class RDTTrainer:
                         'val/loss': val_loss,
                         'val/recon_loss': val_recon,
                         'val/gate_loss': val_gate,
-                        'val/aux_loss': val_aux,
                         'epoch': epoch
                     })
                 
@@ -513,16 +510,15 @@ class RDTTrainer:
                 
                 # Validation at regular step intervals
                 if step % self.eval_every_n_steps == 0:
-                    val_loss, val_recon, val_gate, val_aux = self.validate()
-                    print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}, Aux: {val_aux:.4f}")
+                    val_loss, val_recon, val_gate = self.validate()
+                    print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
                     
                     val_data = {
                         'epoch': epoch,
                         'step': step,
                         'val_loss': val_loss,
                         'val_recon': val_recon,
-                        'val_gate': val_gate,
-                        'val_aux': val_aux
+                        'val_gate': val_gate
                     }
                     self.csv_logger.log(val_data)
                     
@@ -531,7 +527,6 @@ class RDTTrainer:
                             'val/loss': val_loss,
                             'val/recon_loss': val_recon,
                             'val/gate_loss': val_gate,
-                            'val/aux_loss': val_aux,
                             'step': step
                         })
                     
