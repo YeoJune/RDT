@@ -168,7 +168,7 @@ class RDTTrainer:
         num_valid_steps = 0
         
         # Scheduled Sampling Probability
-        sampling_prob = self.get_sampling_prob(self.current_epoch)
+        sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
         
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             # 0. Initial embedding and gate prediction for h_0
