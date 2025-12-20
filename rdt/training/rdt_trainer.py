@@ -272,6 +272,7 @@ class RDTTrainer:
                     target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
                     target_emb = self.model.pos_encoding(target_emb)
                     h_GT = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
+                    h_GT = self.model.input_norm(h_GT)
                     
                     # 2. Predicted hidden: h_{i+1} (from main loop, already computed)
                     h_pred = hidden_states[step_idx][:aux_batch_size]  # [Aux_B, Seq, D]
@@ -353,7 +354,7 @@ class RDTTrainer:
                     
                     # Store hidden for aux loss
                     if hidden_states is not None:
-                        hidden_states.append(hidden.clone())
+                        hidden_states.append(hidden)
                     
                     step_targets = targets[:, step_idx, :]
                     step_loss_mask = loss_masks[:, step_idx, :]
@@ -397,6 +398,7 @@ class RDTTrainer:
                         target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
                         target_emb = self.model.pos_encoding(target_emb)
                         h_GT = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
+                        h_GT = self.model.input_norm(h_GT)
                         
                         h_pred = hidden_states[step_idx][:aux_batch_size]
                         latent_loss = nn.functional.mse_loss(h_pred, h_GT)
