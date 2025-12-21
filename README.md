@@ -1,321 +1,207 @@
 # RDT: Recursive Denoising Transformer
 
-> **An Iterative Text Refinement Framework via Diffusion-inspired Recursive Computation**
+> **An Iterative Text Refinement Framework via Latent Space Denoising**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Pytorch](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
+[![Paper](https://img.shields.io/badge/Paper-ArXiv-B31B1B.svg)](https://arxiv.org/)
 
-## 📄 Abstract
+**Recursive Denoising Transformer (RDT)** proposes a novel architecture that bridges the gap between **Autoregressive Transformers** and **Denoising Diffusion Models**. Unlike traditional BERT-like models that process input in a single pass, RDT employs a **state-aware recursive mechanism** to iteratively refine text representations within a continuous latent space.
 
-**Recursive Denoising Transformer (RDT)** proposes a novel architecture that bridges the gap between **Autoregressive Transformers** and **Denoising Diffusion Models**. Unlike traditional models that process input in a single pass, RDT employs a **state-aware recursive mechanism** to iteratively refine corrupted text representations.
-
-By leveraging **Adaptive Layer Normalization (AdaLN)** conditioned on self-estimated timesteps, RDT dynamically modulates its computation path. This allows for parameter-efficient deep computation and continuous state refinement, enabling the model to reconstruct complex semantic structures from heavily masked inputs through successive iterations.
+By leveraging **Adaptive Layer Normalization (AdaLN)** and a self-regulating **Gate Mechanism**, RDT dynamically modulates its computation path. This allows for parameter-efficient deep computation, enabling the model to reconstruct complex semantic structures from heavily masked inputs through successive "denoising" iterations.
 
 ---
 
 ## 🧩 Methodology
 
-### 1. The Recursive Diffusion Process
+### 1. Latent Space Denoising
+RDT fundamentally differs from standard MLMs by separating the generation process into **Latent Mapping** and **Latent Denoising**.
+*   **Interface (Encoders/Decoders)**: Acts as a bridge between discrete tokens and continuous vectors.
+*   **Engine (Recursive Block)**: Performs the restoration trajectory ($h_t \to h_{t+1}$) entirely within the latent space, effectively removing "semantic noise" without observing raw tokens.
 
-The core philosophy of RDT is to treat text generation as a reverse diffusion process ($s_0 \to s_1 \dots \to s_L$), where $s_0$ represents a highly corrupted state and $s_L$ represents the fully restored sequence.
-
-Instead of stacking distinct layers $L_1 \dots L_N$, RDT utilizes a **Shared Recursive Encoder** $\mathcal{F}_\theta$ that is applied repeatedly:
-
-$$ h*{t+1} = \mathcal{F}*\theta(h_t, \text{Emb}(t)) $$
-
-Where $h_t$ is the hidden state at step $t$, and $\text{Emb}(t)$ is the sinusoidal embedding of the current timestep.
+$$
+h_{t+1} = \mathcal{F}_\theta(h_t, \text{Emb}(g_t))
+$$
 
 ### 2. Model Architecture
 
-The architecture integrates concepts from **DiT (Diffusion Transformers)** into a recursive NLP framework.
+The architecture mimics a **Latent Diffusion** process adapted for discrete text via recursive computation.
 
 ```mermaid
 graph LR
-    subgraph "Forward Process (Iteration t)"
-        Input[Hidden State h_t] --> Gate{Gate MLP}
-        Gate --"Step Estimation t"--> Time[Timestep Embedder]
-
-        Input --> Block[Recursive Transformer Block]
-        Time --"AdaLN Modulation (γ, β)"--> Block
-
-        Block --> Output[Hidden State h_t+1]
+    subgraph "Interface (Token Space)"
+        Input[Corrupted Input]
+        Output[Refined Output]
     end
 
-    Output -.-> Input
-    Output --> Decoder[Token Projection]
+    subgraph "Recursive Engine (Latent Space)"
+        H_in((h_t)) --> Norm[Input Norm]
+        Norm --> Gate{Gate MLP}
+        
+        Gate --"Noise Level (t)"--> Time[Timestep Embedder]
+        Time --"AdaLN Modulation (γ, β)"--> Block[Recursive Denoising Block]
+        
+        H_in --> Block
+        Block --> H_out((h_t+1))
+    end
+
+    Input --"Input Encoder"--> H_in
+    H_out --"Output Decoder"--> Output
+    H_out -."Recursion Loop".-> H_in
 ```
 
 #### A. Adaptive Layer Normalization (AdaLN)
-
-To effectively reuse weights across different denoising stages, the model must understand "time". We employ **AdaLN** to zero-initialize the control of the residual block and dynamically shift feature statistics based on the noise level:
-
+To effectively reuse weights across different denoising stages, the model injects timestep information into the normalization layers. The affine parameters are dynamically generated based on the Gate's output:
 $$ \text{AdaLN}(x, t) = (1 + \gamma(t)) \cdot \text{LayerNorm}(x) + \beta(t) $$
+We employ a **Zero-Initialization** strategy for $\gamma$ and $\beta$, ensuring the recursive block starts as an identity function and gradually learns to modulate features.
 
-This allows the same physical layers to perform coarse structural repairs at early steps and fine-grained detailing at later steps.
-
-#### B. Self-Regulated Gating Mechanism
-
-RDT includes a lightweight **Gate MLP** that acts as an internal clock. It diagnoses the current entropy of the hidden state to predict the restoration progress (timestep $t$). This prediction is fed back into the next iteration as a condition, making the inference process autonomous.
+#### B. Differential Gate Mechanism
+RDT includes a lightweight **Gate MLP** that acts as an internal clock. It diagnoses the entropy of the current hidden state to predict the restoration progress using a **Residual Prediction** scheme:
+$$ g_{t} = g_{t-1} - \Delta(h_t, h_{t-1}) $$
+This ensures a monotonically decreasing noise estimate, preventing infinite loops during inference.
 
 ---
 
 ## 📉 Optimization Objectives
 
-The model is trained using a multi-task objective function to ensure structural integrity and temporal coherence:
+The training optimizes a multi-task objective ensuring structural integrity and temporal coherence:
 
-$$ \mathcal{L}_{total} = \mathcal{L}_{recon} + \lambda*{gate}\mathcal{L}*{gate} + \lambda*{aux}\mathcal{L}*{latent} $$
+$$ \mathcal{L}_{total} = \mathcal{L}_{recon} + \lambda_{gate}\mathcal{L}_{gate} + \lambda_{latent}\mathcal{L}_{latent} $$
 
-1.  **Reconstruction Loss ($\mathcal{L}_{recon}$)**: Cross-Entropy loss for token prediction at each step.
-2.  **Gate Loss ($\mathcal{L}_{gate}$)**: MSE loss ensuring the Gate MLP accurately estimates the ground-truth timestep.
-3.  **Latent Consistency Loss ($\mathcal{L}_{latent}$)**: Enforces the hidden state trajectory to remain consistent with the ground-truth restoration path.
+| Component | Symbol | Description |
+| :--- | :---: | :--- |
+| **Reconstruction** | $\mathcal{L}_{recon}$ | Cross-Entropy loss on the final logits. Ensures the latent state decodes to correct tokens. |
+| **Gate Consistency** | $\mathcal{L}_{gate}$ | MSE loss ensuring the Gate MLP accurately estimates the ground-truth noise level ($s_{GT}$). |
+| **Latent Consistency** | $\mathcal{L}_{latent}$ | **Key Component.** Minimizes distance between recursive state $h_t$ and the "ideal" state encoded from ground-truth text. Acts as **Teacher Forcing in Latent Space**. |
+
+---
+
+## 📂 Project Structure
+
+The project is organized to separate model architecture, training logic, and data processing.
+
+```bash
+rdt/
+├── models/              # Core Neural Architectures
+│   ├── rdt_model.py        # Main RDT Implementation
+│   │   ├── DirectionalRecursiveBlock  # Shared Denoising Block
+│   │   ├── AdaptiveLayerNorm          # Time-conditioned Norm
+│   │   └── GateMLP                    # Residual Time Estimator
+│   ├── baseline_models.py  # BERT/RoBERTa wrappers
+│   └── bert_init.py        # Weight initialization tools
+│
+├── training/            # Training Logic
+│   ├── rdt_trainer.py      # RDT Trainer
+│   │   ├── Latent Consistency Loss    # Auxiliary loss implementation
+│   │   └── Scheduled Sampling         # GT vs Predicted Gate curriculum
+│   └── baseline_trainer.py # Standard MLM Trainer
+│
+├── data/                # Data Pipeline
+│   ├── datasets.py         # StreamingTextDataset
+│   └── collators.py        # Chain generation ($s_0 \to s_L$) & Masking
+│
+├── scripts/             # CLI Entry Points
+│   ├── train.py            # Unified training script
+│   ├── inference.py        # Adaptive inference demo
+│   └── evaluate.py         # Evaluation metrics calculation
+│
+└── configs/             # Hyperparameter Configurations
+    ├── base.yaml           # Default RDT config
+    └── experiment.yaml     # Custom experiment setups
+```
 
 ---
 
 ## 🛠️ Installation
 
-```bash
-git clone https://github.com/yourusername/rdt.git
-cd rdt
-pip install -e .
-```
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/yourusername/rdt.git
+   cd rdt
+   ```
 
-**Check compatibility:**
+2. **Install dependencies:**
+   ```bash
+   pip install -e .
+   ```
 
-```bash
-python check_compatibility.py
-```
+3. **(Optional) Setup Weights & Biases:**
+   ```bash
+   wandb login
+   ```
 
-**Setup Weights & Biases (W&B) for experiment tracking:**
+---
 
-```bash
-# Login to W&B (first time only)
-wandb login
+## 🚀 Usage
 
-# Or disable W&B by adding to your config:
-# use_wandb: false
-```
+### 1. Training
 
-## 🚀 Quick Start
-
-### Training RDT
-
-Train RDT model with the unified training script:
+RDT supports both **Epoch-based** and **Step-based** training. The trainer automatically handles **Scheduled Sampling**, transitioning from Ground-Truth timestamps (Early Training) to Predicted Gate scores (Late Training).
 
 ```bash
-# Train RDT (default)
+# Train RDT with default settings
 rdt-train --config rdt/configs/base.yaml
 
-# Train with custom settings
-rdt-train --config rdt/configs/experiment.yaml --output_dir ./outputs
+# Train with specific experiment configuration
+rdt-train --config rdt/configs/experiment.yaml --output_dir ./outputs/exp1
 ```
 
-### Training Baseline Models
+### 2. Inference (Iterative Denoising)
 
-Train BERT or RoBERTa baselines using the same data pipeline:
-
-```bash
-# Train RoBERTa baseline
-rdt-train --config rdt/configs/roberta_baseline.yaml
-
-# Train BERT baseline
-rdt-train --config rdt/configs/bert_baseline.yaml
-```
-
-### Evaluation
-
-Evaluate trained models:
-
-```bash
-# Evaluate any model (auto-detects RDT vs MLM)
-rdt-evaluate --checkpoint checkpoints/best_model.pt --config rdt/configs/base.yaml
-
-# Evaluate on specific dataset
-rdt-evaluate --checkpoint checkpoints/best_model.pt --config rdt/configs/base.yaml --dataset wikitext-2
-```
-
-### Inference (Iterative Denoising)
-
-Run inference with RDT's adaptive stopping mechanism:
+Run inference to observe the recursive restoration process. The model uses the **Adaptive Stopping** mechanism to determine when the text is fully restored.
 
 ```bash
 python rdt/scripts/inference.py \
     --checkpoint checkpoints/best_model.pt \
-    --config rdt/configs/base.yaml \
     --text "The quick brown [MASK] jumps over the lazy [MASK]." \
     --threshold 0.02
 ```
 
-### Testing
+**Output Example:**
+```text
+Step 0 (Gate: 1.00): The quick brown [MASK] jumps over the lazy [MASK].
+Step 1 (Gate: 0.45): The quick brown fox jumps over the lazy [MASK].
+Step 2 (Gate: 0.01): The quick brown fox jumps over the lazy dog.
+> Terminated (Threshold < 0.02)
+```
 
-Quick model verification:
+### 3. Evaluation
+
+Evaluate Perplexity (PPL) and Reconstruction Accuracy on standard benchmarks (WikiText-2, etc.).
 
 ```bash
-# Test model implementation
-python test_model.py
-
-# Test masking behavior
-python rdt/scripts/test_masking.py --config rdt/configs/base.yaml
+rdt-evaluate \
+    --checkpoint checkpoints/best_model.pt \
+    --config rdt/configs/base.yaml \
+    --dataset wikitext-2
 ```
 
-## 📂 Project Structure
+---
 
-```
-rdt/
-├── models/              # Model architectures
-│   ├── rdt_model.py        # RDT implementation (AdaLN, Gate MLP, Recursive blocks)
-│   ├── baseline_models.py  # Baseline wrappers (BERT, RoBERTa)
-│   └── bert_init.py        # BERT weight initialization
-├── data/                # Data loading and processing
-│   ├── datasets.py         # StreamingTextDataset, WikiTextDataset
-│   └── collators.py        # Data collators (RDT chains, MLM masking)
-├── training/            # Training logic
-│   ├── rdt_trainer.py      # RDT trainer (multi-objective loss)
-│   └── baseline_trainer.py # Standard MLM trainer
-├── evaluation/          # Evaluation tools
-│   ├── metrics.py          # Perplexity, accuracy, top-k metrics
-│   └── evaluator.py        # Unified evaluation interface
-├── scripts/             # Runnable scripts
-│   ├── train.py            # Unified training script (RDT + baselines)
-│   ├── evaluate.py         # Evaluation script
-│   ├── inference.py        # Interactive inference
-│   ├── test_masking.py     # Masking behavior tests
-│   └── test_bert.py        # BERT compatibility tests
-├── configs/             # Configuration files
-│   ├── base.yaml           # RDT config
-│   ├── experiment.yaml     # RDT experiment config
-│   ├── roberta_baseline.yaml  # RoBERTa config
-│   └── bert_baseline.yaml  # BERT config
-└── utils.py             # Shared utilities
+## 📊 Performance & Logging
 
-Root files:
-├── test_model.py        # Quick model tests
-├── check_compatibility.py  # Dependency checker
-└── pyproject.toml       # Package configuration
-```
+RDT integrates with **Weights & Biases (W&B)** and local **CSV logging**.
 
-### Key Components
+*   **Training Metrics:** Loss (Total, Recon, Gate, Aux), Learning Rate.
+*   **Validation Metrics:** Accuracy, Perplexity, Gate Error.
+*   **Visualizations:** Gate score trajectories, Latent space convergence.
 
-- **`models/rdt_model.py`**: Core RDT architecture with DirectionalRecursiveBlock and AdaLN
-- **`data/datasets.py`**: Streaming data pipeline with chain trajectory generation
-- **`training/rdt_trainer.py`**: Multi-objective training (reconstruction + gate + latent consistency)
-- **`evaluation/evaluator.py`**: Unified evaluation for both RDT and baseline models
-- **`scripts/train.py`**: Single entry point for training any model type
+Logs are saved to `outputs/logs/` and synced to your W&B project dashboard defined in `configs/base.yaml`.
 
-## 📊 Logging and Results
+---
 
-### Training Logs
+## 📜 Citation
 
-Training automatically generates CSV logs alongside W&B tracking:
-
-```bash
-# Logs saved to outputs/logs/train_YYYYMMDD_HHMMSS.csv
-rdt-train --config rdt/configs/base.yaml
-```
-
-**Log contents**: epoch, step, loss, recon_loss, gate_loss, aux_loss, lr, val_loss, etc.
-
-### Evaluation Results
-
-Evaluation saves detailed results as JSON:
-
-```bash
-# Save to custom path
-rdt-evaluate --checkpoint checkpoints/best_model.pt \
-             --config rdt/configs/base.yaml \
-             --output outputs/results/eval_results.json
-```
-
-**Result format**:
-
-```json
-{
-  "timestamp": "2024-12-15T10:30:00",
-  "model_type": "rdt",
-  "results": {
-    "loss": 2.34,
-    "accuracy": 0.65,
-    "perplexity": 10.38
-  }
-}
-```
-
-### Visualization
-
-Generate plots from logs:
-
-```bash
-# Plot training curves
-rdt-plot --log outputs/logs/train_20241215_103000.csv
-
-# Compare multiple experiments
-rdt-plot --compare outputs/results/rdt_eval.json \
-                    outputs/results/roberta_eval.json \
-         --output-dir outputs/visualizations
-```
-
-**Generated plots**:
-
-- `training_curves.png`: Loss, accuracy, learning rate over time
-- `comparison.png`: Side-by-side model comparison
-
-## � Experiment Tracking with W&B
-
-RDT uses [Weights & Biases](https://wandb.ai/) for experiment tracking and visualization.
-
-### Setup
-
-```bash
-# Install W&B
-pip install wandb
-
-# Login (first time only)
-wandb login
-```
-
-### Configuration
-
-Add W&B settings to your config file (e.g., `rdt/configs/base.yaml`):
-
-```yaml
-use_wandb: true # Enable/disable W&B (default: true)
-wandb_project: "rdt" # Your W&B project name
-wandb_run_name: "experiment-1" # Optional: custom run name
-```
-
-### What gets tracked:
-
-- **Training metrics**: loss, reconstruction loss, gate loss, auxiliary loss
-- **Learning rate**: current learning rate and scheduler state
-- **Validation metrics**: perplexity, accuracy, top-k accuracy
-- **Model architecture**: automatic model graph and gradients
-- **Hardware usage**: GPU utilization, memory, system metrics
-
-### Disable W&B
-
-To train without W&B:
-
-```yaml
-use_wandb: false
-```
-
-Or use environment variable:
-
-```bash
-export WANDB_MODE=disabled
-rdt-train --config rdt/configs/base.yaml
-```
-
-## �📜 Citation
-
-If you find this code useful for your research, please cite:
+If you use RDT in your research, please cite the following:
 
 ```bibtex
-@misc{rdt2024,
-  title={RDT: Recursive Denoising Transformer with Adaptive Computation},
+@misc{rdt2025,
+  title={RDT: Recursive Denoising Transformer via Latent Space Refinement},
   author={RDT Contributors},
-  year={2024},
+  year={2025},
   publisher={GitHub},
+  journal={arXiv preprint},
   howpublished={\url{https://github.com/yourusername/rdt}}
 }
 ```
