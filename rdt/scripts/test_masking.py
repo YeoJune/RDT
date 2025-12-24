@@ -165,10 +165,11 @@ def roberta_single_pass_inference(model, input_ids, attention_mask):
 
 
 def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, 
-                   metric_calc, max_steps=20, threshold=0.5):
-    """Test RDT model across different masking levels with multiple metrics"""
+                   metric_calc, max_steps=20, threshold=0.5, batch_size=32):
+    """Test RDT model across different masking levels with multiple metrics (batched)"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
+    pad_token_id = tokenizer.pad_token_id or 0
     
     # Initialize result storage
     results = {
@@ -179,10 +180,13 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
         'steps': {ratio: [] for ratio in mask_ratios}
     }
     
-    print(f"\nTesting RDT reconstruction capability (max_seq_len={max_seq_len})...")
+    print(f"\nTesting RDT reconstruction capability (max_seq_len={max_seq_len}, batch_size={batch_size})...")
     
-    for text in tqdm(test_texts, desc="Processing texts"):
-        # Tokenize
+    # Tokenize all texts first
+    all_tokens = []
+    all_texts = []
+    
+    for text in tqdm(test_texts, desc="Tokenizing"):
         encoded = tokenizer(
             text, 
             return_tensors='pt', 
@@ -192,42 +196,88 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
         )
         tokens = encoded['input_ids'].squeeze(0)
         
-        if len(tokens) < 10:
-            continue
+        if len(tokens) >= 10:
+            all_tokens.append(tokens)
+            all_texts.append(tokenizer.decode(tokens, skip_special_tokens=True))
+    
+    # Process in batches for each masking ratio
+    for ratio in mask_ratios:
+        print(f"\nProcessing masking ratio: {ratio*100:.0f}%")
         
-        # Original text for BERTScore and BLEU
-        original_text = tokenizer.decode(tokens, skip_special_tokens=True)
-        
-        # Test each masking ratio
-        for ratio in mask_ratios:
-            # Create masked input
-            masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id)
-            input_ids = masked_tokens.unsqueeze(0).to(device)
+        for i in tqdm(range(0, len(all_tokens), batch_size), desc=f"Batches ({ratio*100:.0f}%)"):
+            batch_tokens = all_tokens[i:i+batch_size]
+            batch_texts = all_texts[i:i+batch_size]
             
-            # Inference
+            # Prepare batch
+            max_len = max(len(t) for t in batch_tokens)
+            batch_input_ids = []
+            batch_attention_mask = []
+            batch_eval_masks = []
+            batch_original_tokens = []
+            
+            for tokens in batch_tokens:
+                # Create masked input
+                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id)
+                
+                # Pad to max_len
+                pad_len = max_len - len(masked_tokens)
+                if pad_len > 0:
+                    masked_tokens = torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
+                    eval_mask = torch.cat([eval_mask, torch.zeros(pad_len, dtype=torch.bool)])
+                    padded_tokens = torch.cat([tokens, torch.full((pad_len,), pad_token_id)])
+                    attention_mask = torch.cat([torch.ones(len(tokens)), torch.zeros(pad_len)])
+                else:
+                    padded_tokens = tokens
+                    attention_mask = torch.ones(len(tokens))
+                
+                batch_input_ids.append(masked_tokens)
+                batch_attention_mask.append(attention_mask)
+                batch_eval_masks.append(eval_mask)
+                batch_original_tokens.append(padded_tokens)
+            
+            # Stack into batch tensors
+            batch_input_ids = torch.stack(batch_input_ids).to(device)
+            batch_attention_mask = torch.stack(batch_attention_mask).to(device)
+            
+            # Batch inference
             with torch.no_grad():
-                output_ids, num_steps = model.inference(
-                    input_ids,
-                    max_steps=max_steps,
-                    threshold=threshold
-                )
-            
-            pred_tokens = output_ids.squeeze(0).cpu()
-            
-            # 1. Exact Match Accuracy
-            accuracy = metric_calc.calculate_exact_match(pred_tokens, tokens, eval_mask)
-            results['exact_match'][ratio].append(accuracy)
-            
-            # 2. Reconstructed text for other metrics
-            reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
-            results['bertscore'][ratio]['refs'].append(original_text)
-            results['bertscore'][ratio]['preds'].append(reconstructed_text)
-            results['perplexity'][ratio].append(reconstructed_text)
-            results['bleu4'][ratio]['refs'].append(original_text)
-            results['bleu4'][ratio]['preds'].append(reconstructed_text)
-            
-            # 3. Steps taken
-            results['steps'][ratio].append(num_steps)
+                # Note: RDT.inference doesn't support batching natively, so we process one by one
+                # but keep them on GPU for efficiency
+                for j in range(len(batch_tokens)):
+                    input_ids = batch_input_ids[j:j+1]
+                    
+                    output_ids, num_steps = model.inference(
+                        input_ids,
+                        max_steps=max_steps,
+                        threshold=threshold
+                    )
+                    
+                    pred_tokens = output_ids.squeeze(0).cpu()
+                    original_tokens = batch_original_tokens[j]
+                    eval_mask = batch_eval_masks[j]
+                    
+                    # Remove padding for evaluation
+                    valid_len = len(batch_tokens[j])
+                    pred_tokens = pred_tokens[:valid_len]
+                    original_tokens = original_tokens[:valid_len]
+                    eval_mask = eval_mask[:valid_len]
+                    
+                    # 1. Exact Match Accuracy
+                    accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
+                    results['exact_match'][ratio].append(accuracy)
+                    
+                    # 2. Reconstructed text
+                    reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+                    original_text = batch_texts[i+j]
+                    
+                    results['bertscore'][ratio]['refs'].append(original_text)
+                    results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                    results['perplexity'][ratio].append(reconstructed_text)
+                    results['bleu4'][ratio]['refs'].append(original_text)
+                    results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                    
+                    # 3. Steps taken
+                    results['steps'][ratio].append(num_steps)
     
     # Aggregate results
     aggregated = {
@@ -281,10 +331,12 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
     return aggregated
 
 
-def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, metric_calc):
-    """Test RoBERTa model with single-pass inference"""
+def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, 
+                      metric_calc, batch_size=32):
+    """Test RoBERTa model with single-pass inference (batched)"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
+    pad_token_id = tokenizer.pad_token_id or 0
     
     # Initialize result storage
     results = {
@@ -295,10 +347,14 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
         'steps': {ratio: [] for ratio in mask_ratios}
     }
     
-    print(f"\nTesting RoBERTa Single-pass reconstruction (max_seq_len={max_seq_len})...")
+    print(f"\nTesting RoBERTa Single-pass reconstruction (max_seq_len={max_seq_len}, batch_size={batch_size})...")
     
-    for text in tqdm(test_texts, desc="Processing texts"):
-        # Tokenize
+    # Tokenize all texts first
+    all_tokens = []
+    all_texts = []
+    all_attention_masks = []
+    
+    for text in tqdm(test_texts, desc="Tokenizing"):
         encoded = tokenizer(
             text, 
             return_tensors='pt', 
@@ -309,48 +365,75 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
         tokens = encoded['input_ids'].squeeze(0)
         attention_mask = encoded['attention_mask'].squeeze(0)
         
-        # Filter out padding for evaluation
+        # Filter out padding
         valid_positions = attention_mask.bool()
         valid_tokens = tokens[valid_positions]
         
-        if len(valid_tokens) < 10:
-            continue
+        if len(valid_tokens) >= 10:
+            all_tokens.append((tokens, attention_mask, valid_positions, valid_tokens))
+            all_texts.append(tokenizer.decode(valid_tokens, skip_special_tokens=True))
+    
+    # Process in batches for each masking ratio
+    for ratio in mask_ratios:
+        print(f"\nProcessing masking ratio: {ratio*100:.0f}%")
         
-        # Original text
-        original_text = tokenizer.decode(valid_tokens, skip_special_tokens=True)
-        
-        # Test each masking ratio
-        for ratio in mask_ratios:
-            # Create masked input (only on valid positions)
-            masked_tokens, eval_mask = create_masked_input(valid_tokens, ratio, mask_token_id)
+        for i in tqdm(range(0, len(all_tokens), batch_size), desc=f"Batches ({ratio*100:.0f}%)"):
+            batch_data = all_tokens[i:i+batch_size]
+            batch_texts = all_texts[i:i+batch_size]
             
-            # Put back into full sequence
-            full_masked = tokens.clone()
-            full_masked[valid_positions] = masked_tokens
+            # Prepare batch
+            batch_input_ids = []
+            batch_attention_masks = []
+            batch_eval_masks = []
+            batch_valid_tokens = []
             
-            input_ids = full_masked.unsqueeze(0).to(device)
-            attn_mask = attention_mask.unsqueeze(0).to(device)
+            for tokens, attention_mask, valid_positions, valid_tokens in batch_data:
+                # Create masked input (only on valid positions)
+                masked_tokens, eval_mask = create_masked_input(valid_tokens, ratio, mask_token_id)
+                
+                # Put back into full sequence
+                full_masked = tokens.clone()
+                full_masked[valid_positions] = masked_tokens
+                
+                batch_input_ids.append(full_masked)
+                batch_attention_masks.append(attention_mask)
+                batch_eval_masks.append((eval_mask, valid_positions))
+                batch_valid_tokens.append(valid_tokens)
             
-            # Inference (single-pass)
-            pred_tokens_full = roberta_single_pass_inference(model, input_ids, attn_mask)
+            # Stack into batch tensors
+            batch_input_ids = torch.stack(batch_input_ids).to(device)
+            batch_attention_masks = torch.stack(batch_attention_masks).to(device)
             
-            # Extract predictions on valid positions
-            pred_tokens = pred_tokens_full.squeeze(0).cpu()[valid_positions]
+            # Batch inference
+            with torch.no_grad():
+                outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_masks)
+                logits = outputs.logits
+                pred_tokens_batch = torch.argmax(logits, dim=-1).cpu()
             
-            # 1. Exact Match Accuracy
-            accuracy = metric_calc.calculate_exact_match(pred_tokens, valid_tokens, eval_mask)
-            results['exact_match'][ratio].append(accuracy)
-            
-            # 2. Reconstructed text
-            reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
-            results['bertscore'][ratio]['refs'].append(original_text)
-            results['bertscore'][ratio]['preds'].append(reconstructed_text)
-            results['perplexity'][ratio].append(reconstructed_text)
-            results['bleu4'][ratio]['refs'].append(original_text)
-            results['bleu4'][ratio]['preds'].append(reconstructed_text)
-            
-            # 3. Steps (always 1 for single-pass)
-            results['steps'][ratio].append(1)
+            # Process each sample in batch
+            for j in range(len(batch_data)):
+                eval_mask, valid_positions = batch_eval_masks[j]
+                valid_tokens = batch_valid_tokens[j]
+                
+                # Extract predictions on valid positions
+                pred_tokens = pred_tokens_batch[j][valid_positions]
+                
+                # 1. Exact Match Accuracy
+                accuracy = metric_calc.calculate_exact_match(pred_tokens, valid_tokens, eval_mask)
+                results['exact_match'][ratio].append(accuracy)
+                
+                # 2. Reconstructed text
+                reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+                original_text = batch_texts[i+j]
+                
+                results['bertscore'][ratio]['refs'].append(original_text)
+                results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                results['perplexity'][ratio].append(reconstructed_text)
+                results['bleu4'][ratio]['refs'].append(original_text)
+                results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                
+                # 3. Steps (always 1 for single-pass)
+                results['steps'][ratio].append(1)
     
     # Aggregate results
     aggregated = {
@@ -652,10 +735,14 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
     config = load_config(config_path)
     model_type = config.get('model_type', 'rdt').lower()
     
+    # Get batch size from config
+    batch_size = config['training'].get('batch_size', 32)
+    
     print(f"\n{'='*80}")
     print(f"Testing Model: {model_type.upper()}")
     print(f"Config: {config_path}")
     print(f"Checkpoint: {checkpoint_path}")
+    print(f"Batch size: {batch_size} (from config)")
     print(f"{'='*80}")
     
     # Initialize metric calculator
@@ -702,7 +789,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         # Test model
         results = test_rdt_model(
             model, tokenizer, test_texts, mask_ratios, 
-            device, max_seq_len, metric_calc, max_steps, threshold
+            device, max_seq_len, metric_calc, max_steps, threshold, batch_size
         )
         
         model_name = f"RDT"
@@ -741,7 +828,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         # Test model
         results = test_roberta_model(
             model, tokenizer, test_texts, mask_ratios, 
-            device, max_seq_len, metric_calc
+            device, max_seq_len, metric_calc, batch_size
         )
         
         model_name = "RoBERTa-base"
