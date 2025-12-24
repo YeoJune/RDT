@@ -36,8 +36,8 @@ class MetricCalculator:
         
         # Load GPT-2 Large for perplexity
         print("Loading GPT-2 Large for perplexity calculation...")
-        self.gpt2_model = GPT2LMHeadModel.from_pretrained('gpt2-large').to(device)
-        self.gpt2_tokenizer = GPT2TokenizerFast.from_pretrained('gpt2-large')
+        self.gpt2_model = GPT2LMHeadModel.from_pretrained('distillgpt2').to(device)
+        self.gpt2_tokenizer = GPT2TokenizerFast.from_pretrained('distillgpt2')
         self.gpt2_model.eval()
         
         self.smoothing = SmoothingFunction()
