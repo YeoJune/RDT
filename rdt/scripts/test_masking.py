@@ -1,15 +1,137 @@
-"""Test reconstruction capability across different masking levels for RDT and RoBERTa models"""
+"""Test reconstruction capability across different masking levels for RDT and RoBERTa models
+Enhanced with multiple metrics: BERTScore, Oracle PPL, BLEU-4, Exact Match
+"""
 
 import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import AutoTokenizer, RobertaForMaskedLM
+from transformers import AutoTokenizer, RobertaForMaskedLM, GPT2LMHeadModel, GPT2TokenizerFast
 from tqdm import tqdm
 from pathlib import Path
+from typing import Dict, List, Tuple
+import json
+
+# Metric libraries
+from bert_score import score as bert_score
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import nltk
 
 from rdt.models import RDT
 from rdt.utils import load_config, get_device
+
+
+# Download NLTK data if needed
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+
+class MetricCalculator:
+    """Batch-optimized metric calculator"""
+    
+    def __init__(self, device='cuda'):
+        self.device = device
+        
+        # Load GPT-2 Large for perplexity
+        print("Loading GPT-2 Large for perplexity calculation...")
+        self.gpt2_model = GPT2LMHeadModel.from_pretrained('gpt2-large').to(device)
+        self.gpt2_tokenizer = GPT2TokenizerFast.from_pretrained('gpt2-large')
+        self.gpt2_model.eval()
+        
+        self.smoothing = SmoothingFunction()
+    
+    def calculate_bertscore(self, references: List[str], predictions: List[str]) -> float:
+        """Calculate BERTScore F1 (batch)"""
+        if len(references) == 0:
+            return 0.0
+        
+        P, R, F1 = bert_score(
+            predictions, 
+            references, 
+            lang='en', 
+            model_type='bert-base-uncased',
+            device=self.device,
+            batch_size=32,
+            verbose=False
+        )
+        
+        return F1.mean().item()
+    
+    def calculate_perplexity_batch(self, texts: List[str], batch_size: int = 8) -> float:
+        """Calculate average perplexity using GPT-2 Large (per-sample, batched for speed)"""
+        if len(texts) == 0:
+            return float('inf')
+        
+        ppls = []
+        
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i+batch_size]
+                
+                # Process each sample individually to get per-sample PPL
+                for text in batch_texts:
+                    # Tokenize
+                    encodings = self.gpt2_tokenizer(
+                        text,
+                        return_tensors='pt',
+                        truncation=True,
+                        max_length=1024
+                    ).to(self.device)
+                    
+                    input_ids = encodings['input_ids']
+                    
+                    # Calculate loss for this sample
+                    outputs = self.gpt2_model(input_ids, labels=input_ids)
+                    
+                    # Perplexity = exp(loss)
+                    sample_loss = outputs.loss.item()
+                    ppl = np.exp(sample_loss)
+                    ppls.append(ppl)
+        
+        return np.mean(ppls) if ppls else float('inf')
+    
+    def calculate_bleu4(self, references: List[str], predictions: List[str]) -> float:
+        """Calculate average BLEU-4 score"""
+        if len(references) == 0:
+            return 0.0
+        
+        bleu_scores = []
+        
+        for ref, pred in zip(references, predictions):
+            # Tokenize
+            ref_tokens = ref.split()
+            pred_tokens = pred.split()
+            
+            if len(pred_tokens) == 0:
+                bleu_scores.append(0.0)
+                continue
+            
+            # Calculate BLEU-4
+            score = sentence_bleu(
+                [ref_tokens], 
+                pred_tokens, 
+                weights=(0.25, 0.25, 0.25, 0.25),
+                smoothing_function=self.smoothing.method1
+            )
+            bleu_scores.append(score)
+        
+        return np.mean(bleu_scores)
+    
+    def calculate_exact_match(self, pred_tokens: torch.Tensor, target_tokens: torch.Tensor, 
+                             eval_mask: torch.Tensor) -> float:
+        """Calculate exact match accuracy on masked positions"""
+        if eval_mask.sum() == 0:
+            return 1.0
+        
+        masked_pred = pred_tokens[eval_mask]
+        masked_target = target_tokens[eval_mask]
+        
+        correct = (masked_pred == masked_target).sum().item()
+        total = eval_mask.sum().item()
+        
+        return correct / total
 
 
 def create_masked_input(tokens, mask_ratio, mask_token_id):
@@ -33,20 +155,6 @@ def create_masked_input(tokens, mask_ratio, mask_token_id):
     return masked_tokens, eval_mask
 
 
-def calculate_accuracy(pred_tokens, target_tokens, eval_mask):
-    """Calculate accuracy on masked positions"""
-    if eval_mask.sum() == 0:
-        return 1.0
-    
-    masked_pred = pred_tokens[eval_mask]
-    masked_target = target_tokens[eval_mask]
-    
-    correct = (masked_pred == masked_target).sum().item()
-    total = eval_mask.sum().item()
-    
-    return correct / total
-
-
 def roberta_single_pass_inference(model, input_ids, attention_mask):
     """Single forward pass through RoBERTa"""
     with torch.no_grad():
@@ -56,67 +164,25 @@ def roberta_single_pass_inference(model, input_ids, attention_mask):
     return pred_tokens
 
 
-def roberta_iterative_inference(model, input_ids, attention_mask, mask_token_id, max_steps=20, threshold=0.95):
-    """Iterative refinement similar to RDT"""
-    current_ids = input_ids.clone()
-    
-    for step in range(max_steps):
-        # Forward pass
-        with torch.no_grad():
-            outputs = model(input_ids=current_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1)
-            pred_tokens = torch.argmax(logits, dim=-1)
-            max_probs = torch.max(probs, dim=-1)[0]
-        
-        # Find masked positions
-        mask_positions = (current_ids == mask_token_id)
-        
-        if not mask_positions.any():
-            return current_ids, step + 1
-        
-        # Get confidence for masked positions
-        masked_probs = max_probs[mask_positions]
-        
-        # Update high-confidence predictions
-        high_conf_mask = masked_probs > threshold
-        
-        if not high_conf_mask.any():
-            # If no high confidence, update all
-            current_ids[mask_positions] = pred_tokens[mask_positions]
-            return current_ids, step + 1
-        
-        # Update only high-confidence positions
-        mask_positions_idx = torch.where(mask_positions)[1]
-        high_conf_idx = mask_positions_idx[high_conf_mask]
-        
-        for idx in high_conf_idx:
-            current_ids[0, idx] = pred_tokens[0, idx]
-    
-    # Final pass to fill any remaining masks
-    mask_positions = (current_ids == mask_token_id)
-    if mask_positions.any():
-        with torch.no_grad():
-            outputs = model(input_ids=current_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            pred_tokens = torch.argmax(logits, dim=-1)
-        current_ids[mask_positions] = pred_tokens[mask_positions]
-    
-    return current_ids, max_steps
-
-
-def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, max_steps=20, threshold=0.5):
-    """Test RDT model across different masking levels"""
+def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, 
+                   metric_calc, max_steps=20, threshold=0.5):
+    """Test RDT model across different masking levels with multiple metrics"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
     
-    results = {ratio: [] for ratio in mask_ratios}
-    steps_taken = {ratio: [] for ratio in mask_ratios}
+    # Initialize result storage
+    results = {
+        'exact_match': {ratio: [] for ratio in mask_ratios},
+        'bertscore': {ratio: {'refs': [], 'preds': []} for ratio in mask_ratios},
+        'perplexity': {ratio: [] for ratio in mask_ratios},
+        'bleu4': {ratio: {'refs': [], 'preds': []} for ratio in mask_ratios},
+        'steps': {ratio: [] for ratio in mask_ratios}
+    }
     
     print(f"\nTesting RDT reconstruction capability (max_seq_len={max_seq_len})...")
     
     for text in tqdm(test_texts, desc="Processing texts"):
-        # Tokenize with config max_length
+        # Tokenize
         encoded = tokenizer(
             text, 
             return_tensors='pt', 
@@ -128,6 +194,9 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
         
         if len(tokens) < 10:
             continue
+        
+        # Original text for BERTScore and BLEU
+        original_text = tokenizer.decode(tokens, skip_special_tokens=True)
         
         # Test each masking ratio
         for ratio in mask_ratios:
@@ -143,38 +212,90 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                     threshold=threshold
                 )
             
-            # Calculate accuracy
             pred_tokens = output_ids.squeeze(0).cpu()
-            accuracy = calculate_accuracy(pred_tokens, tokens, eval_mask)
             
-            results[ratio].append(accuracy)
-            steps_taken[ratio].append(num_steps)
+            # 1. Exact Match Accuracy
+            accuracy = metric_calc.calculate_exact_match(pred_tokens, tokens, eval_mask)
+            results['exact_match'][ratio].append(accuracy)
+            
+            # 2. Reconstructed text for other metrics
+            reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+            results['bertscore'][ratio]['refs'].append(original_text)
+            results['bertscore'][ratio]['preds'].append(reconstructed_text)
+            results['perplexity'][ratio].append(reconstructed_text)
+            results['bleu4'][ratio]['refs'].append(original_text)
+            results['bleu4'][ratio]['preds'].append(reconstructed_text)
+            
+            # 3. Steps taken
+            results['steps'][ratio].append(num_steps)
     
     # Aggregate results
-    avg_results = {}
-    avg_steps = {}
+    aggregated = {
+        'exact_match': {},
+        'bertscore': {},
+        'perplexity': {},
+        'bleu4': {},
+        'steps': {}
+    }
     
-    for ratio in mask_ratios:
-        if results[ratio]:
-            avg_results[ratio] = np.mean(results[ratio])
-            avg_steps[ratio] = np.mean(steps_taken[ratio])
+    print("\nCalculating metrics...")
+    for ratio in tqdm(mask_ratios, desc="Aggregating"):
+        # Exact Match
+        if results['exact_match'][ratio]:
+            aggregated['exact_match'][ratio] = np.mean(results['exact_match'][ratio])
         else:
-            avg_results[ratio] = 0.0
-            avg_steps[ratio] = 0.0
+            aggregated['exact_match'][ratio] = 0.0
+        
+        # BERTScore
+        if results['bertscore'][ratio]['refs']:
+            aggregated['bertscore'][ratio] = metric_calc.calculate_bertscore(
+                results['bertscore'][ratio]['refs'],
+                results['bertscore'][ratio]['preds']
+            )
+        else:
+            aggregated['bertscore'][ratio] = 0.0
+        
+        # Perplexity
+        if results['perplexity'][ratio]:
+            aggregated['perplexity'][ratio] = metric_calc.calculate_perplexity_batch(
+                results['perplexity'][ratio]
+            )
+        else:
+            aggregated['perplexity'][ratio] = float('inf')
+        
+        # BLEU-4
+        if results['bleu4'][ratio]['refs']:
+            aggregated['bleu4'][ratio] = metric_calc.calculate_bleu4(
+                results['bleu4'][ratio]['refs'],
+                results['bleu4'][ratio]['preds']
+            )
+        else:
+            aggregated['bleu4'][ratio] = 0.0
+        
+        # Steps
+        if results['steps'][ratio]:
+            aggregated['steps'][ratio] = np.mean(results['steps'][ratio])
+        else:
+            aggregated['steps'][ratio] = 0.0
     
-    return avg_results, avg_steps
+    return aggregated
 
 
-def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, mode='single', max_steps=20, threshold=0.95):
-    """Test RoBERTa model across different masking levels"""
+def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, metric_calc):
+    """Test RoBERTa model with single-pass inference"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
     
-    results = {ratio: [] for ratio in mask_ratios}
-    steps_taken = {ratio: [] for ratio in mask_ratios}
+    # Initialize result storage
+    results = {
+        'exact_match': {ratio: [] for ratio in mask_ratios},
+        'bertscore': {ratio: {'refs': [], 'preds': []} for ratio in mask_ratios},
+        'perplexity': {ratio: [] for ratio in mask_ratios},
+        'bleu4': {ratio: {'refs': [], 'preds': []} for ratio in mask_ratios},
+        'steps': {ratio: [] for ratio in mask_ratios}
+    }
     
-    mode_name = "Single-pass" if mode == 'single' else "Iterative"
-    print(f"\nTesting RoBERTa {mode_name} reconstruction (max_seq_len={max_seq_len})...")
+    print(f"\nTesting RoBERTa Single-pass reconstruction (max_seq_len={max_seq_len})...")
     
     for text in tqdm(test_texts, desc="Processing texts"):
         # Tokenize
@@ -195,6 +316,9 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
         if len(valid_tokens) < 10:
             continue
         
+        # Original text
+        original_text = tokenizer.decode(valid_tokens, skip_special_tokens=True)
+        
         # Test each masking ratio
         for ratio in mask_ratios:
             # Create masked input (only on valid positions)
@@ -207,98 +331,265 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
             input_ids = full_masked.unsqueeze(0).to(device)
             attn_mask = attention_mask.unsqueeze(0).to(device)
             
-            # Inference
-            if mode == 'single':
-                pred_tokens_full = roberta_single_pass_inference(model, input_ids, attn_mask)
-                num_steps = 1
-            else:
-                pred_tokens_full, num_steps = roberta_iterative_inference(
-                    model, input_ids, attn_mask, mask_token_id, max_steps, threshold
-                )
+            # Inference (single-pass)
+            pred_tokens_full = roberta_single_pass_inference(model, input_ids, attn_mask)
             
             # Extract predictions on valid positions
             pred_tokens = pred_tokens_full.squeeze(0).cpu()[valid_positions]
             
-            # Calculate accuracy
-            accuracy = calculate_accuracy(pred_tokens, valid_tokens, eval_mask)
+            # 1. Exact Match Accuracy
+            accuracy = metric_calc.calculate_exact_match(pred_tokens, valid_tokens, eval_mask)
+            results['exact_match'][ratio].append(accuracy)
             
-            results[ratio].append(accuracy)
-            steps_taken[ratio].append(num_steps)
+            # 2. Reconstructed text
+            reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+            results['bertscore'][ratio]['refs'].append(original_text)
+            results['bertscore'][ratio]['preds'].append(reconstructed_text)
+            results['perplexity'][ratio].append(reconstructed_text)
+            results['bleu4'][ratio]['refs'].append(original_text)
+            results['bleu4'][ratio]['preds'].append(reconstructed_text)
+            
+            # 3. Steps (always 1 for single-pass)
+            results['steps'][ratio].append(1)
     
     # Aggregate results
-    avg_results = {}
-    avg_steps = {}
+    aggregated = {
+        'exact_match': {},
+        'bertscore': {},
+        'perplexity': {},
+        'bleu4': {},
+        'steps': {}
+    }
     
-    for ratio in mask_ratios:
-        if results[ratio]:
-            avg_results[ratio] = np.mean(results[ratio])
-            avg_steps[ratio] = np.mean(steps_taken[ratio])
+    print("\nCalculating metrics...")
+    for ratio in tqdm(mask_ratios, desc="Aggregating"):
+        # Exact Match
+        if results['exact_match'][ratio]:
+            aggregated['exact_match'][ratio] = np.mean(results['exact_match'][ratio])
         else:
-            avg_results[ratio] = 0.0
-            avg_steps[ratio] = 0.0
+            aggregated['exact_match'][ratio] = 0.0
+        
+        # BERTScore
+        if results['bertscore'][ratio]['refs']:
+            aggregated['bertscore'][ratio] = metric_calc.calculate_bertscore(
+                results['bertscore'][ratio]['refs'],
+                results['bertscore'][ratio]['preds']
+            )
+        else:
+            aggregated['bertscore'][ratio] = 0.0
+        
+        # Perplexity
+        if results['perplexity'][ratio]:
+            aggregated['perplexity'][ratio] = metric_calc.calculate_perplexity_batch(
+                results['perplexity'][ratio]
+            )
+        else:
+            aggregated['perplexity'][ratio] = float('inf')
+        
+        # BLEU-4
+        if results['bleu4'][ratio]['refs']:
+            aggregated['bleu4'][ratio] = metric_calc.calculate_bleu4(
+                results['bleu4'][ratio]['refs'],
+                results['bleu4'][ratio]['preds']
+            )
+        else:
+            aggregated['bleu4'][ratio] = 0.0
+        
+        # Steps
+        if results['steps'][ratio]:
+            aggregated['steps'][ratio] = np.mean(results['steps'][ratio])
+        else:
+            aggregated['steps'][ratio] = 1.0
     
-    return avg_results, avg_steps
+    return aggregated
 
 
-def visualize_results(mask_ratios, accuracies, steps, model_type='rdt', mode='single', save_path=None):
-    """Visualize test results"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+def visualize_comparison(mask_ratios, results1, results2, model1_name, model2_name, output_dir):
+    """Visualize comparison between two models"""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Determine title and color based on model type
-    if model_type == 'rdt':
-        title_prefix = "RDT"
-        color_acc = 'b'
-        color_steps = 'r'
-    else:
-        mode_name = "Single-pass" if mode == 'single' else "Iterative"
-        title_prefix = f"RoBERTa-base {mode_name}"
-        color_acc = 'g'
-        color_steps = 'purple'
-    
-    # Plot 1: Accuracy vs Masking Ratio
     mask_percentages = [r * 100 for r in mask_ratios]
-    ax1.plot(mask_percentages, list(accuracies.values()), marker='o', color=color_acc, linewidth=2, markersize=8)
-    ax1.set_xlabel('Masking Ratio (%)', fontsize=12)
-    ax1.set_ylabel('Reconstruction Accuracy', fontsize=12)
-    ax1.set_title(f'{title_prefix} Reconstruction Accuracy', fontsize=14, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.set_ylim([0, 1.05])
     
-    # Add value labels
-    for ratio, acc in accuracies.items():
-        x = ratio * 100
-        ax1.annotate(f'{acc:.3f}', (x, acc), textcoords="offset points", 
-                    xytext=(0,10), ha='center', fontsize=9)
+    metrics = [
+        ('exact_match', 'Exact Match Accuracy', (0, 1.05)),
+        ('bertscore', 'BERTScore F1', (0, 1.05)),
+        ('bleu4', 'BLEU-4 Score', (0, 1.05)),
+        ('perplexity', 'Perplexity (GPT-2 Large)', None),
+        ('steps', 'Average Inference Steps', None)
+    ]
     
-    # Plot 2: Steps Taken vs Masking Ratio
-    ax2.plot(mask_percentages, list(steps.values()), marker='s', color=color_steps, linewidth=2, markersize=8)
-    ax2.set_xlabel('Masking Ratio (%)', fontsize=12)
-    ax2.set_ylabel('Average Steps Taken', fontsize=12)
-    ax2.set_title('Inference Steps by Masking Level', fontsize=14, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
+    for metric_key, metric_name, ylim in metrics:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Plot model 1
+        values1 = [results1[metric_key][r] for r in mask_ratios]
+        ax.plot(mask_percentages, values1, marker='o', linewidth=2, markersize=8, 
+                label=model1_name, color='#2E86DE')
+        
+        # Plot model 2
+        values2 = [results2[metric_key][r] for r in mask_ratios]
+        ax.plot(mask_percentages, values2, marker='s', linewidth=2, markersize=8, 
+                label=model2_name, color='#EE5A6F')
+        
+        ax.set_xlabel('Masking Ratio (%)', fontsize=12)
+        ax.set_ylabel(metric_name, fontsize=12)
+        ax.set_title(f'{metric_name} Comparison', fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        
+        if ylim:
+            ax.set_ylim(ylim)
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / f'{metric_key}_comparison.png', dpi=300, bbox_inches='tight')
+        plt.close()
     
-    # Add value labels
-    for ratio, step in steps.items():
-        x = ratio * 100
-        ax2.annotate(f'{step:.1f}', (x, step), textcoords="offset points", 
-                    xytext=(0,10), ha='center', fontsize=9)
+    print(f"\nVisualizations saved to: {output_dir}")
+
+
+def visualize_single(mask_ratios, results, model_name, output_dir):
+    """Visualize results for a single model"""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
+    mask_percentages = [r * 100 for r in mask_ratios]
+    
+    # Create 2x3 subplot layout
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    axes = axes.flatten()
+    
+    metrics = [
+        ('exact_match', 'Exact Match Accuracy', (0, 1.05), '#2E86DE'),
+        ('bertscore', 'BERTScore F1', (0, 1.05), '#10AC84'),
+        ('bleu4', 'BLEU-4 Score', (0, 1.05), '#EE5A6F'),
+        ('perplexity', 'Perplexity (GPT-2 Large)', None, '#F79F1F'),
+        ('steps', 'Average Inference Steps', None, '#5F27CD')
+    ]
+    
+    for idx, (metric_key, metric_name, ylim, color) in enumerate(metrics):
+        ax = axes[idx]
+        
+        values = [results[metric_key][r] for r in mask_ratios]
+        ax.plot(mask_percentages, values, marker='o', linewidth=2, markersize=8, color=color)
+        
+        ax.set_xlabel('Masking Ratio (%)', fontsize=11)
+        ax.set_ylabel(metric_name, fontsize=11)
+        ax.set_title(metric_name, fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        
+        if ylim:
+            ax.set_ylim(ylim)
+        
+        # Add value labels
+        for ratio, val in zip(mask_percentages, values):
+            if metric_key == 'perplexity':
+                ax.annotate(f'{val:.1f}', (ratio, val), textcoords="offset points", 
+                           xytext=(0,5), ha='center', fontsize=8)
+            else:
+                ax.annotate(f'{val:.3f}', (ratio, val), textcoords="offset points", 
+                           xytext=(0,5), ha='center', fontsize=8)
+    
+    # Hide the last subplot (6th position)
+    axes[5].axis('off')
+    
+    fig.suptitle(f'{model_name} - Reconstruction Metrics', fontsize=16, fontweight='bold', y=0.995)
     plt.tight_layout()
+    plt.savefig(output_dir / 'all_metrics.png', dpi=300, bbox_inches='tight')
+    plt.close()
     
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"\nVisualization saved to: {save_path}")
-    
-    plt.show()
+    print(f"\nVisualization saved to: {output_dir}")
 
 
-def load_test_texts_rdt(config, num_samples=100):
+def save_results_text(mask_ratios, results, model_name, output_path):
+    """Save results to text file"""
+    with open(output_path, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"{model_name} - Reconstruction Test Results\n")
+        f.write("=" * 80 + "\n\n")
+        
+        # Table header
+        f.write(f"{'Mask %':<10} {'Exact Match':<15} {'BERTScore':<15} {'BLEU-4':<15} {'PPL':<15} {'Steps':<10}\n")
+        f.write("-" * 80 + "\n")
+        
+        for ratio in mask_ratios:
+            mask_pct = ratio * 100
+            exact = results['exact_match'][ratio]
+            bert = results['bertscore'][ratio]
+            bleu = results['bleu4'][ratio]
+            ppl = results['perplexity'][ratio]
+            steps = results['steps'][ratio]
+            
+            f.write(f"{mask_pct:>8.0f}%  {exact:>13.4f}  {bert:>13.4f}  {bleu:>13.4f}  "
+                   f"{ppl:>13.2f}  {steps:>8.2f}\n")
+        
+        f.write("=" * 80 + "\n")
+
+
+def save_comparison_text(mask_ratios, results1, results2, model1_name, model2_name, output_path):
+    """Save comparison results to text file"""
+    with open(output_path, 'w') as f:
+        f.write("=" * 100 + "\n")
+        f.write(f"Comparison: {model1_name} vs {model2_name}\n")
+        f.write("=" * 100 + "\n\n")
+        
+        metrics = ['exact_match', 'bertscore', 'bleu4', 'perplexity', 'steps']
+        metric_names = ['Exact Match', 'BERTScore F1', 'BLEU-4', 'Perplexity', 'Steps']
+        
+        for metric_key, metric_name in zip(metrics, metric_names):
+            f.write(f"\n{metric_name}:\n")
+            f.write("-" * 100 + "\n")
+            f.write(f"{'Mask %':<10} {model1_name:<25} {model2_name:<25} {'Difference':<20}\n")
+            f.write("-" * 100 + "\n")
+            
+            for ratio in mask_ratios:
+                mask_pct = ratio * 100
+                val1 = results1[metric_key][ratio]
+                val2 = results2[metric_key][ratio]
+                
+                if metric_key == 'perplexity':
+                    diff = val1 - val2
+                    f.write(f"{mask_pct:>8.0f}%  {val1:>23.2f}  {val2:>23.2f}  {diff:>18.2f}\n")
+                else:
+                    diff = val1 - val2
+                    f.write(f"{mask_pct:>8.0f}%  {val1:>23.4f}  {val2:>23.4f}  {diff:>+18.4f}\n")
+            
+            f.write("\n")
+        
+        f.write("=" * 100 + "\n")
+
+
+def save_detailed_csv(mask_ratios, results, model_name, output_path):
+    """Save detailed results to CSV"""
+    import csv
+    
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        
+        # Header
+        writer.writerow(['Model', 'Masking_Ratio', 'Exact_Match', 'BERTScore_F1', 
+                        'BLEU4', 'Perplexity', 'Avg_Steps'])
+        
+        # Data
+        for ratio in mask_ratios:
+            writer.writerow([
+                model_name,
+                f"{ratio*100:.0f}%",
+                f"{results['exact_match'][ratio]:.4f}",
+                f"{results['bertscore'][ratio]:.4f}",
+                f"{results['bleu4'][ratio]:.4f}",
+                f"{results['perplexity'][ratio]:.2f}",
+                f"{results['steps'][ratio]:.2f}"
+            ])
+
+
+def load_test_texts_rdt(config, num_samples=1000):
     """Load test texts using WikiTextDataset for RDT"""
     from rdt.data import WikiTextDataset
     
     print(f"Loading test data from {config['data']['dataset_name']}...")
     
-    # Create dataset using existing WikiTextDataset (same logic as training)
+    # Create dataset
     dataset = WikiTextDataset(
         dataset_name=config['data']['dataset_name'],
         split='test',
@@ -308,36 +599,33 @@ def load_test_texts_rdt(config, num_samples=100):
         max_chain_length=config['training']['max_chain_length'],
         visible_loss_ratio=config['training'].get('visible_loss_ratio', 0.15),
         samples_per_text=1,
-        streaming=False  # Use non-streaming for test
+        streaming=False
     )
     
-    # Extract raw texts from tokenized data
+    # Extract raw texts
     texts = []
     tokenizer = dataset.tokenizer
     
     for tokens in dataset.tokenized_data[:num_samples]:
-        # Decode tokens back to text
         text = tokenizer.decode(tokens, skip_special_tokens=True)
-        if len(text) > 50:  # Only use substantial texts
+        if len(text) > 50:
             texts.append(text)
     
     return texts
 
 
-def load_test_texts_roberta(config, tokenizer, num_samples=100):
+def load_test_texts_roberta(config, tokenizer, num_samples=1000):
     """Load test texts from WikiText for RoBERTa/MLM models"""
     from datasets import load_dataset
     
-    # Get dataset name from config
     dataset_name = config['data'].get('dataset_name', 'wikitext-2')
     
-    # Map simplified names to full dataset names
+    # Map dataset names
     dataset_map = {
         'wikitext-2': 'wikitext-2-raw-v1',
         'wikitext-103': 'wikitext-103-raw-v1'
     }
     
-    # Handle both formats
     if dataset_name in dataset_map:
         full_dataset_name = dataset_map[dataset_name]
     else:
@@ -357,53 +645,31 @@ def load_test_texts_roberta(config, tokenizer, num_samples=100):
     return texts
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Test Masking Reconstruction for RDT and RoBERTa')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, required=True,
-                        help='Path to config file')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use')
-    parser.add_argument('--num_samples', type=int, default=100,
-                        help='Number of test samples')
-    parser.add_argument('--max_seq_len', type=int, default=None,
-                        help='Maximum sequence length (optional override)')
-    parser.add_argument('--max_steps', type=int, default=None,
-                        help='Maximum inference steps (optional override)')
-    parser.add_argument('--threshold', type=float, default=None,
-                        help='Confidence threshold (optional override)')
-    parser.add_argument('--mode', type=str, default='single', choices=['single', 'iterative'],
-                        help='RoBERTa inference mode: single-pass or iterative')
-    parser.add_argument('--output', type=str, default=None,
-                        help='Output visualization path')
-    
-    args = parser.parse_args()
-    
+def run_single_model_test(config_path, checkpoint_path, device, num_samples, 
+                         max_seq_len, max_steps, threshold, output_dir):
+    """Run test for a single model"""
     # Load config
-    config = load_config(args.config)
+    config = load_config(config_path)
     model_type = config.get('model_type', 'rdt').lower()
-    print(f"\nModel type: {model_type.upper()}")
     
-    # Set default output path
-    if args.output is None:
-        args.output = f'{model_type}_masking_results.png'
+    print(f"\n{'='*80}")
+    print(f"Testing Model: {model_type.upper()}")
+    print(f"Config: {config_path}")
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"{'='*80}")
     
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # Initialize metric calculator
+    metric_calc = MetricCalculator(device=device)
+    
+    # Define masking ratios
+    mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     
     if model_type == 'rdt':
-        # ===== RDT Model =====
-        # Load checkpoint
-        print(f"Loading RDT checkpoint from {args.checkpoint}")
-        checkpoint = torch.load(args.checkpoint, map_location='cpu')
-        
-        # Load tokenizer
+        # Load RDT model
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
         tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
         vocab_size = tokenizer.vocab_size
         
-        # Create model
-        print("Creating RDT model...")
         model = RDT(
             vocab_size=vocab_size,
             d_model=config['model']['d_model'],
@@ -420,124 +686,179 @@ def main():
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
         
-        # Load weights
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
         model.eval()
         
-        print(f"Model loaded (epoch {checkpoint['epoch']}, step {checkpoint['step']})")
-        
         # Load test data
-        test_texts = load_test_texts_rdt(config, num_samples=args.num_samples)
+        test_texts = load_test_texts_rdt(config, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")
         
-        # Define masking ratios
-        mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        
-        # Set threshold and max_steps
-        threshold = args.threshold if args.threshold is not None else config['model']['threshold']
-        max_steps = args.max_steps if args.max_steps is not None else config['training']['total_steps']
+        # Set parameters
+        threshold = threshold if threshold is not None else config['model']['threshold']
+        max_steps = max_steps if max_steps is not None else config['training']['total_steps']
+        max_seq_len = max_seq_len if max_seq_len is not None else config['data']['max_seq_length']
         
         # Test model
-        accuracies, steps = test_rdt_model(
+        results = test_rdt_model(
             model, tokenizer, test_texts, mask_ratios, 
-            device, config['data']['max_seq_length'], max_steps, threshold
+            device, max_seq_len, metric_calc, max_steps, threshold
         )
         
-        # Print results
-        print("\n" + "="*60)
-        print("RDT Test Results")
-        print("="*60)
-        print(f"{'Masking %':<12} {'Accuracy':<12} {'Avg Steps':<12}")
-        print("-"*60)
+        model_name = f"RDT"
         
-        for ratio in mask_ratios:
-            mask_pct = ratio * 100
-            acc = accuracies[ratio]
-            step = steps[ratio]
-            print(f"{mask_pct:>10.0f}%  {acc:>10.4f}  {step:>10.2f}")
-        
-        print("="*60)
-        
-        # Visualize
-        visualize_results(mask_ratios, accuracies, steps, 'rdt', args.mode, args.output)
-    
     elif model_type == 'mlm':
-        # ===== RoBERTa/BERT Model =====
-        model_name = config['model']['name']
+        # Load RoBERTa model
+        model_name_hf = config['model']['name']
+        checkpoint_path = Path(checkpoint_path)
         
-        # Check if checkpoint is a directory or file
-        checkpoint_path = Path(args.checkpoint)
-        is_checkpoint_dir = checkpoint_path.is_dir()
-        
-        if is_checkpoint_dir:
-            # Load from HuggingFace checkpoint directory
-            print(f"Loading MLM model from checkpoint directory: {args.checkpoint}")
-            tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
-            model = RobertaForMaskedLM.from_pretrained(args.checkpoint)
+        if checkpoint_path.is_dir():
+            tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+            model = RobertaForMaskedLM.from_pretrained(checkpoint_path)
         else:
-            # Load from custom checkpoint file
-            print(f"Loading tokenizer from {model_name}")
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name_hf)
+            model = RobertaForMaskedLM.from_pretrained(model_name_hf)
             
-            print(f"Loading model from checkpoint: {args.checkpoint}")
-            model = RobertaForMaskedLM.from_pretrained(model_name)
-            
-            # Load state dict if .pt file exists
             if checkpoint_path.suffix == '.pt':
-                checkpoint = torch.load(args.checkpoint, map_location='cpu')
+                checkpoint = torch.load(checkpoint_path, map_location='cpu')
                 if 'model_state_dict' in checkpoint:
                     model.load_state_dict(checkpoint['model_state_dict'])
                 elif 'state_dict' in checkpoint:
                     model.load_state_dict(checkpoint['state_dict'])
                 else:
                     model.load_state_dict(checkpoint)
-                print(f"Loaded weights from {args.checkpoint}")
         
         model = model.to(device)
         model.eval()
         
-        print(f"Model loaded: {model_name}")
-        
         # Load test data
-        test_texts = load_test_texts_roberta(config, tokenizer, num_samples=args.num_samples)
+        test_texts = load_test_texts_roberta(config, tokenizer, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")
         
-        # Define masking ratios
-        mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        
-        # Set default parameters from config
-        max_seq_len = args.max_seq_len if args.max_seq_len is not None else config['data'].get('max_seq_length', 128)
-        threshold = args.threshold if args.threshold is not None else 0.95
-        max_steps = args.max_steps if args.max_steps is not None else 20
+        # Set parameters
+        max_seq_len = max_seq_len if max_seq_len is not None else config['data'].get('max_seq_length', 128)
         
         # Test model
-        accuracies, steps = test_roberta_model(
+        results = test_roberta_model(
             model, tokenizer, test_texts, mask_ratios, 
-            device, max_seq_len, args.mode, max_steps, threshold
+            device, max_seq_len, metric_calc
         )
         
-        # Print results
-        mode_name = "Single-pass" if args.mode == 'single' else "Iterative"
-        print("\n" + "="*60)
-        print(f"{model_name} {mode_name} Test Results")
-        print("="*60)
-        print(f"{'Masking %':<12} {'Accuracy':<12} {'Avg Steps':<12}")
-        print("-"*60)
-        
-        for ratio in mask_ratios:
-            mask_pct = ratio * 100
-            acc = accuracies[ratio]
-            step = steps[ratio]
-            print(f"{mask_pct:>10.0f}%  {acc:>10.4f}  {step:>10.2f}")
-        
-        print("="*60)
-        
-        # Visualize
-        visualize_results(mask_ratios, accuracies, steps, 'roberta', args.mode, args.output)
+        model_name = "RoBERTa-base"
     
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Must be 'rdt' or 'mlm'")
+        raise ValueError(f"Unknown model type: {model_type}")
+    
+    # Print results
+    print("\n" + "="*80)
+    print(f"{model_name} Test Results")
+    print("="*80)
+    print(f"{'Mask %':<10} {'Exact Match':<15} {'BERTScore':<15} {'BLEU-4':<15} {'PPL':<15} {'Steps':<10}")
+    print("-"*80)
+    
+    for ratio in mask_ratios:
+        mask_pct = ratio * 100
+        exact = results['exact_match'][ratio]
+        bert = results['bertscore'][ratio]
+        bleu = results['bleu4'][ratio]
+        ppl = results['perplexity'][ratio]
+        steps = results['steps'][ratio]
+        
+        print(f"{mask_pct:>8.0f}%  {exact:>13.4f}  {bert:>13.4f}  {bleu:>13.4f}  "
+              f"{ppl:>13.2f}  {steps:>8.2f}")
+    
+    print("="*80)
+    
+    return results, model_name, mask_ratios
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Test Masking Reconstruction with Multiple Metrics')
+    
+    # Single model mode
+    parser.add_argument('--config', type=str, help='Path to config file')
+    parser.add_argument('--checkpoint', type=str, help='Path to model checkpoint')
+    
+    # Comparison mode
+    parser.add_argument('--config1', type=str, help='Path to first model config')
+    parser.add_argument('--checkpoint1', type=str, help='Path to first model checkpoint')
+    parser.add_argument('--config2', type=str, help='Path to second model config')
+    parser.add_argument('--checkpoint2', type=str, help='Path to second model checkpoint')
+    
+    # Common arguments
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use')
+    parser.add_argument('--num_samples', type=int, default=1000, help='Number of test samples')
+    parser.add_argument('--max_seq_len', type=int, default=None, help='Maximum sequence length')
+    parser.add_argument('--max_steps', type=int, default=None, help='Maximum inference steps (RDT)')
+    parser.add_argument('--threshold', type=float, default=None, help='Confidence threshold (RDT)')
+    parser.add_argument('--output', type=str, default='results/', help='Output directory')
+    
+    args = parser.parse_args()
+    
+    # Determine mode
+    is_comparison = args.config1 is not None and args.config2 is not None
+    
+    if not is_comparison and (args.config is None or args.checkpoint is None):
+        parser.error("Either provide --config and --checkpoint, or --config1, --checkpoint1, --config2, --checkpoint2")
+    
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    if is_comparison:
+        # Comparison mode
+        print("\n" + "="*80)
+        print("COMPARISON MODE: Testing two models")
+        print("="*80)
+        
+        # Test model 1
+        results1, name1, mask_ratios = run_single_model_test(
+            args.config1, args.checkpoint1, device, args.num_samples,
+            args.max_seq_len, args.max_steps, args.threshold, output_dir
+        )
+        
+        # Test model 2
+        results2, name2, _ = run_single_model_test(
+            args.config2, args.checkpoint2, device, args.num_samples,
+            args.max_seq_len, args.max_steps, args.threshold, output_dir
+        )
+        
+        # Generate comparison visualizations
+        visualize_comparison(mask_ratios, results1, results2, name1, name2, output_dir)
+        
+        # Save comparison text
+        save_comparison_text(mask_ratios, results1, results2, name1, name2, 
+                            output_dir / 'comparison_summary.txt')
+        
+        # Save individual CSVs
+        save_detailed_csv(mask_ratios, results1, name1, output_dir / f'{name1}_results.csv')
+        save_detailed_csv(mask_ratios, results2, name2, output_dir / f'{name2}_results.csv')
+        
+        print(f"\nComparison results saved to: {output_dir}")
+        
+    else:
+        # Single model mode
+        print("\n" + "="*80)
+        print("SINGLE MODEL MODE")
+        print("="*80)
+        
+        results, model_name, mask_ratios = run_single_model_test(
+            args.config, args.checkpoint, device, args.num_samples,
+            args.max_seq_len, args.max_steps, args.threshold, output_dir
+        )
+        
+        # Generate visualization
+        visualize_single(mask_ratios, results, model_name, output_dir)
+        
+        # Save text results
+        save_results_text(mask_ratios, results, model_name, output_dir / 'summary.txt')
+        
+        # Save CSV
+        save_detailed_csv(mask_ratios, results, model_name, output_dir / 'detailed_results.csv')
+        
+        print(f"\nResults saved to: {output_dir}")
 
 
 if __name__ == '__main__':
