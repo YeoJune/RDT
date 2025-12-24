@@ -72,6 +72,11 @@ class MetricCalculator:
                 
                 # Process each sample individually to get per-sample PPL
                 for text in batch_texts:
+                    # Skip empty or very short texts
+                    if not text or len(text.strip()) < 3:
+                        ppls.append(float('inf'))
+                        continue
+                    
                     # Tokenize
                     encodings = self.gpt2_tokenizer(
                         text,
@@ -81,6 +86,11 @@ class MetricCalculator:
                     ).to(self.device)
                     
                     input_ids = encodings['input_ids']
+                    
+                    # Skip if tokenization resulted in too few tokens
+                    if input_ids.size(1) < 2:
+                        ppls.append(float('inf'))
+                        continue
                     
                     # Calculate loss for this sample
                     outputs = self.gpt2_model(input_ids, labels=input_ids)
@@ -134,16 +144,31 @@ class MetricCalculator:
         return correct / total
 
 
-def create_masked_input(tokens, mask_ratio, mask_token_id):
-    """Create masked input with specified ratio"""
+def create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids=None):
+    """Create masked input with specified ratio, excluding special tokens"""
     seq_len = len(tokens)
-    num_mask = int(seq_len * mask_ratio)
+    
+    # Identify maskable positions (exclude special tokens)
+    if special_token_ids is not None:
+        maskable_positions = torch.tensor(
+            [i for i in range(seq_len) if tokens[i].item() not in special_token_ids],
+            dtype=torch.long
+        )
+    else:
+        maskable_positions = torch.arange(seq_len)
+    
+    num_maskable = len(maskable_positions)
+    if num_maskable == 0:
+        return tokens.clone(), torch.zeros(seq_len, dtype=torch.bool)
+    
+    num_mask = int(num_maskable * mask_ratio)
     
     if num_mask == 0:
         return tokens.clone(), torch.zeros(seq_len, dtype=torch.bool)
     
-    # Random masking positions
-    mask_indices = torch.randperm(seq_len)[:num_mask]
+    # Random masking positions from maskable positions only
+    mask_positions_indices = torch.randperm(num_maskable)[:num_mask]
+    mask_indices = maskable_positions[mask_positions_indices]
     
     masked_tokens = tokens.clone()
     masked_tokens[mask_indices] = mask_token_id
@@ -182,6 +207,9 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
     
     print(f"\nTesting RDT reconstruction capability (max_seq_len={max_seq_len}, batch_size={batch_size})...")
     
+    # Get special token IDs to exclude from masking
+    special_token_ids = set(tokenizer.all_special_ids)
+    
     # Tokenize all texts first
     all_tokens = []
     all_texts = []
@@ -217,7 +245,7 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             
             for tokens in batch_tokens:
                 # Create masked input
-                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id)
+                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
                 
                 # Pad to max_len
                 pad_len = max_len - len(masked_tokens)
@@ -349,6 +377,9 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
     
     print(f"\nTesting RoBERTa Single-pass reconstruction (max_seq_len={max_seq_len}, batch_size={batch_size})...")
     
+    # Get special token IDs to exclude from masking
+    special_token_ids = set(tokenizer.all_special_ids)
+    
     # Tokenize all texts first
     all_tokens = []
     all_texts = []
@@ -389,7 +420,7 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
             
             for tokens, attention_mask, valid_positions, valid_tokens in batch_data:
                 # Create masked input (only on valid positions)
-                masked_tokens, eval_mask = create_masked_input(valid_tokens, ratio, mask_token_id)
+                masked_tokens, eval_mask = create_masked_input(valid_tokens, ratio, mask_token_id, special_token_ids)
                 
                 # Put back into full sequence
                 full_masked = tokens.clone()
@@ -749,7 +780,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
     metric_calc = MetricCalculator(device=device)
     
     # Define masking ratios
-    mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     
     if model_type == 'rdt':
         # Load RDT model
