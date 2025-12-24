@@ -268,7 +268,7 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                     
                     # 2. Reconstructed text
                     reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
-                    original_text = batch_texts[i+j]
+                    original_text = batch_texts[j]
                     
                     results['bertscore'][ratio]['refs'].append(original_text)
                     results['bertscore'][ratio]['preds'].append(reconstructed_text)
