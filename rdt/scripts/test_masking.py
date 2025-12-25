@@ -228,86 +228,46 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             all_tokens.append(tokens)
             all_texts.append(tokenizer.decode(tokens, skip_special_tokens=True))
     
-    # Process in batches for each masking ratio
+    # Process each sample individually for each masking ratio
     for ratio in mask_ratios:
         print(f"\nProcessing masking ratio: {ratio*100:.0f}%")
         
-        for i in tqdm(range(0, len(all_tokens), batch_size), desc=f"Batches ({ratio*100:.0f}%)"):
-            batch_tokens = all_tokens[i:i+batch_size]
-            batch_texts = all_texts[i:i+batch_size]
+        for i in tqdm(range(len(all_tokens)), desc=f"Samples ({ratio*100:.0f}%)"):
+            tokens = all_tokens[i]
+            original_text = all_texts[i]
             
-            # Prepare batch
-            max_len = max(len(t) for t in batch_tokens)
-            batch_input_ids = []
-            batch_attention_mask = []
-            batch_eval_masks = []
-            batch_original_tokens = []
+            # Create masked input (no padding)
+            masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
             
-            for tokens in batch_tokens:
-                # Create masked input
-                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
-                
-                # Pad to max_len
-                pad_len = max_len - len(masked_tokens)
-                if pad_len > 0:
-                    masked_tokens = torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
-                    eval_mask = torch.cat([eval_mask, torch.zeros(pad_len, dtype=torch.bool)])
-                    padded_tokens = torch.cat([tokens, torch.full((pad_len,), pad_token_id)])
-                    attention_mask = torch.cat([torch.ones(len(tokens)), torch.zeros(pad_len)])
-                else:
-                    padded_tokens = tokens
-                    attention_mask = torch.ones(len(tokens))
-                
-                batch_input_ids.append(masked_tokens)
-                batch_attention_mask.append(attention_mask)
-                batch_eval_masks.append(eval_mask)
-                batch_original_tokens.append(padded_tokens)
-            
-            # Stack into batch tensors
-            batch_input_ids = torch.stack(batch_input_ids).to(device)
-            batch_attention_mask = torch.stack(batch_attention_mask).to(device)
-            
-            # Batch inference
+            # Inference (single sample, no padding)
             with torch.no_grad():
-                # Note: RDT.inference doesn't support batching natively, so we process one by one
-                # but keep them on GPU for efficiency
-                for j in range(len(batch_tokens)):
-                    input_ids = batch_input_ids[j:j+1]
-                    
-                    output_ids, num_steps = model.inference(
-                        input_ids,
-                        max_steps=max_steps,
-                        threshold=threshold
-                    )
-                    
-                    pred_tokens = output_ids.squeeze(0).cpu()
-                    original_tokens = batch_original_tokens[j]
-                    eval_mask = batch_eval_masks[j]
-                    
-                    # Remove padding for evaluation
-                    valid_len = len(batch_tokens[j])
-                    pred_tokens = pred_tokens[:valid_len]
-                    original_tokens = original_tokens[:valid_len]
-                    eval_mask = eval_mask[:valid_len]
-                    
-                    # 1. Exact Match Accuracy
-                    accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
-                    results['exact_match'][ratio].append(accuracy)
-                    
-                    # 2. Reconstructed text - combine original unmasked + predicted masked tokens
-                    reconstructed_tokens = original_tokens.clone()
-                    reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
-                    reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
-                    original_text = batch_texts[j]
-                    
-                    results['bertscore'][ratio]['refs'].append(original_text)
-                    results['bertscore'][ratio]['preds'].append(reconstructed_text)
-                    results['perplexity'][ratio].append(reconstructed_text)
-                    results['bleu4'][ratio]['refs'].append(original_text)
-                    results['bleu4'][ratio]['preds'].append(reconstructed_text)
-                    
-                    # 3. Steps taken
-                    results['steps'][ratio].append(num_steps)
+                input_ids = masked_tokens.unsqueeze(0).to(device)
+                
+                output_ids, num_steps = model.inference(
+                    input_ids,
+                    max_steps=max_steps,
+                    threshold=threshold
+                )
+                
+                pred_tokens = output_ids.squeeze(0).cpu()
+            
+            # 1. Exact Match Accuracy
+            accuracy = metric_calc.calculate_exact_match(pred_tokens, tokens, eval_mask)
+            results['exact_match'][ratio].append(accuracy)
+            
+            # 2. Reconstructed text - combine original unmasked + predicted masked tokens
+            reconstructed_tokens = tokens.clone()
+            reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
+            reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
+            
+            results['bertscore'][ratio]['refs'].append(original_text)
+            results['bertscore'][ratio]['preds'].append(reconstructed_text)
+            results['perplexity'][ratio].append(reconstructed_text)
+            results['bleu4'][ratio]['refs'].append(original_text)
+            results['bleu4'][ratio]['preds'].append(reconstructed_text)
+            
+            # 3. Steps taken
+            results['steps'][ratio].append(num_steps)
     
     # Aggregate results
     aggregated = {
