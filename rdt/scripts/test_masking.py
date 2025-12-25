@@ -342,10 +342,9 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
     # Get special token IDs to exclude from masking
     special_token_ids = set(tokenizer.all_special_ids)
     
-    # Tokenize all texts first
+    # Tokenize all texts first (no padding yet)
     all_tokens = []
     all_texts = []
-    all_attention_masks = []
     
     for text in tqdm(test_texts, desc="Tokenizing"):
         encoded = tokenizer(
@@ -353,70 +352,77 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
             return_tensors='pt', 
             truncation=True, 
             max_length=max_seq_len,
-            padding='max_length'
+            padding=False
         )
         tokens = encoded['input_ids'].squeeze(0)
-        attention_mask = encoded['attention_mask'].squeeze(0)
         
-        # Filter out padding
-        valid_positions = attention_mask.bool()
-        valid_tokens = tokens[valid_positions]
-        
-        if len(valid_tokens) >= 10:
-            all_tokens.append((tokens, attention_mask, valid_positions, valid_tokens))
-            all_texts.append(tokenizer.decode(valid_tokens, skip_special_tokens=True))
+        if len(tokens) >= 10:
+            all_tokens.append(tokens)
+            all_texts.append(tokenizer.decode(tokens, skip_special_tokens=True))
     
     # Process in batches for each masking ratio
     for ratio in mask_ratios:
         print(f"\nProcessing masking ratio: {ratio*100:.0f}%")
         
         for i in tqdm(range(0, len(all_tokens), batch_size), desc=f"Batches ({ratio*100:.0f}%)"):
-            batch_data = all_tokens[i:i+batch_size]
+            batch_tokens = all_tokens[i:i+batch_size]
             batch_texts = all_texts[i:i+batch_size]
             
-            # Prepare batch
+            # Prepare batch with dynamic padding
             batch_input_ids = []
-            batch_attention_masks = []
             batch_eval_masks = []
-            batch_valid_tokens = []
+            batch_original_tokens = []
             
-            for tokens, attention_mask, valid_positions, valid_tokens in batch_data:
-                # Create masked input (only on valid positions)
-                masked_tokens, eval_mask = create_masked_input(valid_tokens, ratio, mask_token_id, special_token_ids)
+            for tokens in batch_tokens:
+                # Create masked input
+                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
                 
-                # Put back into full sequence
-                full_masked = tokens.clone()
-                full_masked[valid_positions] = masked_tokens
-                
-                batch_input_ids.append(full_masked)
-                batch_attention_masks.append(attention_mask)
-                batch_eval_masks.append((eval_mask, valid_positions))
-                batch_valid_tokens.append(valid_tokens)
+                batch_input_ids.append(masked_tokens)
+                batch_eval_masks.append(eval_mask)
+                batch_original_tokens.append(tokens)
+            
+            # Pad to max length in this batch
+            max_len = max(len(t) for t in batch_input_ids)
+            padded_input_ids = []
+            padded_attention_masks = []
+            
+            for masked_tokens in batch_input_ids:
+                pad_len = max_len - len(masked_tokens)
+                if pad_len > 0:
+                    padded_input_ids.append(
+                        torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
+                    )
+                    padded_attention_masks.append(
+                        torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])
+                    )
+                else:
+                    padded_input_ids.append(masked_tokens)
+                    padded_attention_masks.append(torch.ones(len(masked_tokens)))
             
             # Stack into batch tensors
-            batch_input_ids = torch.stack(batch_input_ids).to(device)
-            batch_attention_masks = torch.stack(batch_attention_masks).to(device)
+            batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
+            batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
             
             # Batch inference
             with torch.no_grad():
-                outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_masks)
+                outputs = model(input_ids=batch_input_ids_tensor, attention_mask=batch_attention_masks_tensor)
                 logits = outputs.logits
                 pred_tokens_batch = torch.argmax(logits, dim=-1).cpu()
             
             # Process each sample in batch
-            for j in range(len(batch_data)):
-                eval_mask, valid_positions = batch_eval_masks[j]
-                valid_tokens = batch_valid_tokens[j]
+            for j in range(len(batch_tokens)):
+                original_tokens = batch_original_tokens[j]
+                eval_mask = batch_eval_masks[j]
                 
-                # Extract predictions on valid positions
-                pred_tokens = pred_tokens_batch[j][valid_positions]
+                # Extract predictions (remove padding)
+                pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
                 
                 # 1. Exact Match Accuracy
-                accuracy = metric_calc.calculate_exact_match(pred_tokens, valid_tokens, eval_mask)
+                accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
                 results['exact_match'][ratio].append(accuracy)
                 
                 # 2. Reconstructed text - combine original unmasked + predicted masked tokens
-                reconstructed_tokens = valid_tokens.clone()
+                reconstructed_tokens = original_tokens.clone()
                 reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                 original_text = batch_texts[j]
