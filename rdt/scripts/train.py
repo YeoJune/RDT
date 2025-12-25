@@ -20,9 +20,16 @@ def main():
     parser.add_argument('--device', type=str, default=None,
                         help='Device to use (cuda/cpu)')
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to checkpoint to resume from')
+                        help='Path to checkpoint to resume from (loads model, optimizer, scheduler, and training state)')
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='Path to pretrained weights to load (loads only model weights, starts training from scratch)')
     
     args = parser.parse_args()
+    
+    # Check for conflicting arguments
+    if args.checkpoint and args.pretrained:
+        raise ValueError("Cannot use both --checkpoint and --pretrained flags simultaneously. "
+                         "Use --checkpoint to resume training with all states, or --pretrained to load only weights.")
     
     # Load config
     print(f"Loading config from {args.config}")
@@ -105,7 +112,7 @@ def main():
     else:
         raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt' or 'mlm'")
     
-    # Resume from checkpoint if specified
+    # Resume from checkpoint or load pretrained weights
     if args.checkpoint:
         print(f"\nResuming from checkpoint: {args.checkpoint}")
         from rdt.utils import load_checkpoint
@@ -117,6 +124,16 @@ def main():
         )
         trainer.current_epoch = checkpoint.get('epoch', 0) + 1
         trainer.global_step = checkpoint.get('step', 0)
+        print(f"Resuming from epoch {trainer.current_epoch}, step {trainer.global_step}")
+    
+    elif args.pretrained:
+        print(f"\nLoading pretrained weights: {args.pretrained}")
+        from rdt.utils import load_pretrained_weights
+        load_pretrained_weights(
+            args.pretrained,
+            trainer.model
+        )
+        print("Starting training from epoch 0, step 0 with pretrained weights")
     
     # Train
     trainer.train()

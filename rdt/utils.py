@@ -159,6 +159,19 @@ def load_checkpoint(
     return checkpoint
 
 
+def load_pretrained_weights(
+    checkpoint_path: str,
+    model: torch.nn.Module
+) -> None:
+    """Load only model weights from checkpoint without optimizer/scheduler state"""
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    print(f"Pretrained weights loaded from: {checkpoint_path}")
+    print("Training will start from step 0 (optimizer and scheduler states not loaded)")
+
+
 def cleanup_checkpoints(checkpoint_dir: str, keep_last_n: int = 3):
     """Keep only the last N checkpoints"""
     checkpoint_dir = Path(checkpoint_dir)
