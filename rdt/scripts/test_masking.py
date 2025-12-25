@@ -294,8 +294,10 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                     accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
                     results['exact_match'][ratio].append(accuracy)
                     
-                    # 2. Reconstructed text
-                    reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+                    # 2. Reconstructed text - combine original unmasked + predicted masked tokens
+                    reconstructed_tokens = original_tokens.clone()
+                    reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
+                    reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                     original_text = batch_texts[j]
                     
                     results['bertscore'][ratio]['refs'].append(original_text)
@@ -453,8 +455,10 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
                 accuracy = metric_calc.calculate_exact_match(pred_tokens, valid_tokens, eval_mask)
                 results['exact_match'][ratio].append(accuracy)
                 
-                # 2. Reconstructed text
-                reconstructed_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+                # 2. Reconstructed text - combine original unmasked + predicted masked tokens
+                reconstructed_tokens = valid_tokens.clone()
+                reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
+                reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                 original_text = batch_texts[j]
                 
                 results['bertscore'][ratio]['refs'].append(original_text)
