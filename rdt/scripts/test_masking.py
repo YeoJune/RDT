@@ -51,7 +51,7 @@ class MetricCalculator:
             predictions, 
             references, 
             lang='en', 
-            model_type='bert-base-uncased',
+            model_type='roberta-large',
             device=self.device,
             batch_size=32,
             verbose=False
@@ -60,21 +60,20 @@ class MetricCalculator:
         return F1.mean().item()
     
     def calculate_perplexity_batch(self, texts: List[str], batch_size: int = 8) -> float:
-        """Calculate average perplexity using GPT-2 Large (per-sample, batched for speed)"""
+        """Calculate corpus-level perplexity using GPT-2 (mathematically correct: average loss then exp)"""
         if len(texts) == 0:
             return float('inf')
         
-        ppls = []
+        losses = []
         
         with torch.no_grad():
             for i in range(0, len(texts), batch_size):
                 batch_texts = texts[i:i+batch_size]
                 
-                # Process each sample individually to get per-sample PPL
+                # Process each sample individually to get per-sample loss
                 for text in batch_texts:
                     # Skip empty or very short texts
                     if not text or len(text.strip()) < 3:
-                        ppls.append(float('inf'))
                         continue
                     
                     # Tokenize
@@ -89,18 +88,21 @@ class MetricCalculator:
                     
                     # Skip if tokenization resulted in too few tokens
                     if input_ids.size(1) < 2:
-                        ppls.append(float('inf'))
                         continue
                     
                     # Calculate loss for this sample
                     outputs = self.gpt2_model(input_ids, labels=input_ids)
                     
-                    # Perplexity = exp(loss)
+                    # Store loss (not PPL)
                     sample_loss = outputs.loss.item()
-                    ppl = np.exp(sample_loss)
-                    ppls.append(ppl)
+                    losses.append(sample_loss)
         
-        return np.mean(ppls) if ppls else float('inf')
+        # Corpus-level PPL: exp(average loss)
+        if losses:
+            avg_loss = np.mean(losses)
+            return np.exp(avg_loss)
+        else:
+            return float('inf')
     
     def calculate_bleu4(self, references: List[str], predictions: List[str]) -> float:
         """Calculate average BLEU-4 score"""
