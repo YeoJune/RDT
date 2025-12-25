@@ -114,7 +114,8 @@ class RDTTrainer:
                 max_lr=self.config['training']['learning_rate'],
                 total_steps=total_steps,
                 pct_start=self.config['training']['warmup_ratio'],
-                anneal_strategy='cos'
+                anneal_strategy='cos',
+                eta_min=self.config['training']['learning_rate'] * 1e-2
             )
         elif self.config['training']['scheduler'] == 'linear':
             scheduler = optim.lr_scheduler.LinearLR(
