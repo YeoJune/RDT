@@ -6,7 +6,7 @@ import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import AutoTokenizer, RobertaForMaskedLM, GPT2LMHeadModel, GPT2TokenizerFast
+from transformers import AutoTokenizer, AutoModelForMaskedLM, GPT2LMHeadModel, GPT2TokenizerFast
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -798,16 +798,16 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         model_name = f"RDT"
         
     elif model_type == 'mlm':
-        # Load RoBERTa model
+        # Load MLM model (BERT/RoBERTa)
         model_name_hf = config['model']['name']
         checkpoint_path = Path(checkpoint_path)
         
         if checkpoint_path.is_dir():
             tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-            model = RobertaForMaskedLM.from_pretrained(checkpoint_path)
+            model = AutoModelForMaskedLM.from_pretrained(checkpoint_path)
         else:
             tokenizer = AutoTokenizer.from_pretrained(model_name_hf)
-            model = RobertaForMaskedLM.from_pretrained(model_name_hf)
+            model = AutoModelForMaskedLM.from_pretrained(model_name_hf)
             
             if checkpoint_path.suffix == '.pt':
                 checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -834,7 +834,13 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             device, max_seq_len, metric_calc, batch_size
         )
         
-        model_name = "RoBERTa-base"
+        # Extract model name from config
+        if 'bert' in model_name_hf.lower():
+            model_name = "BERT-base"
+        elif 'roberta' in model_name_hf.lower():
+            model_name = "RoBERTa-base"
+        else:
+            model_name = model_name_hf
     
     else:
         raise ValueError(f"Unknown model type: {model_type}")
