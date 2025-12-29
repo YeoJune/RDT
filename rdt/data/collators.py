@@ -166,14 +166,27 @@ class CMLMCollator:
         }
 
 
+class MDLMCollator(CMLMCollator):
+    """
+    Collator for MDLM (Masked Diffusion Language Model).
+    
+    Identical to CMLM: returns original tokens without pre-masking.
+    Masking is done on-the-fly in train_step using continuous_time_masking().
+    
+    This enables continuous-time diffusion training where masking ratio
+    varies across time steps t ~ Uniform[0, 1].
+    """
+    pass  # Inherits all functionality from CMLMCollator
+
+
 def get_collator(model_type: str, tokenizer=None, pad_token_id=0, mlm_probability=0.15):
     """
     Factory function to get appropriate collator based on model type.
     
     Args:
-        model_type: 'rdt', 'mlm', or 'cmlm'
+        model_type: 'rdt', 'mlm', 'cmlm', or 'mdlm'
         tokenizer: Required for MLM collator
-        pad_token_id: Padding token ID for RDT/CMLM collator
+        pad_token_id: Padding token ID for RDT/CMLM/MDLM collator
         mlm_probability: Masking probability for MLM collator
         
     Returns:
@@ -189,5 +202,7 @@ def get_collator(model_type: str, tokenizer=None, pad_token_id=0, mlm_probabilit
         return MLMCollator(tokenizer=tokenizer, mlm_probability=mlm_probability)
     elif model_type == 'cmlm':
         return CMLMCollator(pad_token_id=pad_token_id)
+    elif model_type == 'mdlm':
+        return MDLMCollator(pad_token_id=pad_token_id)
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', or 'cmlm'")
+        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', 'cmlm', or 'mdlm'")

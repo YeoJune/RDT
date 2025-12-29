@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 
 from rdt.models import RDT, MLM
 from rdt.models.cmlm import CMLM
-from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders
+from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders, create_mdlm_dataloaders
 from rdt.training import RDTTrainer, MLMTrainer
 from rdt.utils import load_config, merge_configs, set_seed, get_device, create_model_from_config
 
@@ -85,7 +85,7 @@ def main():
             device=device
         )
         
-    elif model_type in ['mlm', 'cmlm']:
+    elif model_type in ['mlm', 'cmlm', 'mdlm']:
         # Baseline models (MLM or CMLM)
         print("\n" + "="*60)
         print(f"Training {model_type.upper()} Model")
@@ -98,6 +98,9 @@ def main():
             model = MLM.from_config(config)
         elif model_type == 'cmlm':
             model = CMLM.from_config(config)
+        elif model_type == 'mdlm':
+            from rdt.models.mdlm import MDLM
+            model = MDLM.from_config(config)
         
         print(f"\nModel parameters: {model.count_parameters()/1e6:.1f}M")
         
@@ -105,6 +108,8 @@ def main():
         print(f"\nPreparing {model_type.upper()} data...")
         if model_type == 'mlm':
             train_loader, val_loader = create_mlm_dataloaders(config)
+        elif model_type == 'mdlm':
+            train_loader, val_loader = create_mdlm_dataloaders(config)
         elif model_type == 'cmlm':
             train_loader, val_loader = create_cmlm_dataloaders(config)
         
@@ -118,7 +123,7 @@ def main():
         )
         
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', or 'cmlm'")
+        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', 'cmlm', or 'mdlm'")
     
     # Resume from checkpoint or load pretrained weights
     if args.checkpoint:

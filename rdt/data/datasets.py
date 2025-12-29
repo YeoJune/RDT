@@ -900,3 +900,128 @@ def create_cmlm_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     )
     
     return train_loader, val_loader
+
+def create_mdlm_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create dataloaders for MDLM training.
+    
+    Similar to CMLM: returns original tokens without pre-masking.
+    Masking is done on-the-fly using continuous_time_masking().
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        train_loader, val_loader: DataLoaders for training and validation
+    """
+    from .collators import MDLMCollator
+    
+    data_config = config["data"]
+    training_config = config["training"]
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(data_config["tokenizer_name"])
+    
+    # Load datasets
+    dataset_name = data_config["dataset_name"]
+    if "wikitext-2" in dataset_name.lower():
+        dataset_config = "wikitext-2-raw-v1"
+    elif "wikitext-103" in dataset_name.lower():
+        dataset_config = "wikitext-103-raw-v1"
+    else:
+        dataset_config = dataset_name
+    
+    print(f"Loading {dataset_name}...")
+    train_dataset = load_dataset("wikitext", dataset_config, split="train")
+    val_dataset = load_dataset("wikitext", dataset_config, split="validation")
+    
+    # Text chunking (same as CMLM, no masking)
+    max_seq_length = data_config["max_seq_length"]
+    overlap = data_config.get("chunk_overlap", 0)
+    min_length = data_config.get("min_text_length", 50)
+    
+    def chunk_and_tokenize(examples):
+        """Tokenize and chunk texts into multiple samples"""
+        all_input_ids = []
+        all_attention_masks = []
+        
+        for text in examples["text"]:
+            if len(text.strip()) < min_length:
+                continue
+            
+            # Tokenize full text
+            encoded = tokenizer(
+                text,
+                truncation=False,
+                add_special_tokens=True,
+                return_attention_mask=True
+            )
+            
+            input_ids = encoded["input_ids"]
+            
+            # Chunk into multiple samples
+            stride = max_seq_length - overlap
+            for i in range(0, len(input_ids), stride):
+                chunk = input_ids[i:i + max_seq_length]
+                
+                # Pad if needed
+                if len(chunk) < max_seq_length:
+                    padding_length = max_seq_length - len(chunk)
+                    chunk = chunk + [tokenizer.pad_token_id] * padding_length
+                    attention_mask = [1] * (max_seq_length - padding_length) + [0] * padding_length
+                else:
+                    attention_mask = [1] * max_seq_length
+                
+                all_input_ids.append(chunk)
+                all_attention_masks.append(attention_mask)
+        
+        return {
+            "input_ids": all_input_ids,
+            "attention_mask": all_attention_masks
+        }
+    
+    # Tokenize and chunk
+    print("Tokenizing and chunking train data...")
+    train_dataset = train_dataset.map(
+        chunk_and_tokenize,
+        batched=True,
+        remove_columns=train_dataset.column_names,
+        desc="Tokenizing train"
+    )
+    train_dataset = train_dataset.filter(lambda x: len(x["input_ids"]) > 0)
+    
+    print("Tokenizing and chunking validation data...")
+    val_dataset = val_dataset.map(
+        chunk_and_tokenize,
+        batched=True,
+        remove_columns=val_dataset.column_names,
+        desc="Tokenizing validation"
+    )
+    val_dataset = val_dataset.filter(lambda x: len(x["input_ids"]) > 0)
+    
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    
+    # Create collator (no masking, just padding - same as CMLM)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    collator = MDLMCollator(pad_token_id=pad_token_id)
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=training_config["batch_size"],
+        shuffle=True,
+        num_workers=data_config.get("num_workers", 4),
+        pin_memory=data_config.get("pin_memory", True),
+        collate_fn=collator
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=training_config["batch_size"],
+        shuffle=False,
+        num_workers=data_config.get("num_workers", 4),
+        pin_memory=data_config.get("pin_memory", True),
+        collate_fn=collator
+    )
+    
+    return train_loader, val_loader

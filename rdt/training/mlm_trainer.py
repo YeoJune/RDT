@@ -103,6 +103,8 @@ class MLMTrainer:
     def _detect_model_type(self, model):
         """Detect model type from class name"""
         class_name = model.__class__.__name__.lower()
+        if 'mdlm' in class_name:
+            return 'mdlm'
         if 'cmlm' in class_name:
             return 'cmlm'
         return 'mlm'
@@ -134,6 +136,8 @@ class MLMTrainer:
     
     def train_step(self, batch):
         """Unified training step with model-specific masking"""
+        if self.model_type == 'mdlm':
+            return self._train_step_mdlm(batch)
         if self.model_type == 'cmlm':
             return self._train_step_cmlm(batch)
         else:
@@ -260,6 +264,80 @@ class MLMTrainer:
             'lr': self.scheduler.get_last_lr()[0]
         }
     
+    def _train_step_mdlm(self, batch):
+        """MDLM training with continuous-time masking and weighted loss"""
+        self.model.train()
+        
+        # Move batch to device
+        input_ids = batch['input_ids'].to(self.device)  # Original tokens
+        attention_mask = batch.get('attention_mask')
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+        
+        # Apply continuous-time masking on-the-fly
+        masked_input_ids, labels, t, loss_weight = self.model.continuous_time_masking(
+            input_ids, 
+            attention_mask,
+            low_discrepancy_sampling=True
+        )
+        
+        # Forward pass with time-weighted loss
+        if self.use_amp:
+            with autocast('cuda'):
+                loss, logits = self.model.forward_with_time_weighting(
+                    masked_input_ids, attention_mask, labels, loss_weight
+                )
+        else:
+            loss, logits = self.model.forward_with_time_weighting(
+                masked_input_ids, attention_mask, labels, loss_weight
+            )
+        
+        # Store original loss for logging
+        original_loss = loss.item()
+        
+        # Backward pass with gradient accumulation
+        loss = loss / self.gradient_accumulation_steps  # Scale loss
+        
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        # Only update weights every gradient_accumulation_steps
+        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
+            if self.use_amp:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+            
+            self.optimizer.zero_grad()
+            self.scheduler.step()
+        
+        # Calculate accuracy (on masked tokens only)
+        mask = labels != -100
+        if mask.sum() > 0:
+            pred_tokens = logits.argmax(dim=-1)
+            correct = (pred_tokens == labels) & mask
+            accuracy = correct.sum().float() / mask.sum().float()
+        else:
+            accuracy = torch.tensor(0.0)
+        
+        # Calculate average time and mask ratio for logging
+        avg_t = t.mean().item()
+        mask_ratio = (labels != -100).float().sum() / mask.numel()
+        
+        return {
+            'loss': original_loss,
+            'accuracy': accuracy.item(),
+            'avg_time': avg_t,
+            'mask_ratio': mask_ratio.item(),
+            'avg_loss_weight': loss_weight.mean().item(),
+            'lr': self.scheduler.get_last_lr()[0]
+        }
     def evaluate(self):
         """Evaluate on validation set"""
         self.model.eval()
@@ -275,6 +353,11 @@ class MLMTrainer:
                     attention_mask = attention_mask.to(self.device)
                 
                 # Handle masking based on model type
+                elif self.model_type == 'mdlm':
+                    # Apply continuous-time masking for MDLM
+                    masked_input_ids, labels, _, _ = self.model.continuous_time_masking(
+                        input_ids, attention_mask
+                    )
                 if self.model_type == 'cmlm':
                     # Apply uniform masking for CMLM
                     masked_input_ids, labels, _ = self.model.uniform_masking(

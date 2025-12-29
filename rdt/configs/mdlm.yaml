@@ -1,0 +1,80 @@
+# MDLM (Masked Diffusion Language Model) Configuration
+# Paper: "Simple and Effective Masked Diffusion Language Models" (Sahoo et al., NeurIPS 2024)
+
+# Model Type
+model_type: "mdlm"
+
+# Model Architecture
+model:
+  architecture: "bert-base-uncased" # Model architecture for config and tokenizer
+  pretrained: null # Pretrained weights to load (null/empty for from-scratch)
+
+  # Optional: Override architecture parameters (for fair comparison with custom models)
+  config_overrides:
+    num_hidden_layers: 6 # Match RDT's layer count
+    hidden_size: 512 # Match RDT's hidden dimension
+    num_attention_heads: 8 # Must divide hidden_size evenly
+    intermediate_size: 2048 # FFN dimension (typically 4x hidden_size)
+
+  # MDLM-specific parameters
+  noise_schedule: "cosine" # Noise schedule: 'cosine' (α(t)=cos²(πt/2)) or 'linear' (α(t)=1-t)
+  time_conditioning: false # Whether to condition model on timestep (MDLM paper uses false)
+
+# Training Strategy
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
+  training_mode: "epoch"
+  num_epochs: 3
+  max_training_steps: 100000
+
+  learning_rate: 0.0001 # 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+
+  scheduler: "cosine"
+  max_grad_norm: 1.0
+
+  save_every_n_epochs: 1
+  save_every_n_steps: 1000
+  keep_last_n_checkpoints: 3
+
+# MDLM-specific Training
+mdlm:
+  # Continuous-time masking: sample t ~ Uniform[0,1], mask with probability p_mask(t) = 1 - α(t)
+  # Rao-Blackwellized objective: time-weighted cross-entropy loss with weight α'(t)/(1-α(t))
+  low_discrepancy_sampling: true # Use low-discrepancy sampler for variance reduction
+
+  # Inference settings
+  num_steps: 1000 # Number of denoising steps for generation
+  sampler: "ddpm_cache" # Sampling strategy: 'ddpm_cache' (fast), 'ddpm' (standard), 'analytic' (placeholder)
+  temperature: 1.0 # Sampling temperature
+
+  # Key difference from CMLM: MDLM uses RANDOM unmasking (not confidence-based)
+  # This makes MDLM a simple baseline compared to smart methods like CMLM and RDT
+
+# Data
+data:
+  dataset_name: "wikitext-2"
+  streaming: false
+  max_seq_length: 512
+
+  # MDLM uses continuous-time masking during training
+  # No fixed masking ratio - dynamically sampled per batch based on noise schedule
+
+  tokenizer_name: "bert-base-uncased"
+  num_workers: 4
+  pin_memory: true
+
+# Logging & Checkpoints
+output:
+  checkpoint_dir: "checkpoints/mdlm"
+  log_dir: "runs/mdlm"
+  log_every_n_steps: 100
+  eval_every_n_epochs: 1
+  eval_every_n_steps: 1000
+
+# Hardware
+device: "cuda"
+mixed_precision: true
+seed: 42

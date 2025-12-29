@@ -5,7 +5,8 @@ from .datasets import (
     WikiTextDataset,
     create_dataloaders,
     create_mlm_dataloaders,
-    create_cmlm_dataloaders
+    create_cmlm_dataloaders,
+    create_mdlm_dataloaders
 )
 from .collators import RDTCollator, MLMCollator
 
@@ -15,6 +16,7 @@ __all__ = [
     'create_dataloaders',
     'create_mlm_dataloaders',
     'create_cmlm_dataloaders',
+    'create_mdlm_dataloaders',
     'RDTCollator',
     'MLMCollator'
 ]
