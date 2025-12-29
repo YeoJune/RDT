@@ -438,26 +438,18 @@ class MLMTrainer:
     
     def _evaluate_mdlm(self):
         """
-        MDLM evaluation with Monte Carlo integration over timesteps.
-        
-        Implements continuous-time NLL evaluation as in MDLM paper:
-        L = E_t ∫ [α'(t) / (1 - α(t))] * CrossEntropy dt
-        
-        Monte Carlo approximation:
-        L ≈ (1/K) Σ_k [α'(t_k) / (1 - α(t_k))] * CrossEntropy(x | z_{t_k})
-        where t_k ~ Uniform[0, 1]
+        MDLM evaluation using standard Monte Carlo integration.
+        - Loss: Weighted NLL (ELBO) matching the training objective.
+        - Accuracy: Unweighted average accuracy over timesteps.
         """
         self.model.eval()
-        total_weighted_loss = 0
-        total_accuracy = 0
+        total_elbo = 0
+        total_accuracy = 0  # Accuracy 누적 변수
         total_tokens = 0
         num_batches = 0
         
-        # Monte Carlo samples for continuous-time integration
-        # Paper uses T→∞ (continuous), we approximate with MC sampling
+        # Monte Carlo samples
         num_mc_samples = self.config.get('eval', {}).get('mc_samples', 10)
-        
-        print(f"  Using {num_mc_samples} Monte Carlo samples for MDLM evaluation")
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Evaluating MDLM", leave=False):
@@ -466,21 +458,24 @@ class MLMTrainer:
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(self.device)
                 
-                # Monte Carlo integration over timesteps
-                batch_weighted_loss = 0
-                batch_accuracy = 0
+                # Valid token count
+                if attention_mask is not None:
+                    num_valid_tokens = attention_mask.sum().item()
+                else:
+                    num_valid_tokens = (input_ids != self.model.pad_token_id).sum().item()
+
+                # MC Integration
+                batch_elbo_sum = 0
+                batch_acc_sum = 0 # 배치 내 MC 샘플들의 정확도 합
                 
                 for _ in range(num_mc_samples):
-                    # Sample timestep and apply continuous-time masking
                     masked_ids, labels, t, loss_weight = self.model.continuous_time_masking(
-                        input_ids, 
-                        attention_mask,
-                        low_discrepancy_sampling=True  # Variance reduction
+                        input_ids, attention_mask, low_discrepancy_sampling=True
                     )
                     
-                    # Forward pass with time weighting
                     if self.use_amp:
-                        with autocast():
+                        with autocast('cuda'):
+                            # Loss (Weighted)
                             loss, logits = self.model.forward_with_time_weighting(
                                 masked_ids, attention_mask, labels, loss_weight
                             )
@@ -489,38 +484,39 @@ class MLMTrainer:
                             masked_ids, attention_mask, labels, loss_weight
                         )
                     
-                    batch_weighted_loss += loss.item()
+                    # 1. Loss Accumulation (Weighted Sum)
+                    batch_elbo_sum += loss.item() * num_valid_tokens
                     
-                    # Calculate accuracy (on masked tokens)
+                    # 2. Accuracy Calculation (Unweighted)
                     mask = labels != -100
                     if mask.sum() > 0:
                         pred_tokens = logits.argmax(dim=-1)
                         correct = (pred_tokens == labels) & mask
-                        accuracy = correct.sum().float() / mask.sum().float()
-                        batch_accuracy += accuracy.item()
-                
+                        # 해당 타임스텝 t에서의 정확도
+                        acc = correct.sum().float() / mask.sum().float()
+                        batch_acc_sum += acc.item()
+                    # (만약 mask.sum() == 0이면 acc는 0으로 간주하거나 skip)
+
                 # Average over MC samples
-                batch_weighted_loss /= num_mc_samples
-                batch_accuracy /= num_mc_samples
+                batch_avg_elbo = batch_elbo_sum / num_mc_samples
+                batch_avg_acc = batch_acc_sum / num_mc_samples # 배치의 평균 정확도
                 
-                # Count valid tokens for proper averaging
-                if attention_mask is not None:
-                    num_tokens = attention_mask.sum().item()
-                else:
-                    num_tokens = (input_ids != self.model.pad_token_id).sum().item()
-                
-                total_weighted_loss += batch_weighted_loss * num_tokens
-                total_accuracy += batch_accuracy
-                total_tokens += num_tokens
+                total_elbo += batch_avg_elbo
+                total_accuracy += batch_avg_acc
+                total_tokens += num_valid_tokens
                 num_batches += 1
         
-        # Compute averages
-        avg_loss = total_weighted_loss / total_tokens
-        avg_accuracy = total_accuracy / num_batches
+        # Final Metrics
+        if total_tokens > 0:
+            avg_elbo = total_elbo / total_tokens
+        else:
+            avg_elbo = 0.0
+            
+        avg_accuracy = total_accuracy / max(1, num_batches)
         
         return {
-            'val_loss': avg_loss,
-            'val_accuracy': avg_accuracy,
+            'val_loss': avg_elbo,     # Weighted NLL (Train Loss와 비교용)
+            'val_accuracy': avg_accuracy, # Average Reconstruction Acc
             'mc_samples': num_mc_samples
         }
 

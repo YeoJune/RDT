@@ -345,27 +345,45 @@ class MDLM(MLM):
         loss_weight: Optional[torch.Tensor] = None
     ):
         """
-        Forward pass with time-weighted loss for MDLM training.
-        
-        Args:
-            input_ids: [B, L] masked token indices
-            attention_mask: [B, L] attention mask
-            labels: [B, L] target tokens (-100 for non-masked)
-            loss_weight: [B] time-dependent loss weight
-            
-        Returns:
-            loss: Weighted cross-entropy loss
-            logits: [B, L, V] output logits
+        [Standard Implementation Fix]
+        Computes weighted loss properly by applying weights PER SAMPLE before reduction.
+        Prevents the scalar-product bug where E[W*L] != E[W] * E[L].
         """
-        # Standard forward pass
-        loss, logits = self.forward(input_ids, attention_mask, labels)
+        # 1. Forward pass to get logits (don't use internal loss)
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
         
-        # Apply time weighting
-        if loss_weight is not None:
-            # Average weight across batch
-            avg_weight = loss_weight.mean()
-            loss = loss * avg_weight
-        
+        loss = None
+        if labels is not None:
+            # 2. Compute per-token loss (reduction='none')
+            # shape: [B*L] -> [B, L]
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+            vocab_size = logits.size(-1)
+            
+            raw_loss = loss_fct(logits.view(-1, vocab_size), labels.view(-1))
+            raw_loss = raw_loss.view(labels.size(0), -1) # [B, L]
+            
+            # 3. Apply mask (ignore -100 labels)
+            # CE loss returns 0 for -100, but being explicit is safer
+            valid_mask = (labels != -100).float()
+            masked_loss = raw_loss * valid_mask
+            
+            # 4. Apply Time Weighting per sample
+            if loss_weight is not None:
+                # loss_weight: [B] -> [B, 1] for broadcasting
+                weighted_loss = masked_loss * loss_weight.unsqueeze(-1)
+            else:
+                weighted_loss = masked_loss
+                
+            # 5. Correct Reduction (Sum / Total Valid Tokens)
+            # This computes the weighted mean over the batch
+            num_valid_tokens = valid_mask.sum()
+            
+            if num_valid_tokens > 0:
+                loss = weighted_loss.sum() / num_valid_tokens
+            else:
+                loss = torch.tensor(0.0, device=input_ids.device)
+                
         return loss, logits
     
     def inference(
