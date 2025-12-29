@@ -129,10 +129,6 @@ rdt/
 │   ├── cmlm.yaml           # CMLM baseline (iterative mask-predict)
 │   └── mdlm.yaml           # MDLM baseline (diffusion-based generation)
 │
-├── utils/               # Utility Functions
-│   ├── __init__.py
-│   └── logger.py           # CSV logging utilities
-│
 ├── utils.py             # Main utility functions (config, checkpoint, etc.)
 └── __init__.py          # Package initialization
 ```
