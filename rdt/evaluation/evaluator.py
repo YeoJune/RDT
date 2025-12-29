@@ -29,8 +29,8 @@ class Evaluator:
         self.device = device
         self.model_type = model_type.lower()
         
-        if self.model_type not in ['rdt', 'mlm', 'cmlm']:
-            raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', or 'cmlm'")
+        if self.model_type not in ['rdt', 'mlm', 'cmlm', 'mdlm']:
+            raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', 'cmlm', or 'mdlm'")
     
     def evaluate_rdt(self, dataloader: DataLoader, max_steps: int = 20,
                      threshold: float = 0.02) -> Dict[str, float]:
@@ -248,6 +248,95 @@ class Evaluator:
             'iterations': max_iterations
         }
     
+    def evaluate_mdlm(self, dataloader: DataLoader, num_steps: int = 1000, 
+                    sampler: str = 'ddpm_cache') -> Dict[str, float]:
+        """
+        Evaluate MDLM (Masked Diffusion Language Model) with iterative denoising.
+        
+        Args:
+            dataloader: DataLoader with MDLM format data (original tokens)
+            num_steps: Number of diffusion denoising steps
+            sampler: Sampling strategy ('ddpm', 'ddpm_cache', 'analytic')
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        self.model.eval()
+        total_loss = 0
+        total_accuracy = 0
+        total_top5_accuracy = 0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Evaluating MDLM", leave=False):
+                input_ids = batch['input_ids'].to(self.device)  # Original tokens
+                attention_mask = batch.get('attention_mask')
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+                
+                # MDLM inference with diffusion sampling
+                batch_size, seq_len = input_ids.shape
+                
+                # Start with all masks
+                masked_input_ids = torch.full_like(input_ids, self.model.mask_token_id)
+                
+                # Copy special tokens (CLS, SEP, PAD)
+                if attention_mask is not None:
+                    special_mask = attention_mask == 0
+                else:
+                    special_mask = input_ids == self.model.pad_token_id
+                masked_input_ids[special_mask] = input_ids[special_mask]
+                
+                # Diffusion-based denoising
+                output_ids, _ = self.model.inference(
+                    masked_input_ids,
+                    attention_mask=attention_mask,
+                    num_steps=num_steps,
+                    sampler=sampler,
+                    return_intermediate=False
+                )
+                
+                # Get final logits for metric calculation
+                logits = self.model(output_ids, attention_mask)
+                
+                # Create labels (all tokens except special tokens)
+                labels = input_ids.clone()
+                if attention_mask is not None:
+                    labels[attention_mask == 0] = -100
+                else:
+                    labels[input_ids == self.model.pad_token_id] = -100
+                
+                # Calculate metrics
+                metrics = calculate_metrics(logits, labels, ignore_index=-100)
+                
+                total_loss += metrics['loss']
+                total_accuracy += metrics['accuracy']
+                total_top5_accuracy += metrics['top5_accuracy']
+                num_batches += 1
+        
+        if num_batches == 0:
+            return {
+                'loss': 0.0, 
+                'accuracy': 0.0, 
+                'perplexity': float('inf'), 
+                'num_steps': num_steps,
+                'sampler': sampler
+            }
+        
+        avg_loss = total_loss / num_batches
+        avg_accuracy = total_accuracy / num_batches
+        avg_top5_accuracy = total_top5_accuracy / num_batches
+        perplexity = torch.exp(torch.tensor(avg_loss)).item()
+        
+        return {
+            'loss': avg_loss,
+            'accuracy': avg_accuracy,
+            'top5_accuracy': avg_top5_accuracy,
+            'perplexity': perplexity,
+            'num_steps': num_steps,
+            'sampler': sampler
+        }
+    
     def evaluate(self, dataloader: DataLoader, **kwargs) -> Dict[str, float]:
         """
         Unified evaluation interface.
@@ -271,9 +360,15 @@ class Evaluator:
                 dataloader,
                 max_iterations=kwargs.get('max_iterations', 10)
             )
+        elif self.model_type == 'mdlm':
+            return self.evaluate_mdlm(
+                dataloader,
+                num_steps=kwargs.get('num_steps', 1000),
+                sampler=kwargs.get('sampler', 'ddpm_cache')
+            )
         else:  # mlm
             return self.evaluate_mlm(dataloader)
-    
+        
     def save_results(self, results: Dict, save_path: str, add_metadata: bool = True):
         """
         Save evaluation results to JSON file with metadata.

@@ -105,7 +105,7 @@ class MLMTrainer:
         class_name = model.__class__.__name__.lower()
         if 'mdlm' in class_name:
             return 'mdlm'
-        if 'cmlm' in class_name:
+        elif 'cmlm' in class_name:
             return 'cmlm'
         return 'mlm'
     
@@ -340,7 +340,16 @@ class MLMTrainer:
         }
     
     def evaluate(self):
-        """Evaluate on validation set"""
+        """Evaluate on validation set with model-specific logic"""
+        if self.model_type == 'mdlm':
+            return self._evaluate_mdlm()
+        elif self.model_type == 'cmlm':
+            return self._evaluate_cmlm()
+        else:
+            return self._evaluate_mlm()
+        
+    def _evaluate_mlm(self):
+        """Standard MLM evaluation"""
         self.model.eval()
         total_loss = 0
         total_accuracy = 0
@@ -352,39 +361,14 @@ class MLMTrainer:
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(self.device)
-
-                if self.model_type == 'mdlm':
-                    # Weight까지 받아옴
-                    masked_input_ids, labels, t, loss_weight = self.model.continuous_time_masking(
-                        input_ids, attention_mask, low_discrepancy_sampling=True
-                    )
-                    # Weighted Loss 계산 (Train과 동일한 기준)
-                    if self.use_amp:
-                        with autocast('cuda'):
-                            loss, logits = self.model.forward_with_time_weighting(
-                                masked_input_ids, attention_mask, labels, loss_weight
-                            )
-                    else:
-                        loss, logits = self.model.forward_with_time_weighting(
-                            masked_input_ids, attention_mask, labels, loss_weight
-                        )
+                labels = batch['labels'].to(self.device)
+                
+                if self.use_amp:
+                    with autocast():
+                        loss, logits = self.model(input_ids, attention_mask, labels)
                 else:
-                    if self.model_type == 'cmlm':
-                        # CMLM: masking 및 labels 생성
-                        masked_input_ids, labels, _ = self.model.uniform_masking(
-                            input_ids, attention_mask
-                        )
-                    else:
-                        # MLM: labels는 collator에서 batch에 포함
-                        labels = batch['labels'].to(self.device)
-                        masked_input_ids = input_ids
-
-                    if self.use_amp:
-                        with autocast('cuda'):
-                            loss, logits = self.model(masked_input_ids, attention_mask, labels)
-                    else:
-                        loss, logits = self.model(masked_input_ids, attention_mask, labels)
-
+                    loss, logits = self.model(input_ids, attention_mask, labels)
+                
                 # Calculate accuracy
                 mask = labels != -100
                 if mask.sum() > 0:
@@ -393,19 +377,161 @@ class MLMTrainer:
                     accuracy = correct.sum().float() / mask.sum().float()
                 else:
                     accuracy = torch.tensor(0.0)
-
+                
                 total_loss += loss.item()
                 total_accuracy += accuracy.item()
                 num_batches += 1
         
         avg_loss = total_loss / num_batches
         avg_accuracy = total_accuracy / num_batches
+        perplexity = math.exp(avg_loss)
         
         return {
             'val_loss': avg_loss,
-            'val_accuracy': avg_accuracy
+            'val_accuracy': avg_accuracy,
+            'val_perplexity': perplexity
         }
     
+    def _evaluate_cmlm(self):
+        """CMLM evaluation with uniform masking"""
+        self.model.eval()
+        total_loss = 0
+        total_accuracy = 0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch.get('attention_mask')
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+                
+                # Apply uniform masking for CMLM
+                masked_input_ids, labels, _ = self.model.uniform_masking(
+                    input_ids, attention_mask
+                )
+                
+                if self.use_amp:
+                    with autocast():
+                        loss, logits = self.model(masked_input_ids, attention_mask, labels)
+                else:
+                    loss, logits = self.model(masked_input_ids, attention_mask, labels)
+                
+                # Calculate accuracy
+                mask = labels != -100
+                if mask.sum() > 0:
+                    pred_tokens = logits.argmax(dim=-1)
+                    correct = (pred_tokens == labels) & mask
+                    accuracy = correct.sum().float() / mask.sum().float()
+                else:
+                    accuracy = torch.tensor(0.0)
+                
+                total_loss += loss.item()
+                total_accuracy += accuracy.item()
+                num_batches += 1
+        
+        avg_loss = total_loss / num_batches
+        avg_accuracy = total_accuracy / num_batches
+        perplexity = math.exp(avg_loss)
+        
+        return {
+            'val_loss': avg_loss,
+            'val_accuracy': avg_accuracy,
+            'val_perplexity': perplexity
+        }
+    
+    def _evaluate_mdlm(self):
+        """
+        MDLM evaluation with Monte Carlo integration over timesteps.
+        
+        Implements continuous-time NLL evaluation as in MDLM paper:
+        L = E_t ∫ [α'(t) / (1 - α(t))] * CrossEntropy dt
+        
+        Monte Carlo approximation:
+        L ≈ (1/K) Σ_k [α'(t_k) / (1 - α(t_k))] * CrossEntropy(x | z_{t_k})
+        where t_k ~ Uniform[0, 1]
+        """
+        self.model.eval()
+        total_weighted_loss = 0
+        total_accuracy = 0
+        total_tokens = 0
+        num_batches = 0
+        
+        # Monte Carlo samples for continuous-time integration
+        # Paper uses T→∞ (continuous), we approximate with MC sampling
+        num_mc_samples = self.config.get('eval', {}).get('mc_samples', 10)
+        
+        print(f"  Using {num_mc_samples} Monte Carlo samples for MDLM evaluation")
+        
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="Evaluating MDLM", leave=False):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch.get('attention_mask')
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+                
+                # Monte Carlo integration over timesteps
+                batch_weighted_loss = 0
+                batch_accuracy = 0
+                
+                for _ in range(num_mc_samples):
+                    # Sample timestep and apply continuous-time masking
+                    masked_ids, labels, t, loss_weight = self.model.continuous_time_masking(
+                        input_ids, 
+                        attention_mask,
+                        low_discrepancy_sampling=True  # Variance reduction
+                    )
+                    
+                    # Forward pass with time weighting
+                    if self.use_amp:
+                        with autocast():
+                            loss, logits = self.model.forward_with_time_weighting(
+                                masked_ids, attention_mask, labels, loss_weight
+                            )
+                    else:
+                        loss, logits = self.model.forward_with_time_weighting(
+                            masked_ids, attention_mask, labels, loss_weight
+                        )
+                    
+                    batch_weighted_loss += loss.item()
+                    
+                    # Calculate accuracy (on masked tokens)
+                    mask = labels != -100
+                    if mask.sum() > 0:
+                        pred_tokens = logits.argmax(dim=-1)
+                        correct = (pred_tokens == labels) & mask
+                        accuracy = correct.sum().float() / mask.sum().float()
+                        batch_accuracy += accuracy.item()
+                
+                # Average over MC samples
+                batch_weighted_loss /= num_mc_samples
+                batch_accuracy /= num_mc_samples
+                
+                # Count valid tokens for proper averaging
+                if attention_mask is not None:
+                    num_tokens = attention_mask.sum().item()
+                else:
+                    num_tokens = (input_ids != self.model.pad_token_id).sum().item()
+                
+                total_weighted_loss += batch_weighted_loss * num_tokens
+                total_accuracy += batch_accuracy
+                total_tokens += num_tokens
+                num_batches += 1
+        
+        # Compute averages
+        avg_loss = total_weighted_loss / total_tokens
+        avg_accuracy = total_accuracy / num_batches
+        
+        # Cap perplexity for numerical stability
+        perplexity = math.exp(min(avg_loss, 100))
+        
+        return {
+            'val_loss': avg_loss,
+            'val_accuracy': avg_accuracy,
+            'val_perplexity': perplexity,
+            'mc_samples': num_mc_samples
+        }
+
     def save_checkpoint(self, filename=None):
         """Save checkpoint"""
         if filename is None:
