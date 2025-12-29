@@ -137,6 +137,29 @@ class MLM(nn.Module):
         print(f"  - pad_token_id: {self.pad_token_id}")
         print(f"  - BERT masking: {self.bert_masking_enabled}")
     
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        """
+        Standard MLM forward pass
+        
+        Args:
+            input_ids: [B, L] token indices
+            attention_mask: [B, L] attention mask (1=valid, 0=padding)
+            labels: [B, L] target token indices (optional, for loss computation)
+            
+        Returns:
+            If labels provided: (loss, logits)
+            Otherwise: logits
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+        
+        if labels is not None:
+            return outputs.loss, outputs.logits
+        return outputs.logits
+    
     def _apply_bert_masking(self, input_ids: torch.Tensor, mask_decision: torch.Tensor) -> torch.Tensor:
         """
         Apply BERT-style masking to input tokens.
