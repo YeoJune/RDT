@@ -213,15 +213,19 @@ class MDLM(MLM):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # 1. Sample time steps t ~ Uniform[0, 1]
+        # 1. Sample time steps t ~ Uniform[eps, 1]
+        # FIX: Avoid t=0 strictly to prevent loss weight singularity
+        eps = 1e-5
         if low_discrepancy_sampling:
-            # Low-discrepancy sampler: partition unit interval evenly
+            # Low-discrepancy sampler: partition interval [eps, 1] evenly
             # Reduces variance during training (Appendix G in paper)
-            t = torch.linspace(0, 1, batch_size + 1, device=device)[:-1]
-            t = t + torch.rand(batch_size, device=device) / batch_size
-            t = t.clamp(0, 1)
+            t = torch.linspace(eps, 1.0, batch_size + 1, device=device)[:-1]
+            noise = torch.rand(batch_size, device=device) * (1 - eps) / batch_size
+            t = t + noise
+            t = t.clamp(eps, 1.0)  # Double safety
         else:
-            t = torch.rand(batch_size, device=device)
+            t = torch.rand(batch_size, device=device) * (1 - eps) + eps
+            t = t.clamp(eps, 1.0)  # Ensure t ∈ [eps, 1]
         
         # 2. Calculate masking probability from noise schedule
         # α(t): probability of NOT masking
@@ -259,10 +263,49 @@ class MDLM(MLM):
     
     def _compute_loss_weight(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Compute loss weight: α'(t) / (1 - α(t))
+        Compute loss weight: α'(t) / (1 - α(t)) using analytic gradients.
+        Prevents singularity at t=0 by clamping the weight.
         
         This comes from the Rao-Blackwellized NELBO objective (Eq. 3 in paper):
         L = E_t ∫ [α'(t) / (1 - α(t))] * CrossEntropy(x_θ(z_t), x) dt
+        
+        Args:
+            t: [B] time steps in [0, 1]
+            
+        Returns:
+            weight: [B] loss weight for each sample
+        """
+        # 1. Analytic derivatives for stability (avoids numerical errors)
+        if self.noise_schedule == 'cosine':
+            # α(t) = cos²(πt/2)
+            # α'(t) = -π * cos(πt/2) * sin(πt/2) = -(π/2) * sin(πt)
+            alpha_prime = -(math.pi / 2) * torch.sin(math.pi * t)
+        elif self.noise_schedule == 'linear':
+            # α(t) = 1 - t
+            # α'(t) = -1
+            alpha_prime = torch.full_like(t, -1.0)
+        else:
+            # Fallback to numerical differentiation for unknown schedules
+            return self._compute_loss_weight_numerical(t)
+        
+        # 2. Compute 1 - α(t)
+        alpha_t = self.get_alpha(t)
+        one_minus_alpha = 1.0 - alpha_t
+        
+        # 3. Compute Weight: |α'(t)| / (1 - α(t))
+        # Add epsilon to denominator for numerical stability
+        weight = torch.abs(alpha_prime) / (one_minus_alpha + 1e-8)
+        
+        # 4. CRITICAL FIX: Clamp large weights at t≈0
+        # The theoretical weight → ∞ as t → 0, but gradients shouldn't explode.
+        # Standard MDLM implementations clamp this to prevent loss spikes.
+        weight = torch.clamp(weight, max=100.0)
+        
+        return weight
+    
+    def _compute_loss_weight_numerical(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Fallback numerical differentiation for unknown noise schedules.
         
         Args:
             t: [B] time steps in [0, 1]
@@ -287,8 +330,10 @@ class MDLM(MLM):
         one_minus_alpha = torch.clamp(one_minus_alpha, min=1e-8)
         
         # Weight = |α'(t)| / (1 - α(t))
-        # Use absolute value because α'(t) is negative (decreasing function)
         weight = torch.abs(alpha_prime) / one_minus_alpha
+        
+        # Clamp to prevent explosion
+        weight = torch.clamp(weight, max=100.0)
         
         return weight
     
