@@ -351,29 +351,28 @@ class MLMTrainer:
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(self.device)
-                
-                # Handle masking based on model type
-                elif self.model_type == 'mdlm':
-                    # Apply continuous-time masking for MDLM
+
+                if self.model_type == 'mdlm':
+                    # MDLM: masking 및 labels 생성
                     masked_input_ids, labels, _, _ = self.model.continuous_time_masking(
                         input_ids, attention_mask
                     )
-                if self.model_type == 'cmlm':
-                    # Apply uniform masking for CMLM
+                elif self.model_type == 'cmlm':
+                    # CMLM: masking 및 labels 생성
                     masked_input_ids, labels, _ = self.model.uniform_masking(
                         input_ids, attention_mask
                     )
                 else:
-                    # MLM: labels already in batch
+                    # MLM: labels는 collator에서 batch에 포함
                     labels = batch['labels'].to(self.device)
                     masked_input_ids = input_ids
-                
+
                 if self.use_amp:
                     with autocast('cuda'):
                         loss, logits = self.model(masked_input_ids, attention_mask, labels)
                 else:
                     loss, logits = self.model(masked_input_ids, attention_mask, labels)
-                
+
                 # Calculate accuracy
                 mask = labels != -100
                 if mask.sum() > 0:
@@ -382,7 +381,7 @@ class MLMTrainer:
                     accuracy = correct.sum().float() / mask.sum().float()
                 else:
                     accuracy = torch.tensor(0.0)
-                
+
                 total_loss += loss.item()
                 total_accuracy += accuracy.item()
                 num_batches += 1
