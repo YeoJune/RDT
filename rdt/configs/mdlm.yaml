@@ -39,6 +39,15 @@ training:
   save_every_n_steps: 1000
   keep_last_n_checkpoints: 3
 
+  # BERT-style masking (80% [MASK], 10% random, 10% keep)
+  # Default: false (use 100% [MASK] as in MDLM paper)
+  # Set to true for consistency experiments with RDT
+  bert_masking:
+    enabled: false
+    mask_prob: 0.8 # Probability of [MASK] token
+    random_prob: 0.1 # Probability of random token
+    keep_prob: 0.1 # Probability of keeping original
+
 # MDLM-specific Training
 mdlm:
   # Continuous-time masking: sample t ~ Uniform[0,1], mask with probability p_mask(t) = 1 - α(t)

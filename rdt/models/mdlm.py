@@ -42,7 +42,11 @@ class MDLM(MLM):
         pad_token_id: Optional[int] = None,
         config_overrides: Optional[Dict] = None,
         noise_schedule: str = 'cosine',
-        time_conditioning: bool = False
+        time_conditioning: bool = False,
+        bert_masking_enabled: bool = False,
+        mask_prob: float = 0.8,
+        random_prob: float = 0.1,
+        keep_prob: float = 0.1
     ):
         """
         Initialize MDLM by extending MLM.
@@ -56,6 +60,10 @@ class MDLM(MLM):
             config_overrides: Dict of config parameters to override
             noise_schedule: Noise schedule type ('cosine' or 'linear')
             time_conditioning: Whether to condition model on timestep (default: False for MDLM)
+            bert_masking_enabled: Enable BERT-style masking (80% [MASK], 10% random, 10% keep)
+            mask_prob: Probability of replacing with [MASK] token (default: 0.8)
+            random_prob: Probability of replacing with random token (default: 0.1)
+            keep_prob: Probability of keeping original token (default: 0.1)
         """
         super().__init__(
             architecture=architecture,
@@ -63,7 +71,11 @@ class MDLM(MLM):
             vocab_size=vocab_size,
             mask_token_id=mask_token_id,
             pad_token_id=pad_token_id,
-            config_overrides=config_overrides
+            config_overrides=config_overrides,
+            bert_masking_enabled=bert_masking_enabled,
+            mask_prob=mask_prob,
+            random_prob=random_prob,
+            keep_prob=keep_prob
         )
         
         self.noise_schedule = noise_schedule
@@ -89,6 +101,12 @@ class MDLM(MLM):
               config_overrides:                   # Optional
                 num_hidden_layers: 6
                 hidden_size: 512
+            training:
+              bert_masking:                       # Optional: BERT-style masking
+                enabled: false
+                mask_prob: 0.8
+                random_prob: 0.1
+                keep_prob: 0.1
         
         Args:
             config: Configuration dictionary
@@ -97,6 +115,8 @@ class MDLM(MLM):
             MDLM instance
         """
         model_cfg = config['model']
+        training_cfg = config.get('training', {})
+        bert_cfg = training_cfg.get('bert_masking', {})
         
         return cls(
             architecture=model_cfg['architecture'],
@@ -106,7 +126,11 @@ class MDLM(MLM):
             pad_token_id=model_cfg.get('pad_token_id'),
             config_overrides=model_cfg.get('config_overrides'),
             noise_schedule=model_cfg.get('noise_schedule', 'cosine'),
-            time_conditioning=model_cfg.get('time_conditioning', False)
+            time_conditioning=model_cfg.get('time_conditioning', False),
+            bert_masking_enabled=bert_cfg.get('enabled', False),
+            mask_prob=bert_cfg.get('mask_prob', 0.8),
+            random_prob=bert_cfg.get('random_prob', 0.1),
+            keep_prob=bert_cfg.get('keep_prob', 0.1)
         )
     
     def _cosine_schedule(self, t: torch.Tensor) -> torch.Tensor:
@@ -220,9 +244,8 @@ class MDLM(MLM):
         
         mask_decision = (rand < mask_prob_expanded) & maskable  # [B, L]
         
-        # 5. Apply SUBS parameterization: masked positions → [MASK], others → keep original
-        masked_input_ids = input_ids.clone()
-        masked_input_ids = masked_input_ids.masked_fill(mask_decision, self.mask_token_id)
+        # 5. Apply masking (BERT-style if enabled, otherwise simple SUBS parameterization)
+        masked_input_ids = self._apply_bert_masking(input_ids, mask_decision)
         
         # 6. Create labels (-100 for non-masked tokens)
         labels = input_ids.clone()

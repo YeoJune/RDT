@@ -29,7 +29,11 @@ class CMLM(MLM):
         vocab_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
         pad_token_id: Optional[int] = None,
-        config_overrides: Optional[Dict] = None
+        config_overrides: Optional[Dict] = None,
+        bert_masking_enabled: bool = False,
+        mask_prob: float = 0.8,
+        random_prob: float = 0.1,
+        keep_prob: float = 0.1
     ):
         """
         Initialize CMLM by extending MLM.
@@ -41,6 +45,10 @@ class CMLM(MLM):
             mask_token_id: ID of [MASK] token (auto-detected if None)
             pad_token_id: ID of [PAD] token (auto-detected if None)
             config_overrides: Dict of config parameters to override (e.g., {'num_hidden_layers': 6})
+            bert_masking_enabled: Enable BERT-style masking (80% [MASK], 10% random, 10% keep)
+            mask_prob: Probability of replacing with [MASK] token (default: 0.8)
+            random_prob: Probability of replacing with random token (default: 0.1)
+            keep_prob: Probability of keeping original token (default: 0.1)
         """
         super().__init__(
             architecture=architecture,
@@ -48,7 +56,11 @@ class CMLM(MLM):
             vocab_size=vocab_size,
             mask_token_id=mask_token_id,
             pad_token_id=pad_token_id,
-            config_overrides=config_overrides
+            config_overrides=config_overrides,
+            bert_masking_enabled=bert_masking_enabled,
+            mask_prob=mask_prob,
+            random_prob=random_prob,
+            keep_prob=keep_prob
         )
     
     @classmethod
@@ -66,6 +78,12 @@ class CMLM(MLM):
               config_overrides:                   # Optional: override architecture params
                 num_hidden_layers: 6
                 hidden_size: 512
+            training:
+              bert_masking:                       # Optional: BERT-style masking
+                enabled: false
+                mask_prob: 0.8
+                random_prob: 0.1
+                keep_prob: 0.1
         
         Args:
             config: Configuration dictionary
@@ -74,6 +92,8 @@ class CMLM(MLM):
             CMLM instance
         """
         model_cfg = config['model']
+        training_cfg = config.get('training', {})
+        bert_cfg = training_cfg.get('bert_masking', {})
         
         return cls(
             architecture=model_cfg['architecture'],
@@ -81,7 +101,11 @@ class CMLM(MLM):
             vocab_size=model_cfg.get('vocab_size'),
             mask_token_id=model_cfg.get('mask_token_id'),
             pad_token_id=model_cfg.get('pad_token_id'),
-            config_overrides=model_cfg.get('config_overrides')
+            config_overrides=model_cfg.get('config_overrides'),
+            bert_masking_enabled=bert_cfg.get('enabled', False),
+            mask_prob=bert_cfg.get('mask_prob', 0.8),
+            random_prob=bert_cfg.get('random_prob', 0.1),
+            keep_prob=bert_cfg.get('keep_prob', 0.1)
         )
     
     def uniform_masking(self, input_ids, attention_mask=None):
@@ -140,9 +164,8 @@ class CMLM(MLM):
         # Mask tokens with rank < num_to_mask
         mask_decision = ranks < num_to_mask  # [B, L]
         
-        # 6. Apply masking
-        masked_input_ids = input_ids.clone()
-        masked_input_ids = masked_input_ids.masked_fill(mask_decision, self.mask_token_id)
+        # 6. Apply masking (BERT-style if enabled, otherwise simple masking)
+        masked_input_ids = self._apply_bert_masking(input_ids, mask_decision)
         
         # 7. Create labels (-100 for non-masked tokens)
         labels = input_ids.clone()

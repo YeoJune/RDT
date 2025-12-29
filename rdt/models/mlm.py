@@ -27,7 +27,11 @@ class MLM(nn.Module):
         vocab_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
         pad_token_id: Optional[int] = None,
-        config_overrides: Optional[Dict] = None
+        config_overrides: Optional[Dict] = None,
+        bert_masking_enabled: bool = False,
+        mask_prob: float = 0.8,
+        random_prob: float = 0.1,
+        keep_prob: float = 0.1
     ):
         """
         Args:
@@ -40,6 +44,10 @@ class MLM(nn.Module):
             pad_token_id: ID of [PAD] token (auto-detected from tokenizer if None)
             config_overrides: Dict of config parameters to override (e.g., {'num_hidden_layers': 6})
                             Useful for matching parameter count with other models
+            bert_masking_enabled: Enable BERT-style masking (80% [MASK], 10% random, 10% keep)
+            mask_prob: Probability of replacing with [MASK] token (default: 0.8)
+            random_prob: Probability of replacing with random token (default: 0.1)
+            keep_prob: Probability of keeping original token (default: 0.1)
         
         Examples:
             # Pretrained model
@@ -56,6 +64,12 @@ class MLM(nn.Module):
         super().__init__()
         self.architecture = architecture
         self.pretrained = pretrained
+        
+        # BERT-style masking parameters
+        self.bert_masking_enabled = bert_masking_enabled
+        self.mask_prob = mask_prob
+        self.random_prob = random_prob
+        self.keep_prob = keep_prob
         
         # Load model config
         config = AutoConfig.from_pretrained(architecture)
@@ -121,8 +135,9 @@ class MLM(nn.Module):
         print(f"  - vocab_size: {self.vocab_size}")
         print(f"  - mask_token_id: {self.mask_token_id}")
         print(f"  - pad_token_id: {self.pad_token_id}")
-        
-    def forward(self, input_ids, attention_mask=None, labels=None):
+        print(f"  - BERT masking: {self.bert_masking_enabled}")
+    
+    def _apply_bert_masking(self, input_ids: torch.Tensor, mask_decision: torch.Tensor) -> torch.Tensor:
         """
         Standard MLM forward pass
         
@@ -207,6 +222,12 @@ class MLM(nn.Module):
               config_overrides:                   # Optional: override architecture params
                 num_hidden_layers: 6
                 hidden_size: 512
+            training:
+              bert_masking:                       # Optional: BERT-style masking
+                enabled: true
+                mask_prob: 0.8
+                random_prob: 0.1
+                keep_prob: 0.1
         
         Args:
             config: Configuration dictionary
@@ -215,6 +236,8 @@ class MLM(nn.Module):
             MLM instance
         """
         model_cfg = config['model']
+        training_cfg = config.get('training', {})
+        bert_cfg = training_cfg.get('bert_masking', {})
         
         return cls(
             architecture=model_cfg['architecture'],
@@ -222,7 +245,11 @@ class MLM(nn.Module):
             vocab_size=model_cfg.get('vocab_size'),
             mask_token_id=model_cfg.get('mask_token_id'),
             pad_token_id=model_cfg.get('pad_token_id'),
-            config_overrides=model_cfg.get('config_overrides')
+            config_overrides=model_cfg.get('config_overrides'),
+            bert_masking_enabled=bert_cfg.get('enabled', True),
+            mask_prob=bert_cfg.get('mask_prob', 0.8),
+            random_prob=bert_cfg.get('random_prob', 0.1),
+            keep_prob=bert_cfg.get('keep_prob', 0.1)
         )
     
     @classmethod

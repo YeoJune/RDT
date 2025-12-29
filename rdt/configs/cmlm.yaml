@@ -15,7 +15,30 @@ model:
     num_attention_heads: 8 # Must divide hidden_size evenly
     intermediate_size: 2048 # FFN dimension (typically 4x hidden_size)
 
-# Training Strategy
+# Data
+data:
+  dataset_name: "wikitext-2"
+  streaming: false
+  max_seq_length: 512
+
+  # CMLM uses uniform masking during training
+  # masking ratio is dynamically sampled per batch
+
+  tokenizer_name: "bert-base-uncased"
+  num_workers: 4
+  pin_memory: true
+
+# CMLM-specific Training
+cmlm:
+  # Uniform masking: masking ratio sampled uniformly from [0, 1]
+  # This trains the model on both easy (single mask) and difficult (fully masked) examples
+  uniform_masking: true
+
+  # Mask-Predict inference settings
+  max_iterations: 10 # Number of mask-predict refinement iterations
+  mask_decay: "linear" # How mask ratio decreases: 'linear' (1.0 → 0.0)
+
+# BERT-style Masking (for consistency experiments)
 training:
   batch_size: 16
   gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
@@ -34,28 +57,14 @@ training:
   save_every_n_steps: 1000
   keep_last_n_checkpoints: 3
 
-# CMLM-specific Training
-cmlm:
-  # Uniform masking: masking ratio sampled uniformly from [0, 1]
-  # This trains the model on both easy (single mask) and difficult (fully masked) examples
-  uniform_masking: true
-
-  # Mask-Predict inference settings
-  max_iterations: 10 # Number of mask-predict refinement iterations
-  mask_decay: "linear" # How mask ratio decreases: 'linear' (1.0 → 0.0)
-
-# Data
-data:
-  dataset_name: "wikitext-2"
-  streaming: false
-  max_seq_length: 512
-
-  # CMLM uses uniform masking during training
-  # masking ratio is dynamically sampled per batch
-
-  tokenizer_name: "bert-base-uncased"
-  num_workers: 4
-  pin_memory: true
+  # BERT-style masking (80% [MASK], 10% random, 10% keep)
+  # Default: false (use 100% [MASK] as in CMLM paper)
+  # Set to true for consistency experiments with RDT
+  bert_masking:
+    enabled: false
+    mask_prob: 0.8 # Probability of [MASK] token
+    random_prob: 0.1 # Probability of random token
+    keep_prob: 0.1 # Probability of keeping original
 
 # Logging & Checkpoints
 output:

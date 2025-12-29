@@ -34,6 +34,15 @@ training:
   save_every_n_steps: 1000
   keep_last_n_checkpoints: 3
 
+  # BERT-style masking (80% [MASK], 10% random, 10% keep)
+  # Default: true (MLM uses BERT-style by default via HuggingFace DataCollatorForLanguageModeling)
+  # Set to false to use 100% [MASK] for consistency with baseline CMLM/MDLM
+  bert_masking:
+    enabled: true
+    mask_prob: 0.8 # Probability of [MASK] token
+    random_prob: 0.1 # Probability of random token
+    keep_prob: 0.1 # Probability of keeping original
+
 # Data
 data:
   dataset_name: "wikitext-2"
