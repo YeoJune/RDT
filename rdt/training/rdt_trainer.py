@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import wandb
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -37,10 +37,12 @@ class RDTTrainer:
         self.num_epochs = config['training'].get('num_epochs', 10)
         self.max_training_steps = config['training'].get('max_training_steps', 100000)
         self.max_grad_norm = config['training']['max_grad_norm']
+        self.gradient_accumulation_steps = config['training'].get('gradient_accumulation_steps', 1)
         self.loss_weight_recon = config['training']['loss_weight_recon']
         self.loss_weight_gate = config['training']['loss_weight_gate']
         self.loss_weight_aux = config['training'].get('loss_weight_aux', 0.1)
         self.aux_ratio = config['training'].get('aux_ratio', 0.25)
+        print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -271,25 +273,35 @@ class RDTTrainer:
                 aux_loss = torch.tensor(0.0, device=self.device)
                 final_loss = main_loss
         
-        # Backward pass
-        self.optimizer.zero_grad()
+        # Store original loss for logging
+        original_final_loss = final_loss.item()
+        
+        # Backward pass with gradient accumulation
+        final_loss = final_loss / self.gradient_accumulation_steps  # Scale loss
         
         if self.use_amp:
             self.scaler.scale(final_loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
         else:
             final_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.optimizer.step()
         
-        if self.scheduler:
-            self.scheduler.step()
+        # Only update weights every gradient_accumulation_steps
+        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
+            if self.use_amp:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+            
+            self.optimizer.zero_grad()
+            
+            if self.scheduler:
+                self.scheduler.step()
         
         return (
-            final_loss.item(),
+            original_final_loss,
             total_recon_loss / max(1, num_valid_steps),
             total_gate_loss / max(1, num_valid_steps),
             aux_loss.item()

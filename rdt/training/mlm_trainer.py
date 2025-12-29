@@ -44,6 +44,8 @@ class MLMTrainer:
         self.num_epochs = config['training'].get('num_epochs', 10)
         self.max_training_steps = config['training'].get('max_training_steps', 100000)
         self.max_grad_norm = config['training']['max_grad_norm']
+        self.gradient_accumulation_steps = config['training'].get('gradient_accumulation_steps', 1)
+        print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -155,20 +157,30 @@ class MLMTrainer:
         else:
             loss, logits = self.model(input_ids, attention_mask, labels)
         
-        # Backward pass
+        # Store original loss for logging
+        original_loss = loss.item()
+        
+        # Backward pass with gradient accumulation
+        loss = loss / self.gradient_accumulation_steps  # Scale loss
+        
         if self.use_amp:
             self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.optimizer.step()
         
-        self.optimizer.zero_grad()
-        self.scheduler.step()
+        # Only update weights every gradient_accumulation_steps
+        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
+            if self.use_amp:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+            
+            self.optimizer.zero_grad()
+            self.scheduler.step()
         
         # Calculate accuracy (on masked tokens only)
         mask = labels != -100
@@ -180,7 +192,7 @@ class MLMTrainer:
             accuracy = torch.tensor(0.0)
         
         return {
-            'loss': loss.item(),
+            'loss': original_loss,
             'accuracy': accuracy.item(),
             'lr': self.scheduler.get_last_lr()[0]
         }
@@ -202,25 +214,35 @@ class MLMTrainer:
         
         # Forward pass with AMP
         if self.use_amp:
-            with autocast():
+            with autocast('cuda'):
                 loss, logits = self.model(masked_input_ids, attention_mask, labels)
         else:
             loss, logits = self.model(masked_input_ids, attention_mask, labels)
         
-        # Backward pass
+        # Store original loss for logging
+        original_loss = loss.item()
+        
+        # Backward pass with gradient accumulation
+        loss = loss / self.gradient_accumulation_steps  # Scale loss
+        
         if self.use_amp:
             self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.optimizer.step()
         
-        self.optimizer.zero_grad()
-        self.scheduler.step()
+        # Only update weights every gradient_accumulation_steps
+        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
+            if self.use_amp:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+            
+            self.optimizer.zero_grad()
+            self.scheduler.step()
         
         # Calculate accuracy (on masked tokens only)
         mask = labels != -100
@@ -232,7 +254,7 @@ class MLMTrainer:
             accuracy = torch.tensor(0.0)
         
         return {
-            'loss': loss.item(),
+            'loss': original_loss,
             'accuracy': accuracy.item(),
             'mask_ratio': mask_ratio,
             'lr': self.scheduler.get_last_lr()[0]
