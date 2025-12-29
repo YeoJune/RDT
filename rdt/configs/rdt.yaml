@@ -58,7 +58,7 @@ training:
   aux_ratio: 1.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
 
   # Optimization
-  batch_size: 16
+  batch_size: 8
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 10 # Used when training_mode is 'epoch'
   max_training_steps: 400000 # Used when training_mode is 'step'
