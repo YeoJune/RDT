@@ -139,26 +139,51 @@ class MLM(nn.Module):
     
     def _apply_bert_masking(self, input_ids: torch.Tensor, mask_decision: torch.Tensor) -> torch.Tensor:
         """
-        Standard MLM forward pass
+        Apply BERT-style masking to input tokens.
         
         Args:
             input_ids: [B, L] token indices
-            attention_mask: [B, L] attention mask (1=valid, 0=padding)
-            labels: [B, L] target token indices (optional, for loss computation)
+            mask_decision: [B, L] boolean mask (True=mask this token)
             
         Returns:
-            If labels provided: (loss, logits)
-            Otherwise: logits
+            masked_input_ids: [B, L] input with masks applied
         """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
+        if not self.bert_masking_enabled:
+            # Simple masking: replace all masked positions with [MASK]
+            masked_input_ids = input_ids.clone()
+            masked_input_ids = masked_input_ids.masked_fill(mask_decision, self.mask_token_id)
+            return masked_input_ids
         
-        if labels is not None:
-            return outputs.loss, outputs.logits
-        return outputs.logits
+        # BERT-style masking (80% [MASK], 10% random, 10% keep)
+        masked_input_ids = input_ids.clone()
+        
+        # Get indices where masking should happen
+        mask_indices = mask_decision.nonzero(as_tuple=True)
+        
+        if len(mask_indices[0]) == 0:
+            return masked_input_ids
+        
+        # Generate random values for each masked position
+        rand_values = torch.rand(len(mask_indices[0]), device=input_ids.device)
+        
+        # 80% of the time: replace with [MASK]
+        mask_token_indices = rand_values < 0.8
+        # 10% of the time: replace with random token (0.8 <= rand < 0.9)
+        random_token_indices = (rand_values >= 0.8) & (rand_values < 0.9)
+        # 10% of the time: keep original token (rand >= 0.9)
+        
+        # Apply [MASK] token
+        mask_positions = (mask_indices[0][mask_token_indices], mask_indices[1][mask_token_indices])
+        if len(mask_positions[0]) > 0:
+            masked_input_ids[mask_positions] = self.mask_token_id
+        
+        # Apply random tokens
+        random_positions = (mask_indices[0][random_token_indices], mask_indices[1][random_token_indices])
+        if len(random_positions[0]) > 0:
+            random_tokens = torch.randint(0, self.vocab_size, (len(random_positions[0]),), device=input_ids.device)
+            masked_input_ids[random_positions] = random_tokens
+        
+        return masked_input_ids
     
     def standard_masking(self, input_ids, attention_mask=None, mask_prob=0.15):
         """
