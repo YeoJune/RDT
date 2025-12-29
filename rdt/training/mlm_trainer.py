@@ -369,7 +369,7 @@ class MLMTrainer:
                     masked_input_ids = input_ids
                 
                 if self.use_amp:
-                    with autocast():
+                    with autocast('cuda'):
                         loss, logits = self.model(masked_input_ids, attention_mask, labels)
                 else:
                     loss, logits = self.model(masked_input_ids, attention_mask, labels)
