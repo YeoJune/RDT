@@ -121,7 +121,7 @@ class MLMTrainer:
                 total_steps=total_steps,
                 pct_start=warmup_steps / total_steps,
                 anneal_strategy='cos',
-                eta_min=self.config['training']['learning_rate'] * 1e-2
+                final_div_factor=100
             )
         else:  # linear
             return optim.lr_scheduler.LambdaLR(
