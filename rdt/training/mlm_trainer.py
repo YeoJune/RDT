@@ -449,7 +449,7 @@ class MLMTrainer:
         num_batches = 0
         
         # Monte Carlo samples
-        num_mc_samples = self.config.get('eval', {}).get('mc_samples', 10)
+        num_mc_samples = self.config.get('mdlm', {}).get('mc_samples', 10)
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Evaluating MDLM", leave=False):

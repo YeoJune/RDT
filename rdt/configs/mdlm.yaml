@@ -61,6 +61,7 @@ mdlm:
 
   # Key difference from CMLM: MDLM uses RANDOM unmasking (not confidence-based)
   # This makes MDLM a simple baseline compared to smart methods like CMLM and RDT
+  mc_samples: 10
 
 # Data
 data:
