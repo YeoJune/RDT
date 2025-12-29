@@ -26,7 +26,8 @@ class MLM(nn.Module):
         pretrained: Optional[str] = None,
         vocab_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
-        pad_token_id: Optional[int] = None
+        pad_token_id: Optional[int] = None,
+        config_overrides: Optional[Dict] = None
     ):
         """
         Args:
@@ -37,6 +38,8 @@ class MLM(nn.Module):
             vocab_size: Vocabulary size (required for from-scratch training)
             mask_token_id: ID of [MASK] token (auto-detected from tokenizer if None)
             pad_token_id: ID of [PAD] token (auto-detected from tokenizer if None)
+            config_overrides: Dict of config parameters to override (e.g., {'num_hidden_layers': 6})
+                            Useful for matching parameter count with other models
         
         Examples:
             # Pretrained model
@@ -45,6 +48,10 @@ class MLM(nn.Module):
             # From scratch with custom vocab
             model = MLM(architecture='bert-base-uncased', vocab_size=50000, 
                        mask_token_id=3, pad_token_id=0)
+            
+            # From scratch with custom architecture (match RDT size)
+            model = MLM(architecture='bert-base-uncased', 
+                       config_overrides={'num_hidden_layers': 6, 'hidden_size': 512})
         """
         super().__init__()
         self.architecture = architecture
@@ -52,6 +59,16 @@ class MLM(nn.Module):
         
         # Load model config
         config = AutoConfig.from_pretrained(architecture)
+        
+        # Apply config overrides (for fair comparison with custom models)
+        if config_overrides:
+            print(f"  Applying config overrides:")
+            for k, v in config_overrides.items():
+                if hasattr(config, k):
+                    setattr(config, k, v)
+                    print(f"    - {k}: {getattr(config, k)} → {v}")
+                else:
+                    print(f"    ⚠ Warning: config does not have attribute '{k}', skipping")
         
         # Override vocab size if provided
         if vocab_size is not None:
@@ -187,6 +204,9 @@ class MLM(nn.Module):
               vocab_size: 50000                   # Optional: custom vocab size
               mask_token_id: 103                  # Optional: auto-detect from tokenizer
               pad_token_id: 0                     # Optional: auto-detect from tokenizer
+              config_overrides:                   # Optional: override architecture params
+                num_hidden_layers: 6
+                hidden_size: 512
         
         Args:
             config: Configuration dictionary
@@ -201,7 +221,8 @@ class MLM(nn.Module):
             pretrained=model_cfg.get('pretrained'),
             vocab_size=model_cfg.get('vocab_size'),
             mask_token_id=model_cfg.get('mask_token_id'),
-            pad_token_id=model_cfg.get('pad_token_id')
+            pad_token_id=model_cfg.get('pad_token_id'),
+            config_overrides=model_cfg.get('config_overrides')
         )
     
     @classmethod

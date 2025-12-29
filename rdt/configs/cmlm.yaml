@@ -6,8 +6,14 @@ model_type: "cmlm"
 # Model Architecture
 model:
   architecture: "bert-base-uncased" # Model architecture for config and tokenizer
-  pretrained: "bert-base-uncased" # Pretrained weights to load (null/empty for from-scratch)
-  # pretrained: null # Train from scratch (random initialization)
+  pretrained: null # Pretrained weights to load (null/empty for from-scratch)
+
+  # Optional: Override architecture parameters (for fair comparison with custom models)
+  config_overrides:
+    num_hidden_layers: 6 # Match RDT's layer count
+    hidden_size: 512 # Match RDT's hidden dimension
+    num_attention_heads: 8 # Must divide hidden_size evenly
+    intermediate_size: 2048 # FFN dimension (typically 4x hidden_size)
 
 # Training Strategy
 training:

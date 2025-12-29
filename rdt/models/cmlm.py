@@ -28,7 +28,8 @@ class CMLM(MLM):
         pretrained: Optional[str] = None,
         vocab_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
-        pad_token_id: Optional[int] = None
+        pad_token_id: Optional[int] = None,
+        config_overrides: Optional[Dict] = None
     ):
         """
         Initialize CMLM by extending MLM.
@@ -39,13 +40,15 @@ class CMLM(MLM):
             vocab_size: Vocabulary size (required for from-scratch training)
             mask_token_id: ID of [MASK] token (auto-detected if None)
             pad_token_id: ID of [PAD] token (auto-detected if None)
+            config_overrides: Dict of config parameters to override (e.g., {'num_hidden_layers': 6})
         """
         super().__init__(
             architecture=architecture,
             pretrained=pretrained,
             vocab_size=vocab_size,
             mask_token_id=mask_token_id,
-            pad_token_id=pad_token_id
+            pad_token_id=pad_token_id,
+            config_overrides=config_overrides
         )
     
     @classmethod
@@ -60,6 +63,9 @@ class CMLM(MLM):
               vocab_size: 50000                   # Optional
               mask_token_id: 103                  # Optional
               pad_token_id: 0                     # Optional
+              config_overrides:                   # Optional: override architecture params
+                num_hidden_layers: 6
+                hidden_size: 512
         
         Args:
             config: Configuration dictionary
@@ -74,7 +80,8 @@ class CMLM(MLM):
             pretrained=model_cfg.get('pretrained'),
             vocab_size=model_cfg.get('vocab_size'),
             mask_token_id=model_cfg.get('mask_token_id'),
-            pad_token_id=model_cfg.get('pad_token_id')
+            pad_token_id=model_cfg.get('pad_token_id'),
+            config_overrides=model_cfg.get('config_overrides')
         )
     
     def uniform_masking(self, input_ids, attention_mask=None):
