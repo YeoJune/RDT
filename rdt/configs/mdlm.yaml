@@ -22,7 +22,7 @@ model:
 
 # Training Strategy
 training:
-  batch_size: 32
+  batch_size: 16
   gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch"
   num_epochs: 3
@@ -67,7 +67,7 @@ mdlm:
 data:
   dataset_name: "wikitext-103"
   streaming: false
-  max_seq_length: 256
+  max_seq_length: 512
 
   # MDLM uses continuous-time masking during training
   # No fixed masking ratio - dynamically sampled per batch based on noise schedule

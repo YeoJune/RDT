@@ -17,7 +17,7 @@ model:
 
 # Training Strategy
 training:
-  batch_size: 32
+  batch_size: 16
   gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch"
   num_epochs: 3
@@ -47,7 +47,7 @@ training:
 data:
   dataset_name: "wikitext-103"
   streaming: false
-  max_seq_length: 256
+  max_seq_length: 512
   mlm_probability: 0.15
 
   tokenizer_name: "bert-base-uncased"
