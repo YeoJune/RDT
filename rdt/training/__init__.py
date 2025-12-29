@@ -1,6 +1,6 @@
 """Training Module"""
 
 from .rdt_trainer import RDTTrainer
-from .baseline_trainer import BaselineTrainer
+from .mlm_trainer import MLMTrainer
 
-__all__ = ['RDTTrainer', 'BaselineTrainer']
+__all__ = ['RDTTrainer', 'MLMTrainer']

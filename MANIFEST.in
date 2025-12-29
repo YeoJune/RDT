@@ -1,15 +1,13 @@
 include README.md
+include INSTALL.md
 include USAGE_GUIDE.md
+include CONTRIBUTING.md
 include LICENSE
-include requirements.txt
 include pyproject.toml
 
 recursive-include rdt/configs *.yaml
-recursive-include configs *.yaml
 
-exclude test_model.py
 exclude .gitignore
-exclude .git
 
 global-exclude __pycache__
 global-exclude *.py[cod]

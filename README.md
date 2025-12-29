@@ -40,10 +40,10 @@ graph LR
     subgraph "Recursive Engine (Latent Space)"
         H_in((h_t)) --> Norm[Input Norm]
         Norm --> Gate{Gate MLP}
-        
+
         Gate --"Noise Level (t)"--> Time[Timestep Embedder]
         Time --"AdaLN Modulation (γ, β)"--> Block[Recursive Denoising Block]
-        
+
         H_in --> Block
         Block --> H_out((h_t+1))
     end
@@ -54,6 +54,7 @@ graph LR
 ```
 
 #### A. Adaptive Layer Normalization (AdaLN)
+
 To effectively reuse weights across different denoising stages, the model injects timestep information directly into the normalization layers. The affine parameters are dynamically generated based on the Gate's output:
 
 $$ \text{AdaLN}(x, t) = (1 + \gamma(t)) \cdot \text{LayerNorm}(x) + \beta(t) $$
@@ -61,23 +62,25 @@ $$ \text{AdaLN}(x, t) = (1 + \gamma(t)) \cdot \text{LayerNorm}(x) + \beta(t) $$
 We utilize a **Zero-Initialization** strategy for $\gamma$ and $\beta$, ensuring that the recursive block starts as an identity function and gradually learns to modulate features as training progresses.
 
 #### B. Self-Regulated Gating Mechanism
+
 RDT includes a lightweight **Gate MLP** that acts as an internal clock. It diagnoses the entropy of the current hidden state to predict the restoration progress ($g_t$).
-*   **Residual Prediction**: The gate predicts the *decrease* in noise ($\Delta$) rather than the absolute value ($g_{t+1} = g_t - \Delta$), ensuring a monotonically decreasing trajectory.
-*   **Adaptive Stopping**: During inference, the recursion terminates automatically when the gate score drops below a threshold.
+
+- **Residual Prediction**: The gate predicts the _decrease_ in noise ($\Delta$) rather than the absolute value ($g_{t+1} = g_t - \Delta$), ensuring a monotonically decreasing trajectory.
+- **Adaptive Stopping**: During inference, the recursion terminates automatically when the gate score drops below a threshold.
 
 ---
 
 ## 📉 Optimization Objectives
 
-The model is trained using a multi-task objective function ($ \mathcal{L}_{total} $) that enforces structural integrity and temporal coherence in the latent space.
+The model is trained using a multi-task objective function ($ \mathcal{L}\_{total} $) that enforces structural integrity and temporal coherence in the latent space.
 
-$$ \mathcal{L}_{total} = \mathcal{L}_{recon} + \lambda_{gate}\mathcal{L}_{gate} + \lambda_{latent}\mathcal{L}_{latent} $$
+$$ \mathcal{L}_{total} = \mathcal{L}_{recon} + \lambda*{gate}\mathcal{L}*{gate} + \lambda*{latent}\mathcal{L}*{latent} $$
 
-| Component | Symbol | Description |
-| :--- | :---: | :--- |
-| **Reconstruction** | $\mathcal{L}_{recon}$ | Cross-Entropy loss applied to the final logits. Ensures the final latent representation decodes into correct tokens. |
-| **Gate Consistency** | $\mathcal{L}_{gate}$ | MSE loss ensuring the Gate MLP accurately estimates the ground-truth restoration percentage ($s_{GT}$). |
-| **Latent Consistency** | $\mathcal{L}_{latent}$ | **The Core Constraint.** We minimize the distance between the recursive state $h_t$ and the "ideal" state encoded from the ground-truth text by the Input Encoder.<br>$$ || h_{pred}^{(t)} - \text{Encoder}(x_{target}) ||^2 $$<br>This acts as **"Teacher Forcing" in the latent space**, simplifying the learning landscape. |
+| Component              |         Symbol         | Description                                                                                                                                                              |
+| :--------------------- | :--------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | ------------------------------------------- | --- | ---------------------------------------------------------------------------------------------------- |
+| **Reconstruction**     | $\mathcal{L}_{recon}$  | Cross-Entropy loss applied to the final logits. Ensures the final latent representation decodes into correct tokens.                                                     |
+| **Gate Consistency**   |  $\mathcal{L}_{gate}$  | MSE loss ensuring the Gate MLP accurately estimates the ground-truth restoration percentage ($s_{GT}$).                                                                  |
+| **Latent Consistency** | $\mathcal{L}_{latent}$ | **The Core Constraint.** We minimize the distance between the recursive state $h_t$ and the "ideal" state encoded from the ground-truth text by the Input Encoder.<br>$$ |     | h*{pred}^{(t)} - \text{Encoder}(x*{target}) |     | ^2 $$<br>This acts as **"Teacher Forcing" in the latent space**, simplifying the learning landscape. |
 
 ---
 
@@ -88,30 +91,39 @@ The project is organized to clearly separate the neural architecture, training l
 ```bash
 rdt/
 ├── models/              # Core Neural Architectures
-│   ├── rdt_model.py        # RDT Implementation (AdaLN, Gate MLP, Recursive Blocks)
-│   ├── baseline_models.py  # Wrappers for BERT/RoBERTa baselines
-│   └── bert_init.py        # Weight initialization utilities
+│   ├── rdt.py              # RDT Implementation (RoPE, MLP I/O, AdaLN, Gate MLP)
+│   ├── mlm.py              # MLM Wrapper for BERT/RoBERTa
+│   ├── cmlm.py             # Conditional MLM (Mask-Predict)
+│   └── bert_init.py        # Pretrained weight initialization utilities
 │
 ├── training/            # Training Logic
 │   ├── rdt_trainer.py      # RDT Trainer (Latent Consistency + Gate Loss)
-│   │   └── Scheduled Sampling # Curriculum learning (GT -> Predicted Gate)
-│   └── baseline_trainer.py # Standard MLM Trainer
+│   │                       #   with Scheduled Sampling for gate predictions
+│   └── mlm_trainer.py      # Standard MLM Trainer for baselines
 │
 ├── data/                # Data Pipeline
-│   ├── datasets.py         # StreamingTextDataset
-│   └── collators.py        # Chain generation ($s_0 \to s_L$) & Masking
+│   ├── datasets.py         # StreamingTextDataset & WikiTextDataset
+│   └── collators.py        # RDTCollator, MLMCollator (masking & chain generation)
+│
+├── evaluation/          # Evaluation Tools
+│   ├── evaluator.py        # Unified evaluator for RDT/MLM/CMLM
+│   └── metrics.py          # Perplexity, Accuracy calculations
 │
 ├── scripts/             # CLI Entry Points
-│   ├── train.py            # Unified training script
-│   ├── evaluate.py         # Evaluation script
-│   ├── inference.py        # Interactive Recursive Inference
-│   └── test_masking.py     # Noise injection testing
+│   ├── train.py            # Unified training script (RDT/MLM/CMLM)
+│   ├── evaluate.py         # Model evaluation script
+│   ├── inference.py        # Interactive inference for all models
+│   ├── test_masking.py     # Masking sensitivity analysis
+│   └── plot_training.py    # Training metrics visualization
 │
 ├── configs/             # Hyperparameter Configurations
 │   ├── base.yaml           # Default RDT configuration
-│   └── experiment.yaml     # Experimental setups
+│   ├── bert_baseline.yaml  # BERT baseline settings
+│   └── roberta_baseline.yaml # RoBERTa baseline settings
 │
-└── utils.py             # Logging & Checkpointing utilities
+└── utils/
+    ├── utils.py            # General utilities & model creation
+    └── logger.py           # Logging utilities
 ```
 
 ---
@@ -123,54 +135,112 @@ rdt/
 git clone https://github.com/YeoJune/rdt.git
 cd rdt
 
-# Install dependencies (Editable mode)
+# Install dependencies (Editable mode for development)
 pip install -e .
+
+# Or install with development tools (pytest, black, flake8, isort)
+pip install -e ".[dev]"
 ```
 
 **Requirements:**
+
 - Python 3.8+
 - PyTorch 2.0+ (with CUDA support recommended)
-- WandB (Optional, for experiment tracking)
+- All dependencies are defined in `pyproject.toml` and installed automatically
 
 ---
 
 ## 🚀 Usage
 
 ### 1. Training
-Train the RDT model using the unified training script. The trainer supports **Scheduled Sampling**, transitioning from Ground-Truth timestamps (Early Training) to Predicted Gate scores (Late Training) to bridge the exposure bias gap.
+
+Train RDT, MLM, or CMLM models using the unified training script. The RDT trainer supports **Scheduled Sampling**, transitioning from Ground-Truth gate scores to Predicted gate scores to reduce exposure bias.
 
 ```bash
-# Train with default configuration (Epoch-based)
-rdt-train --config rdt/configs/base.yaml
+# Train RDT with default configuration
+rdt-train --config rdt/configs/base.yaml --model_type rdt
 
-# Train with specific experiment settings (Step-based)
-rdt-train --config rdt/configs/experiment.yaml --output_dir ./outputs/exp_01
+# Train BERT baseline
+rdt-train --config rdt/configs/bert_baseline.yaml --model_type mlm
+
+# Train CMLM baseline
+rdt-train --config rdt/configs/base.yaml --model_type cmlm --model_name bert-base-uncased
+
+# Custom output directory
+rdt-train --config rdt/configs/base.yaml --output_dir ./checkpoints/exp_01
+
+# Resume from checkpoint
+rdt-train --config rdt/configs/base.yaml --resume ./checkpoints/exp_01/checkpoint_epoch_5.pt
 ```
 
-### 2. Inference (Iterative Denoising)
-Run inference to observe the recursive restoration process. The model uses the **Adaptive Stopping** mechanism to determine when the text is fully restored.
+### 2. Inference
+
+Run inference with any trained model (RDT/MLM/CMLM). RDT uses **Adaptive Stopping** based on gate scores for efficient computation.
 
 ```bash
-python rdt/scripts/inference.py \
-    --checkpoint checkpoints/best_model.pt \
+# Interactive mode - RDT
+rdt-inference --checkpoint checkpoints/rdt_best.pt --model_type rdt --interactive
+
+# Interactive mode - MLM
+rdt-inference --checkpoint checkpoints/mlm_best.pt --model_type mlm --interactive
+
+# Interactive mode - CMLM
+rdt-inference --checkpoint checkpoints/cmlm_best.pt --model_type cmlm --interactive
+
+# Single text inference - RDT
+rdt-inference --checkpoint checkpoints/rdt_best.pt --model_type rdt \
     --text "The quick brown [MASK] jumps over the lazy [MASK]." \
-    --threshold 0.02
+    --max_steps 10 --threshold 0.05
+
+# Single text inference - MLM (single pass)
+rdt-inference --checkpoint checkpoints/mlm_best.pt --model_type mlm \
+    --text "The capital of France is [MASK]."
+
+# Single text inference - CMLM (iterative refinement)
+rdt-inference --checkpoint checkpoints/cmlm_best.pt --model_type cmlm \
+    --text "The quick brown [MASK] jumps over the lazy [MASK]." \
+    --max_iterations 10
 ```
 
-**Output Example:**
+**RDT Output Example:**
+
 ```text
-Step 0 (Gate: 1.00): The quick brown [MASK] jumps over the lazy [MASK].
-Step 1 (Gate: 0.45): The quick brown fox jumps over the lazy [MASK].
-Step 2 (Gate: 0.01): The quick brown fox jumps over the lazy dog.
-> Terminated (Threshold < 0.02)
+[Step 0] Gate: 1.000 | The quick brown [MASK] jumps over the lazy [MASK].
+[Step 1] Gate: 0.782 | The quick brown fox jumps over the lazy [MASK].
+[Step 2] Gate: 0.234 | The quick brown fox jumps over the lazy dog.
+[Step 3] Gate: 0.043 | The quick brown fox jumps over the lazy dog.
+✓ Completed in 3 steps (Gate < 0.05)
 ```
 
 ### 3. Evaluation
-Evaluate the model's Perplexity (PPL) and Reconstruction Accuracy on standard benchmarks.
+
+Evaluate model performance on standard benchmarks. Supports accuracy, BLEU, and BERTScore metrics.
 
 ```bash
-rdt-evaluate --checkpoint checkpoints/best_model.pt --dataset wikitext-2
+# Evaluate RDT model
+rdt-evaluate --checkpoint checkpoints/rdt_best.pt --model_type rdt \
+    --dataset wikitext --split test --mask_ratio 0.5
+
+# Evaluate MLM baseline
+rdt-evaluate --checkpoint checkpoints/mlm_best.pt --model_type mlm \
+    --dataset wikitext --split test
+
+# Evaluate CMLM baseline
+rdt-evaluate --checkpoint checkpoints/cmlm_best.pt --model_type cmlm \
+    --dataset wikitext --split test --max_iterations 10
+
+# Masking sensitivity analysis
+rdt-test-masking --checkpoint checkpoints/rdt_best.pt --model_type rdt \
+    --dataset wikitext --num_samples 100
 ```
+
+**Available Commands:**
+
+- `rdt-train` - Train models (RDT/MLM/CMLM)
+- `rdt-evaluate` - Evaluate trained models
+- `rdt-inference` - Interactive or single-text inference
+- `rdt-test-masking` - Analyze performance across different masking ratios
+- `rdt-plot` - Visualize training metrics from logs
 
 ---
 
@@ -178,9 +248,9 @@ rdt-evaluate --checkpoint checkpoints/best_model.pt --dataset wikitext-2
 
 RDT integrates with **Weights & Biases (W&B)** for real-time experiment tracking.
 
-*   **Training Metrics**: Loss (Total, Recon, Gate, Latent), Learning Rate, Sampling Probability.
-*   **Validation Metrics**: Accuracy, Perplexity, Gate Error.
-*   **Visualizations**: Gate score trajectories, Latent space convergence analysis.
+- **Training Metrics**: Loss (Total, Recon, Gate, Latent), Learning Rate, Sampling Probability.
+- **Validation Metrics**: Accuracy, Perplexity, Gate Error.
+- **Visualizations**: Gate score trajectories, Latent space convergence analysis.
 
 To enable W&B, set `use_wandb: true` in your `configs/base.yaml`.
 

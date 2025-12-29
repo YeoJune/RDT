@@ -5,9 +5,10 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from rdt.models import RDT, BaselineMLM
-from rdt.data import create_dataloaders, create_mlm_dataloaders
-from rdt.training import RDTTrainer, BaselineTrainer
+from rdt.models import RDT, MLM
+from rdt.models.cmlm import CMLM
+from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders
+from rdt.training import RDTTrainer, MLMTrainer
 from rdt.utils import load_config, merge_configs, set_seed, get_device, create_model_from_config
 
 
@@ -84,24 +85,34 @@ def main():
             device=device
         )
         
-    elif model_type == 'mlm':
-        # Baseline MLM model
+    elif model_type in ['mlm', 'cmlm']:
+        # Baseline models (MLM or CMLM)
         print("\n" + "="*60)
-        print("Training Baseline MLM Model")
+        print(f"Training {model_type.upper()} Model")
         print("="*60)
         
         # Create model
         model_name = config['model']['name']
         print(f"\nLoading {model_name}...")
-        model = BaselineMLM(model_name=model_name)
-        print(f"Model loaded: {model.count_parameters()/1e6:.1f}M parameters")
         
-        # Create dataloaders
-        print("\nPreparing MLM data...")
-        train_loader, val_loader = create_mlm_dataloaders(config)
+        if model_type == 'mlm':
+            model = MLM(model_name=model_name)
+            print(f"Model loaded: {model.count_parameters()/1e6:.1f}M parameters")
+            
+            # Create dataloaders with pre-masking
+            print("\nPreparing MLM data...")
+            train_loader, val_loader = create_mlm_dataloaders(config)
+            
+        elif model_type == 'cmlm':
+            model = CMLM(model_name=model_name)
+            print(f"Model loaded: {model.count_parameters()/1e6:.1f}M parameters")
+            
+            # Create dataloaders without pre-masking (masking done on-the-fly)
+            print("\nPreparing CMLM data...")
+            train_loader, val_loader = create_cmlm_dataloaders(config)
         
-        # Create trainer
-        trainer = BaselineTrainer(
+        # Create unified trainer
+        trainer = MLMTrainer(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -110,7 +121,7 @@ def main():
         )
         
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt' or 'mlm'")
+        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', or 'cmlm'")
     
     # Resume from checkpoint or load pretrained weights
     if args.checkpoint:

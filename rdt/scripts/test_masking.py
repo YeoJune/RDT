@@ -6,7 +6,7 @@ import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import AutoTokenizer, AutoModelForMaskedLM, GPT2LMHeadModel, GPT2TokenizerFast
+from transformers import AutoTokenizer, GPT2LMHeadModel, GPT2TokenizerFast
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -17,7 +17,7 @@ from bert_score import score as bert_score
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 import nltk
 
-from rdt.models import RDT
+from rdt.models import RDT, MLM
 from rdt.utils import load_config, get_device
 
 
@@ -230,46 +230,89 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             all_tokens.append(tokens)
             all_texts.append(tokenizer.decode(tokens, skip_special_tokens=True))
     
-    # Process each sample individually for each masking ratio
+    # Process in batches for each masking ratio
     for ratio in mask_ratios:
         print(f"\nProcessing masking ratio: {ratio*100:.0f}%")
         
-        for i in tqdm(range(len(all_tokens)), desc=f"Samples ({ratio*100:.0f}%)"):
-            tokens = all_tokens[i]
-            original_text = all_texts[i]
+        for i in tqdm(range(0, len(all_tokens), batch_size), desc=f"Batches ({ratio*100:.0f}%)"):
+            batch_tokens = all_tokens[i:i+batch_size]
+            batch_texts = all_texts[i:i+batch_size]
             
-            # Create masked input (no padding)
-            masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
+            # Prepare batch with dynamic padding
+            batch_input_ids = []
+            batch_eval_masks = []
+            batch_original_tokens = []
             
-            # Inference (single sample, no padding)
-            with torch.no_grad():
-                input_ids = masked_tokens.unsqueeze(0).to(device)
+            for tokens in batch_tokens:
+                # Create masked input
+                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
                 
-                output_ids, num_steps = model.inference(
-                    input_ids,
+                batch_input_ids.append(masked_tokens)
+                batch_eval_masks.append(eval_mask)
+                batch_original_tokens.append(tokens)
+            
+            # Pad to max length in this batch
+            max_len = max(len(t) for t in batch_input_ids)
+            padded_input_ids = []
+            padded_attention_masks = []
+            
+            for masked_tokens in batch_input_ids:
+                pad_len = max_len - len(masked_tokens)
+                if pad_len > 0:
+                    padded_input_ids.append(
+                        torch.cat([masked_tokens, torch.full((pad_len,), mask_token_id)])
+                    )
+                    padded_attention_masks.append(
+                        torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])
+                    )
+                else:
+                    padded_input_ids.append(masked_tokens)
+                    padded_attention_masks.append(torch.ones(len(masked_tokens)))
+            
+            # Stack into batch tensors
+            batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
+            batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
+            
+            # Batch inference
+            with torch.no_grad():
+                output_ids, steps_taken = model.inference(
+                    batch_input_ids_tensor,
+                    attention_mask=batch_attention_masks_tensor,
                     max_steps=max_steps,
-                    threshold=threshold
+                    threshold=threshold,
+                    return_steps=True
                 )
                 
-                pred_tokens = output_ids.squeeze(0).cpu()
+                pred_tokens_batch = output_ids.cpu()
+                steps_batch = steps_taken.cpu()
             
-            # 1. Exact Match Accuracy
-            accuracy = metric_calc.calculate_exact_match(pred_tokens, tokens, eval_mask)
-            results['exact_match'][ratio].append(accuracy)
-            
-            # 2. Reconstructed text - combine original unmasked + predicted masked tokens
-            reconstructed_tokens = tokens.clone()
-            reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
-            reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
-            
-            results['bertscore'][ratio]['refs'].append(original_text)
-            results['bertscore'][ratio]['preds'].append(reconstructed_text)
-            results['perplexity'][ratio].append(reconstructed_text)
-            results['bleu4'][ratio]['refs'].append(original_text)
-            results['bleu4'][ratio]['preds'].append(reconstructed_text)
-            
-            # 3. Steps taken
-            results['steps'][ratio].append(num_steps)
+            # Process each sample in batch
+            for j in range(len(batch_tokens)):
+                original_tokens = batch_original_tokens[j]
+                eval_mask = batch_eval_masks[j]
+                
+                # Extract predictions (remove padding)
+                pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
+                num_steps = steps_batch[j].item()
+                
+                # 1. Exact Match Accuracy
+                accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
+                results['exact_match'][ratio].append(accuracy)
+                
+                # 2. Reconstructed text - combine original unmasked + predicted masked tokens
+                reconstructed_tokens = original_tokens.clone()
+                reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
+                reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
+                original_text = batch_texts[j]
+                
+                results['bertscore'][ratio]['refs'].append(original_text)
+                results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                results['perplexity'][ratio].append(reconstructed_text)
+                results['bleu4'][ratio]['refs'].append(original_text)
+                results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                
+                # 3. Steps taken
+                results['steps'][ratio].append(num_steps)
     
     # Aggregate results
     aggregated = {
@@ -765,14 +808,16 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             d_model=config['model']['d_model'],
             n_heads=config['model']['n_heads'],
             n_encoder_layers=config['model']['n_encoder_layers'],
-            n_io_layers=config['model']['n_io_layers'],
             d_ff=config['model']['d_ff'],
             dropout=config['model']['dropout'],
             max_seq_len=config['data']['max_seq_length'],
+            input_mlp_hidden=config['model'].get('input_mlp_hidden', [512]),
+            output_mlp_hidden=config['model'].get('output_mlp_hidden', [512]),
             gate_hidden_dim=config['model']['gate_hidden_dim'],
             gate_num_layers=config['model']['gate_num_layers'],
             gate_num_heads=config['model']['gate_num_heads'],
             gate_dropout=config['model']['gate_dropout'],
+            rope_base=config['model'].get('rope_base', 10000.0),
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
         
@@ -798,25 +843,24 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         model_name = f"RDT"
         
     elif model_type == 'mlm':
-        # Load MLM model (BERT/RoBERTa)
+        # Load MLM model (BERT/RoBERTa) using wrapper class
         model_name_hf = config['model']['name']
-        checkpoint_path = Path(checkpoint_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_name_hf)
         
-        if checkpoint_path.is_dir():
-            tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-            model = AutoModelForMaskedLM.from_pretrained(checkpoint_path)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(model_name_hf)
-            model = AutoModelForMaskedLM.from_pretrained(model_name_hf)
-            
-            if checkpoint_path.suffix == '.pt':
-                checkpoint = torch.load(checkpoint_path, map_location='cpu')
-                if 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                elif 'state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['state_dict'])
-                else:
-                    model.load_state_dict(checkpoint)
+        # Use MLM wrapper class to match checkpoint keys
+        model = MLM(model_name=model_name_hf)
+        
+        checkpoint_path = Path(checkpoint_path)
+        if checkpoint_path.suffix == '.pt':
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            # MLM wrapper handles 'model.' prefix in state_dict keys
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            elif 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+        # If checkpoint_path is not .pt, use pretrained weights (already loaded in MLM())
         
         model = model.to(device)
         model.eval()

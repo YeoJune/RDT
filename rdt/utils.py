@@ -212,7 +212,7 @@ def create_model_from_config(config: Dict, vocab_size: int):
     Returns:
         RDT model instance
     """
-    from .models.rdt_model import RDT
+    from .models.rdt import RDT
     
     model_config = config['model']
     use_bert_init = model_config.get('use_bert_init', False)
@@ -235,14 +235,16 @@ def create_model_from_config(config: Dict, vocab_size: int):
             d_model=d_model,
             n_heads=model_config['n_heads'],
             n_encoder_layers=model_config['n_encoder_layers'],
-            n_io_layers=model_config['n_io_layers'],
             d_ff=model_config['d_ff'],
             dropout=model_config['dropout'],
             max_seq_len=config['data']['max_seq_length'],
+            input_mlp_hidden=model_config.get('input_mlp_hidden', [512]),
+            output_mlp_hidden=model_config.get('output_mlp_hidden', [512]),
             gate_hidden_dim=model_config['gate_hidden_dim'],
             gate_num_layers=model_config['gate_num_layers'],
             gate_num_heads=model_config['gate_num_heads'],
             gate_dropout=model_config.get('gate_dropout', 0.1),
+            rope_base=model_config.get('rope_base', 10000.0),
             gradient_checkpointing=model_config.get('gradient_checkpointing', False),
             verbose=True
         )
@@ -253,14 +255,16 @@ def create_model_from_config(config: Dict, vocab_size: int):
             d_model=model_config['d_model'],
             n_heads=model_config['n_heads'],
             n_encoder_layers=model_config['n_encoder_layers'],
-            n_io_layers=model_config['n_io_layers'],
             d_ff=model_config['d_ff'],
             dropout=model_config['dropout'],
             max_seq_len=config['data']['max_seq_length'],
+            input_mlp_hidden=model_config.get('input_mlp_hidden', [512]),
+            output_mlp_hidden=model_config.get('output_mlp_hidden', [512]),
             gate_hidden_dim=model_config['gate_hidden_dim'],
             gate_num_layers=model_config['gate_num_layers'],
             gate_num_heads=model_config['gate_num_heads'],
             gate_dropout=model_config.get('gate_dropout', 0.1),
+            rope_base=model_config.get('rope_base', 10000.0),
             gradient_checkpointing=model_config.get('gradient_checkpointing', False)
         )
     

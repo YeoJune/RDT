@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 import math
 
-from ..models.rdt_model import RDT
+from ..models.rdt import RDT
 from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters, CSVLogger
 
 

@@ -1,15 +1,16 @@
-"""Inference script for RDT"""
+"""Unified inference script for RDT, MLM, and CMLM models"""
 
 import argparse
 import torch
 from transformers import AutoTokenizer
 
-from rdt.models import RDT
-from rdt.utils import load_config, load_checkpoint, get_device
+from rdt.models import RDT, MLM
+from rdt.models.cmlm import CMLM
+from rdt.utils import load_config, load_checkpoint, get_device, create_model_from_config
 
 
-def inference_interactive(model, tokenizer, device, max_steps=20, threshold=0.5):
-    """Interactive inference mode"""
+def inference_interactive_rdt(model, tokenizer, device, max_steps=20, threshold=0.5):
+    """Interactive inference mode for RDT"""
     model.eval()
     
     print("\n" + "="*50)
@@ -37,12 +38,16 @@ def inference_interactive(model, tokenizer, device, max_steps=20, threshold=0.5)
         )
         
         input_ids = encoded['input_ids'].to(device)
+        attention_mask = encoded.get('attention_mask')
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
         
         # Inference
         print("\nRunning inference...")
         with torch.no_grad():
             output_ids, num_steps = model.inference(
                 input_ids,
+                attention_mask=attention_mask,
                 max_steps=max_steps,
                 threshold=threshold
             )
@@ -57,8 +62,121 @@ def inference_interactive(model, tokenizer, device, max_steps=20, threshold=0.5)
         print("-" * 50 + "\n")
 
 
-def inference_single(model, tokenizer, device, text, max_steps=20, threshold=0.5):
-    """Single text inference"""
+def inference_interactive_mlm(model, tokenizer, device):
+    """Interactive inference mode for MLM (single-pass)"""
+    model.eval()
+    
+    print("\n" + "="*50)
+    print("MLM Interactive Inference (Single-pass)")
+    print("Enter text with [MASK] tokens (or 'quit' to exit)")
+    print("="*50 + "\n")
+    
+    while True:
+        # Get input
+        text = input("Input text: ").strip()
+        
+        if text.lower() in ['quit', 'exit', 'q']:
+            break
+        
+        if not text:
+            continue
+        
+        # Tokenize
+        encoded = tokenizer(
+            text,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+        
+        input_ids = encoded['input_ids'].to(device)
+        attention_mask = encoded.get('attention_mask')
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        
+        # Inference
+        print("\nRunning inference...")
+        with torch.no_grad():
+            logits = model(input_ids, attention_mask)
+            output_ids = logits.argmax(dim=-1)
+        
+        # Decode
+        output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        
+        # Display results
+        print(f"\nInput:  {text}")
+        print(f"Output: {output_text}")
+        print("-" * 50 + "\n")
+
+
+def inference_interactive_cmlm(model, tokenizer, device, max_iterations=10):
+    """Interactive inference mode for CMLM (iterative refinement)"""
+    model.eval()
+    
+    print("\n" + "="*50)
+    print(f"CMLM Interactive Inference ({max_iterations} iterations)")
+    print("Enter text (will be fully masked and reconstructed)")
+    print("Or enter text with [MASK] tokens for partial reconstruction")
+    print("Type 'quit' to exit")
+    print("="*50 + "\n")
+    
+    while True:
+        # Get input
+        text = input("Input text: ").strip()
+        
+        if text.lower() in ['quit', 'exit', 'q']:
+            break
+        
+        if not text:
+            continue
+        
+        # Tokenize
+        encoded = tokenizer(
+            text,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+        
+        input_ids = encoded['input_ids'].to(device)
+        attention_mask = encoded.get('attention_mask')
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        
+        # Mask all non-special tokens if no [MASK] in input
+        if tokenizer.mask_token_id not in input_ids:
+            masked_input_ids = torch.full_like(input_ids, tokenizer.mask_token_id)
+            # Keep special tokens
+            special_mask = (input_ids == tokenizer.cls_token_id) | \
+                          (input_ids == tokenizer.sep_token_id) | \
+                          (input_ids == tokenizer.pad_token_id)
+            masked_input_ids[special_mask] = input_ids[special_mask]
+        else:
+            masked_input_ids = input_ids
+        
+        # Inference
+        print("\nRunning inference...")
+        with torch.no_grad():
+            output_ids, _ = model.inference(
+                masked_input_ids,
+                attention_mask=attention_mask,
+                max_iterations=max_iterations
+            )
+        
+        # Decode
+        output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        
+        # Display results
+        print(f"\nInput:  {text}")
+        print(f"Output: {output_text}")
+        print(f"Iterations: {max_iterations}")
+        print("-" * 50 + "\n")
+
+
+def inference_single(model, tokenizer, device, text, model_type='rdt', **kwargs):
+    """Single text inference for any model type"""
     model.eval()
     
     # Tokenize
@@ -71,35 +189,72 @@ def inference_single(model, tokenizer, device, text, max_steps=20, threshold=0.5
     )
     
     input_ids = encoded['input_ids'].to(device)
+    attention_mask = encoded.get('attention_mask')
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
     
-    # Inference
+    # Inference based on model type
     with torch.no_grad():
-        output_ids, num_steps = model.inference(
-            input_ids,
-            max_steps=max_steps,
-            threshold=threshold
-        )
-    
-    # Decode
-    output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    
-    return output_text, num_steps
+        if model_type == 'rdt':
+            max_steps = kwargs.get('max_steps', 20)
+            threshold = kwargs.get('threshold', 0.5)
+            output_ids, num_steps = model.inference(
+                input_ids,
+                attention_mask=attention_mask,
+                max_steps=max_steps,
+                threshold=threshold
+            )
+            output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            return output_text, num_steps
+            
+        elif model_type == 'mlm':
+            logits = model(input_ids, attention_mask)
+            output_ids = logits.argmax(dim=-1)
+            output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            return output_text, 1
+            
+        elif model_type == 'cmlm':
+            max_iterations = kwargs.get('max_iterations', 10)
+            
+            # Mask input if no [MASK] tokens present
+            if tokenizer.mask_token_id not in input_ids:
+                masked_input_ids = torch.full_like(input_ids, tokenizer.mask_token_id)
+                special_mask = (input_ids == tokenizer.cls_token_id) | \
+                              (input_ids == tokenizer.sep_token_id) | \
+                              (input_ids == tokenizer.pad_token_id)
+                masked_input_ids[special_mask] = input_ids[special_mask]
+            else:
+                masked_input_ids = input_ids
+            
+            output_ids, _ = model.inference(
+                masked_input_ids,
+                attention_mask=attention_mask,
+                max_iterations=max_iterations
+            )
+            output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            return output_text, max_iterations
 
 
 def main():
-    parser = argparse.ArgumentParser(description='RDT Inference')
+    parser = argparse.ArgumentParser(description='Unified Model Inference (RDT/MLM/CMLM)')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default=None,
                         help='Path to config file (optional, will use checkpoint config)')
     parser.add_argument('--text', type=str, default=None,
-                        help='Input text to denoise')
-    parser.add_argument('--max_steps', type=int, default=20,
-                        help='Maximum number of recursive steps')
+                        help='Input text for inference')
     parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use')
+                        help='Device to use (cuda/cpu)')
     parser.add_argument('--interactive', action='store_true',
                         help='Run in interactive mode')
+    # RDT-specific args
+    parser.add_argument('--max-steps', type=int, default=20,
+                        help='Maximum number of recursive steps (RDT)')
+    parser.add_argument('--threshold', type=float, default=None,
+                        help='Gate threshold for stopping (RDT)')
+    # CMLM-specific args
+    parser.add_argument('--max-iterations', type=int, default=10,
+                        help='Maximum mask-predict iterations (CMLM)')
     
     args = parser.parse_args()
     
@@ -117,45 +272,85 @@ def main():
     device = get_device(args.device)
     print(f"Using device: {device}")
     
+    # Determine model type
+    model_type = config.get('model_type', 'rdt').lower()
+    print(f"Model type: {model_type.upper()}")
+    
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
-    vocab_size = tokenizer.vocab_size
+    if model_type == 'rdt':
+        tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
+    else:  # mlm or cmlm
+        model_name = config['model']['name']
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Create model
+    # Create and load model
     print("Creating model...")
-    model = RDT(
-        vocab_size=vocab_size,
-        d_model=config['model']['d_model'],
-        n_heads=config['model']['n_heads'],
-        n_encoder_layers=config['model']['n_encoder_layers'],
-        n_io_layers=config['model']['n_io_layers'],
-        d_ff=config['model']['d_ff'],
-        dropout=config['model']['dropout'],
-        max_seq_len=config['data']['max_seq_length'],
-        gate_hidden_dim=config['model']['gate_hidden_dim'],
-        gate_num_layers=config['model']['gate_num_layers'],
-        gate_num_heads=config['model']['gate_num_heads'],
-        gate_dropout=config['model']['gate_dropout'],
-        gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
-    )
+    if model_type == 'rdt':
+        vocab_size = tokenizer.vocab_size
+        model = create_model_from_config(config, vocab_size)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+    elif model_type == 'mlm':
+        model_name = config['model']['name']
+        model = MLM(model_name=model_name)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+    elif model_type == 'cmlm':
+        model_name = config['model']['name']
+        model = CMLM(model_name=model_name)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
     
-    # Load weights
-    model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
     
-    print(f"Model loaded (epoch {checkpoint['epoch']}, step {checkpoint['step']})")
+    print(f"Model loaded (epoch {checkpoint.get('epoch', 0)}, step {checkpoint.get('step', 0)})")
+    
+    # Get model-specific parameters
+    if model_type == 'rdt':
+        threshold = args.threshold if args.threshold is not None else config['model'].get('threshold', 0.02)
+        max_steps = args.max_steps
+        print(f"RDT parameters: max_steps={max_steps}, threshold={threshold}")
+    elif model_type == 'cmlm':
+        max_iterations = args.max_iterations
+        print(f"CMLM parameters: max_iterations={max_iterations}")
     
     # Run inference
     if args.interactive:
-        inference_interactive(model, tokenizer, device, args.max_steps, config['model']['threshold'])
+        if model_type == 'rdt':
+            inference_interactive_rdt(model, tokenizer, device, max_steps, threshold)
+        elif model_type == 'mlm':
+            inference_interactive_mlm(model, tokenizer, device)
+        elif model_type == 'cmlm':
+            inference_interactive_cmlm(model, tokenizer, device, max_iterations)
+            
     elif args.text:
-        output_text, num_steps = inference_single(
-            model, tokenizer, device, args.text, args.max_steps, config['model']['threshold']
-        )
-        print(f"\nInput:  {args.text}")
-        print(f"Output: {output_text}")
-        print(f"Steps:  {num_steps}/{args.max_steps}")
+        if model_type == 'rdt':
+            output_text, num_steps = inference_single(
+                model, tokenizer, device, args.text, model_type='rdt',
+                max_steps=max_steps, threshold=threshold
+            )
+            print(f"\nInput:  {args.text}")
+            print(f"Output: {output_text}")
+            print(f"Steps:  {num_steps}/{max_steps}")
+            
+        elif model_type == 'mlm':
+            output_text, _ = inference_single(
+                model, tokenizer, device, args.text, model_type='mlm'
+            )
+            print(f"\nInput:  {args.text}")
+            print(f"Output: {output_text}")
+            
+        elif model_type == 'cmlm':
+            output_text, iterations = inference_single(
+                model, tokenizer, device, args.text, model_type='cmlm',
+                max_iterations=max_iterations
+            )
+            print(f"\nInput:  {args.text}")
+            print(f"Output: {output_text}")
+            print(f"Iterations: {iterations}")
     else:
         print("Please specify --text for single inference or --interactive for interactive mode")
 

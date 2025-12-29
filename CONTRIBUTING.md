@@ -21,19 +21,21 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 ### 3. Install in Development Mode
 
 ```bash
+# Install with all dependencies and development tools
 pip install -e ".[dev]"
 ```
 
 This installs:
+
 - RDT package in editable mode
-- All dependencies
+- All dependencies from pyproject.toml
 - Development tools (pytest, black, flake8, isort)
 
 ### 4. Verify Installation
 
 ```bash
-python check_compatibility.py
-python test_model.py
+python -c "import rdt; print(rdt.__version__)"
+python -c "from rdt.models import RDT, MLM, CMLM; print('OK')"
 ```
 
 ## Code Style
@@ -51,6 +53,7 @@ black --check rdt/
 ```
 
 Configuration in `pyproject.toml`:
+
 - Line length: 100
 - Target Python: 3.8+
 
@@ -75,8 +78,8 @@ flake8 rdt/
 ### Run Tests
 
 ```bash
-# Run model tests
-python test_model.py
+# Quick import test
+python -c "from rdt.models import RDT, MLM, CMLM; print('Models OK')"
 
 # Run pytest (if test suite exists)
 pytest tests/
@@ -138,6 +141,7 @@ git commit -m "Add feature: description"
 ```
 
 Commit message format:
+
 - `feat:` New feature
 - `fix:` Bug fix
 - `docs:` Documentation
@@ -174,17 +178,19 @@ rdt/
 #### New Model Component
 
 Add to `rdt/model.py`:
+
 ```python
 class NewComponent(nn.Module):
     """Description"""
     def __init__(self, ...):
         ...
-    
+
     def forward(self, x):
         ...
 ```
 
 Export in `rdt/__init__.py`:
+
 ```python
 from .model import NewComponent
 __all__ = [..., "NewComponent"]
@@ -193,12 +199,11 @@ __all__ = [..., "NewComponent"]
 #### New Configuration
 
 Add to `rdt/configs/`:
+
 ```yaml
 # new_config.yaml
-model:
-  ...
-training:
-  ...
+model: ...
+training: ...
 ```
 
 Update docs in `USAGE_GUIDE.md`.
@@ -206,6 +211,7 @@ Update docs in `USAGE_GUIDE.md`.
 #### New Script
 
 Add to `rdt/scripts/`:
+
 ```python
 # new_script.py
 def main():
@@ -216,6 +222,7 @@ if __name__ == '__main__':
 ```
 
 Add entry point in `setup.py`:
+
 ```python
 entry_points={
     'console_scripts': [
@@ -233,16 +240,16 @@ Use Google-style docstrings:
 ```python
 def function(arg1: int, arg2: str) -> bool:
     """One-line summary.
-    
+
     Longer description if needed.
-    
+
     Args:
         arg1: Description of arg1
         arg2: Description of arg2
-    
+
     Returns:
         Description of return value
-    
+
     Example:
         >>> result = function(1, "test")
         >>> print(result)
@@ -254,6 +261,7 @@ def function(arg1: int, arg2: str) -> bool:
 ### Update Documentation
 
 When adding features:
+
 1. Update docstrings
 2. Update README.md (if user-facing)
 3. Update USAGE_GUIDE.md (for detailed usage)
@@ -264,11 +272,13 @@ When adding features:
 ### 1. Update Version
 
 In `rdt/__init__.py` and `setup.py`:
+
 ```python
 __version__ = "0.2.0"
 ```
 
 In `pyproject.toml`:
+
 ```toml
 version = "0.2.0"
 ```
@@ -276,17 +286,21 @@ version = "0.2.0"
 ### 2. Update Changelog
 
 Create or update `CHANGELOG.md`:
+
 ```markdown
 ## [0.2.0] - 2024-XX-XX
 
 ### Added
+
 - New feature X
 - New feature Y
 
 ### Fixed
+
 - Bug fix Z
 
 ### Changed
+
 - Improvement W
 ```
 
@@ -322,6 +336,7 @@ twine upload dist/*
 ### Reporting Bugs
 
 Include:
+
 - Python and package versions
 - Operating system
 - Full error traceback
@@ -330,6 +345,7 @@ Include:
 ### Requesting Features
 
 Include:
+
 - Use case description
 - Proposed API/interface
 - Example usage
@@ -343,6 +359,7 @@ Include:
 ## Code Review
 
 Pull requests will be reviewed for:
+
 - Code quality and style
 - Test coverage
 - Documentation
@@ -357,6 +374,7 @@ By contributing, you agree that your contributions will be licensed under the MI
 ## Questions?
 
 Feel free to:
+
 - Open an issue
 - Start a discussion
 - Contact maintainers

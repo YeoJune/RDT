@@ -8,12 +8,14 @@
 # Clone or download the repository
 cd RDT
 
-# Install in editable mode
+# Install in editable mode with all dependencies
 pip install -e .
 
 # Or install with development dependencies
 pip install -e ".[dev]"
 ```
+
+**Note:** All dependencies are defined in `pyproject.toml` and installed automatically.
 
 ### From PyPI (When Published)
 
@@ -29,11 +31,12 @@ pip install rdt-transformer
 # Test import
 python -c "import rdt; print(rdt.__version__)"
 
-# Run model tests
-python test_model.py
+# Test model import
+python -c "from rdt.models import RDT, MLM, CMLM; print('Models loaded successfully')"
 
 # Check CLI commands
 rdt-train --help
+rdt-evaluate --help
 rdt-inference --help
 ```
 
@@ -53,49 +56,61 @@ rdt-inference --checkpoint checkpoints/best_model.pt --text "Hello world"
 ## Installation Options
 
 ### Standard Installation
+
 ```bash
 pip install rdt-transformer
+# or for development
+pip install -e .
 ```
 
 Includes:
-- Core dependencies (torch, transformers, etc.)
-- Command-line tools (rdt-train, rdt-inference)
+
+- Core dependencies (torch, transformers, datasets, etc.)
+- Evaluation metrics (bert-score, nltk)
+- Training tools (wandb, matplotlib)
+- Command-line tools (rdt-train, rdt-evaluate, rdt-inference, etc.)
 - Configuration files
 
 ### Development Installation
+
 ```bash
 pip install -e ".[dev]"
 ```
 
 Additional tools:
+
 - pytest (testing)
 - black (code formatting)
 - flake8 (linting)
 - isort (import sorting)
 
-### Minimal Installation
+### Minimal Installation (Not Recommended)
+
 ```bash
 pip install --no-deps rdt-transformer
 # Then manually install only what you need
-pip install torch transformers
+pip install torch transformers datasets
 ```
 
 ## Requirements
 
 ### Python Version
+
 - Python >= 3.8
 - Tested on: 3.8, 3.9, 3.10, 3.11
 
 ### Core Dependencies
-- torch >= 2.0.0
-- transformers >= 4.30.0
-- datasets >= 2.14.0
-- pyyaml >= 6.0
-- tensorboard >= 2.13.0
-- tqdm >= 4.65.0
-- numpy >= 1.24.0
+
+All dependencies are specified in `pyproject.toml`:
+
+- **Deep Learning**: torch >= 2.0.0, transformers >= 4.30.0
+- **Data Processing**: datasets >= 2.14.0, numpy >= 1.24.0
+- **Evaluation**: bert-score >= 0.3.13, nltk >= 3.8
+- **Training & Logging**: wandb >= 0.16.0, matplotlib >= 3.5.0
+- **Utilities**: pyyaml >= 6.0, tqdm >= 4.65.0
 
 ### Hardware Requirements
+
 - **Minimum**: 8GB RAM, CPU only
 - **Recommended**: 16GB RAM, NVIDIA GPU (4GB+ VRAM)
 - **Optimal**: 32GB RAM, NVIDIA GPU (8GB+ VRAM)
@@ -103,12 +118,14 @@ pip install torch transformers
 ## Platform-Specific Notes
 
 ### Linux (Ubuntu/Debian)
+
 ```bash
 # No additional steps needed
 pip install rdt-transformer
 ```
 
 ### macOS
+
 ```bash
 # Install with CPU-only PyTorch (recommended for M1/M2)
 pip install rdt-transformer
@@ -117,6 +134,7 @@ pip install rdt-transformer
 ```
 
 ### Windows
+
 ```bash
 # Standard installation
 pip install rdt-transformer
@@ -130,6 +148,7 @@ pip install transformers datasets pyyaml tensorboard tqdm numpy
 ## GPU Support
 
 ### CUDA (NVIDIA GPUs)
+
 ```bash
 # Install PyTorch with CUDA 11.8
 pip install torch --index-url https://download.pytorch.org/whl/cu118
@@ -139,6 +158,7 @@ pip install rdt-transformer
 ```
 
 ### ROCm (AMD GPUs)
+
 ```bash
 # Install PyTorch with ROCm
 pip install torch --index-url https://download.pytorch.org/whl/rocm5.6
@@ -148,6 +168,7 @@ pip install rdt-transformer
 ```
 
 ### MPS (Apple Silicon)
+
 ```bash
 # Standard installation (MPS support included in PyTorch 2.0+)
 pip install rdt-transformer
@@ -156,6 +177,7 @@ pip install rdt-transformer
 ## Troubleshooting
 
 ### Import Errors
+
 ```bash
 # If "No module named 'rdt'" error:
 pip install --force-reinstall rdt-transformer
@@ -167,6 +189,7 @@ pip install -e .
 ```
 
 ### PyTorch Installation Issues
+
 ```bash
 # Remove existing PyTorch
 pip uninstall torch torchvision torchaudio
@@ -176,6 +199,7 @@ pip install torch==2.0.0 --index-url https://download.pytorch.org/whl/cu118
 ```
 
 ### CUDA Version Mismatch
+
 ```bash
 # Check CUDA version
 nvidia-smi
@@ -189,6 +213,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
 ### Memory Issues
+
 ```bash
 # Reduce batch size in config
 training:
@@ -196,6 +221,7 @@ training:
 ```
 
 ### Dataset Download Issues
+
 ```bash
 # If Hugging Face datasets fails, set cache directory:
 export HF_DATASETS_CACHE="/path/to/cache"
@@ -208,6 +234,7 @@ dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', cache_dir='/path/to/cach
 ## Virtual Environment (Recommended)
 
 ### Using venv
+
 ```bash
 # Create virtual environment
 python -m venv rdt-env
@@ -221,6 +248,7 @@ pip install rdt-transformer
 ```
 
 ### Using conda
+
 ```bash
 # Create conda environment
 conda create -n rdt python=3.10
@@ -286,6 +314,7 @@ CMD ["rdt-train", "--config", "rdt/configs/base.yaml"]
 ```
 
 Build and run:
+
 ```bash
 docker build -t rdt .
 docker run -v $(pwd)/checkpoints:/app/checkpoints rdt
@@ -294,6 +323,7 @@ docker run -v $(pwd)/checkpoints:/app/checkpoints rdt
 ## Verifying Installation
 
 ### Quick Test
+
 ```python
 import torch
 import rdt
@@ -317,6 +347,7 @@ print(f"✓ Model works! Output shape: {logits.shape}")
 ```
 
 ### Full Test
+
 ```bash
 # Run provided test script
 python test_model.py
@@ -346,6 +377,7 @@ If installation issues persist:
 ## Next Steps
 
 After successful installation:
+
 1. Read [USAGE_GUIDE.md](USAGE_GUIDE.md) for detailed usage
 2. Check [README.md](README.md) for quick start
 3. Explore configuration files in `rdt/configs/`

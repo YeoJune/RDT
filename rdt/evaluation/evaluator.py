@@ -21,21 +21,21 @@ class Evaluator:
     def __init__(self, model, device: torch.device, model_type: str = 'rdt'):
         """
         Args:
-            model: Model to evaluate (RDT or BaselineMLM)
+            model: Model to evaluate (RDT, MLM, or CMLM)
             device: Device to run evaluation on
-            model_type: 'rdt' or 'mlm'
+            model_type: 'rdt', 'mlm', or 'cmlm'
         """
         self.model = model
         self.device = device
         self.model_type = model_type.lower()
         
-        if self.model_type not in ['rdt', 'mlm']:
-            raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt' or 'mlm'")
+        if self.model_type not in ['rdt', 'mlm', 'cmlm']:
+            raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', or 'cmlm'")
     
     def evaluate_rdt(self, dataloader: DataLoader, max_steps: int = 20,
                      threshold: float = 0.02) -> Dict[str, float]:
         """
-        Evaluate RDT model.
+        Evaluate RDT model with batch processing.
         
         Args:
             dataloader: DataLoader with RDT format data
@@ -49,7 +49,7 @@ class Evaluator:
         total_loss = 0
         total_accuracy = 0
         total_steps_taken = 0
-        num_batches = 0
+        num_samples = 0
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Evaluating RDT", leave=False):
@@ -64,35 +64,31 @@ class Evaluator:
                 
                 batch_size = input_ids.size(0)
                 
+                # Batch inference using model.inference()
+                output_ids, steps_taken = self.model.inference(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    max_steps=max_steps,
+                    threshold=threshold,
+                    return_steps=True
+                )
+                
+                # Decode to get logits
+                # Need to get logits for metric calculation
+                # Use model's output projection
+                hidden = self.model.token_embedding(output_ids)
+                logits = self.model.decode(hidden, attention_mask=attention_mask)
+                
+                # Calculate metrics for each sample
                 for b in range(batch_size):
                     chain_len = chain_lengths[b].item()
-                    x = input_ids[b:b+1]
-                    mask = attention_mask[b:b+1] if attention_mask is not None else None
                     
-                    # Recursive inference
-                    hidden, gate_pred, pooled = self.model(x, attention_mask=mask, is_first_step=True)
-                    step = 1
-                    
-                    while step < max_steps and gate_pred.mean().item() > threshold:
-                        hidden, gate_pred, pooled = self.model(
-                            hidden,
-                            attention_mask=mask,
-                            last_gate_score=gate_pred,
-                            last_pooled=pooled,
-                            is_first_step=False
-                        )
-                        step += 1
-                    
-                    # Final decode
-                    logits = self.model.decode(hidden, attention_mask=mask)
-                    
-                    # Calculate metrics on last target
                     if chain_len > 0:
                         target = targets[b, 0]  # Use first target
                         loss_mask = loss_masks[b, 0]
                         
                         # Apply loss mask
-                        masked_logits = logits[0][loss_mask]
+                        masked_logits = logits[b][loss_mask]
                         masked_target = target[loss_mask]
                         
                         if masked_target.numel() > 0:
@@ -104,15 +100,15 @@ class Evaluator:
                             total_loss += metrics['loss']
                             total_accuracy += metrics['accuracy']
                     
-                    total_steps_taken += step
-                    num_batches += 1
+                    total_steps_taken += steps_taken[b].item()
+                    num_samples += 1
         
-        if num_batches == 0:
+        if num_samples == 0:
             return {'loss': 0.0, 'accuracy': 0.0, 'perplexity': float('inf'), 'avg_steps': 0}
         
-        avg_loss = total_loss / num_batches
-        avg_accuracy = total_accuracy / num_batches
-        avg_steps = total_steps_taken / num_batches
+        avg_loss = total_loss / num_samples
+        avg_accuracy = total_accuracy / num_samples
+        avg_steps = total_steps_taken / num_samples
         perplexity = torch.exp(torch.tensor(avg_loss)).item()
         
         return {
@@ -172,6 +168,86 @@ class Evaluator:
             'perplexity': perplexity
         }
     
+    def evaluate_cmlm(self, dataloader: DataLoader, max_iterations: int = 10) -> Dict[str, float]:
+        """
+        Evaluate CMLM (Conditional Masked Language Model) with iterative refinement.
+        
+        Args:
+            dataloader: DataLoader with CMLM format data (original tokens)
+            max_iterations: Maximum number of mask-predict iterations (fixed, as per paper)
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        self.model.eval()
+        total_loss = 0
+        total_accuracy = 0
+        total_top5_accuracy = 0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Evaluating CMLM", leave=False):
+                input_ids = batch['input_ids'].to(self.device)  # Original tokens
+                attention_mask = batch.get('attention_mask')
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+                
+                # CMLM inference with fixed iterations
+                # Starts from fully masked and iteratively refines
+                batch_size, seq_len = input_ids.shape
+                
+                # Start with all masks
+                masked_input_ids = torch.full_like(input_ids, self.model.mask_token_id)
+                
+                # Copy special tokens (CLS, SEP, PAD)
+                if attention_mask is not None:
+                    special_mask = attention_mask == 0
+                else:
+                    special_mask = input_ids == self.model.pad_token_id
+                masked_input_ids[special_mask] = input_ids[special_mask]
+                
+                # Iterative refinement
+                output_ids, _ = self.model.inference(
+                    masked_input_ids,
+                    attention_mask=attention_mask,
+                    max_iterations=max_iterations,
+                    return_steps=False
+                )
+                
+                # Get final logits for metric calculation
+                logits = self.model(output_ids, attention_mask)
+                
+                # Create labels (all tokens except special tokens)
+                labels = input_ids.clone()
+                if attention_mask is not None:
+                    labels[attention_mask == 0] = -100
+                else:
+                    labels[input_ids == self.model.pad_token_id] = -100
+                
+                # Calculate metrics
+                metrics = calculate_metrics(logits, labels, ignore_index=-100)
+                
+                total_loss += metrics['loss']
+                total_accuracy += metrics['accuracy']
+                total_top5_accuracy += metrics['top5_accuracy']
+                num_batches += 1
+        
+        if num_batches == 0:
+            return {'loss': 0.0, 'accuracy': 0.0, 'perplexity': float('inf'), 'iterations': max_iterations}
+        
+        avg_loss = total_loss / num_batches
+        avg_accuracy = total_accuracy / num_batches
+        avg_top5_accuracy = total_top5_accuracy / num_batches
+        perplexity = torch.exp(torch.tensor(avg_loss)).item()
+        
+        return {
+            'loss': avg_loss,
+            'accuracy': avg_accuracy,
+            'top5_accuracy': avg_top5_accuracy,
+            'perplexity': perplexity,
+            'iterations': max_iterations
+        }
+    
     def evaluate(self, dataloader: DataLoader, **kwargs) -> Dict[str, float]:
         """
         Unified evaluation interface.
@@ -189,6 +265,11 @@ class Evaluator:
                 dataloader,
                 max_steps=kwargs.get('max_steps', 20),
                 threshold=kwargs.get('threshold', 0.02)
+            )
+        elif self.model_type == 'cmlm':
+            return self.evaluate_cmlm(
+                dataloader,
+                max_iterations=kwargs.get('max_iterations', 10)
             )
         else:  # mlm
             return self.evaluate_mlm(dataloader)

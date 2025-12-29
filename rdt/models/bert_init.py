@@ -45,12 +45,11 @@ def load_bert_weights_to_rdt(
     num_bert_layers = bert_config.num_hidden_layers
     num_rdt_main = len(rdt_model.encoder_layers)
     
-    # Validate layer compatibility
-    required_layers = 1 + num_rdt_main + 1  # input + main + output
-    if num_bert_layers < required_layers:
+    # Validate layer compatibility (only need main encoder layers)
+    if num_bert_layers < num_rdt_main:
         raise ValueError(
-            f"BERT has only {num_bert_layers} layers but RDT needs {required_layers} "
-            f"(1 input + {num_rdt_main} main + 1 output). "
+            f"BERT has only {num_bert_layers} layers but RDT needs {num_rdt_main} "
+            f"main encoder layers. "
             f"Use a larger BERT model (e.g., 'bert-base-uncased' with 12 layers) "
             f"or reduce n_encoder_layers."
         )
@@ -64,11 +63,9 @@ def load_bert_weights_to_rdt(
     
     if verbose:
         print(f"BERT: {num_bert_layers} layers, d_model={bert_config.hidden_size}")
-        print(f"RDT: 1 (input) + {num_rdt_main} (main) + 1 (output) = {required_layers} layers")
+        print(f"RDT: {num_rdt_main} main encoder layers")
         print(f"\nLayer Mapping Strategy:")
-        print(f"  BERT[0]     → RDT Input Encoder  (syntactic features)")
-        print(f"  BERT[1-{num_rdt_main}]  → RDT Main Encoder   (semantic features)")
-        print(f"  BERT[{num_bert_layers-1}]     → RDT Output Decoder (task features)")
+        print(f"  BERT[0-{num_rdt_main-1}]  → RDT Main Encoder (semantic features)")
         print()
     
     # =========================================================================
@@ -85,58 +82,40 @@ def load_bert_weights_to_rdt(
         print(f"  ✓ Token embedding: {bert.embeddings.word_embeddings.weight.shape}")
     
     # =========================================================================
-    # Step 1.5: Copy Position Embeddings
+    # Step 2: Copy Main Encoder Only (BERT Layers 0 to num_rdt_main-1)
     # =========================================================================
     if verbose:
-        print("\n[2/5] Copying position embeddings...")
-    
-    bert_pos_emb = bert.embeddings.position_embeddings.weight.data
-    rdt_pos_emb = rdt_model.pos_encoding.position_embeddings.weight.data
-    
-    # Copy as much as possible (BERT typically has 512 positions)
-    min_len = min(bert_pos_emb.size(0), rdt_pos_emb.size(0))
-    rdt_pos_emb[:min_len].copy_(bert_pos_emb[:min_len])
-    
-    if verbose:
-        print(f"  ✓ Position embedding: copied {min_len} positions from BERT")
-        if rdt_pos_emb.size(0) > bert_pos_emb.size(0):
-            print(f"    (RDT has {rdt_pos_emb.size(0)} positions, BERT has {bert_pos_emb.size(0)} - extra positions remain random)")
-    
-    # =========================================================================
-    # Step 2: Copy Input Encoder (BERT Layer 0)
-    # =========================================================================
-    if verbose:
-        print("\n[3/5] Copying input encoder (BERT layer 0)...")
-    
-    bert_layer_0 = bert.encoder.layer[0]
-    
-    # RDT input_encoder is nn.TransformerEncoder with n_io_layers
-    for i, rdt_layer in enumerate(rdt_model.input_encoder.layers):
-        if i == 0:  # Only first layer gets BERT weights
-            copy_standard_transformer_layer(bert_layer_0, rdt_layer)
-            if verbose:
-                print(f"  ✓ Input encoder layer 0 ← BERT layer 0")
-        else:
-            if verbose:
-                print(f"  ⊘ Input encoder layer {i} (random init, n_io_layers > 1)")
-    
-    # =========================================================================
-    # Step 3: Copy Main Encoder (BERT Middle Layers)
-    # =========================================================================
-    if verbose:
-        print(f"\n[4/5] Copying main encoder (BERT layers 1-{num_rdt_main})...")
+        print(f"\n[2/3] Copying main encoder (BERT layers 0-{num_rdt_main-1})...")
     
     for i in range(num_rdt_main):
-        bert_layer_idx = i + 1  # BERT layers 1, 2, 3, 4, 5, 6
+        bert_layer_idx = i  # BERT layers 0, 1, 2, 3, 4, 5
         bert_layer = bert.encoder.layer[bert_layer_idx]
         rdt_layer = rdt_model.encoder_layers[i]
         
-        # Copy Self-Attention
-        copy_attention_weights(
-            bert_layer.attention.self,
-            bert_layer.attention.output,
-            rdt_layer.self_attn
-        )
+        # Copy Self-Attention (RoPE is applied on top, so we copy QKV projections)
+        # RDT uses RoPESelfAttention with qkv_proj
+        bert_self_attn = bert_layer.attention.self
+        bert_attn_output = bert_layer.attention.output
+        
+        # Get Q, K, V weights from BERT
+        q_weight = bert_self_attn.query.weight  # [d_model, d_model]
+        k_weight = bert_self_attn.key.weight
+        v_weight = bert_self_attn.value.weight
+        
+        q_bias = bert_self_attn.query.bias
+        k_bias = bert_self_attn.key.bias
+        v_bias = bert_self_attn.value.bias
+        
+        # Fuse into RDT's qkv_proj
+        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)  # [3*d_model, d_model]
+        qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+        
+        rdt_layer.self_attn.qkv_proj.weight.data.copy_(qkv_weight)
+        rdt_layer.self_attn.qkv_proj.bias.data.copy_(qkv_bias)
+        
+        # Copy output projection
+        rdt_layer.self_attn.out_proj.weight.data.copy_(bert_attn_output.dense.weight)
+        rdt_layer.self_attn.out_proj.bias.data.copy_(bert_attn_output.dense.bias)
         
         # Copy FFN
         copy_ffn_weights(bert_layer, rdt_layer.ffn)
@@ -150,23 +129,6 @@ def load_bert_weights_to_rdt(
                 print(f"    (AdaLN projections remain zero-initialized for conditioning)")
     
     # =========================================================================
-    # Step 4: Copy Output Decoder (BERT Last Layer)
-    # =========================================================================
-    if verbose:
-        print(f"\n[5/5] Copying output decoder (BERT layer {num_bert_layers-1})...")
-    
-    bert_last_layer = bert.encoder.layer[num_bert_layers - 1]
-    
-    for i, rdt_layer in enumerate(rdt_model.output_decoder.layers):
-        if i == 0:  # Only first layer gets BERT weights
-            copy_standard_transformer_layer(bert_last_layer, rdt_layer)
-            if verbose:
-                print(f"  ✓ Output decoder layer 0 ← BERT layer {num_bert_layers-1}")
-        else:
-            if verbose:
-                print(f"  ⊘ Output decoder layer {i} (random init, n_io_layers > 1)")
-    
-    # =========================================================================
     # Summary
     # =========================================================================
     if verbose:
@@ -174,12 +136,11 @@ def load_bert_weights_to_rdt(
         print("✓ BERT weight loading complete!")
         print(f"{'='*60}")
         print("\nInitialized components:")
-        print("  ✓ Token embeddings (tied with output projection)")
-        print("  ✓ Position embeddings (BERT learned positions)")
-        print("  ✓ Input encoder (low-level syntactic features)")
-        print("  ✓ Main encoder (mid-level semantic features, recursive)")
-        print("  ✓ Output decoder (high-level task features)")
+        print("  ✓ Token embeddings")
+        print("  ✓ Main encoder (semantic features, recursive)")
         print("\nRandomly initialized components:")
+        print("  • Input/Output MLP processors")
+        print("  • RoPE (applied on top of BERT attention)")
         print("  • AdaLN conditioning projections (zero-init)")
         print("  • Timestep embedder (noise level)")
         print("  • Cross-attention (if used)")
@@ -310,7 +271,7 @@ def initialize_rdt_with_bert(
     **rdt_kwargs
 ) -> nn.Module:
     """
-    Create RDT model and initialize with optimized BERT weight mapping.
+    Create RDT model and initialize with BERT weights for main encoder only.
     
     Usage:
         # Auto-detect d_model from BERT
@@ -319,7 +280,6 @@ def initialize_rdt_with_bert(
             bert_model_name="prajjwal1/bert-medium",
             n_encoder_layers=6,
             n_heads=8,
-            n_io_layers=1,
             d_ff=2048,
             dropout=0.1
         )
@@ -343,9 +303,9 @@ def initialize_rdt_with_bert(
         **rdt_kwargs: Additional RDT model arguments
         
     Returns:
-        RDT model with BERT-initialized weights
+        RDT model with BERT-initialized main encoder
     """
-    from .rdt_model import RDT
+    from .rdt import RDT
     
     # Load BERT config for validation
     bert_config = AutoConfig.from_pretrained(bert_model_name)
@@ -363,13 +323,11 @@ def initialize_rdt_with_bert(
             f"They must match for weight transfer."
         )
     
-    # Validate layer compatibility
-    required_layers = 1 + n_encoder_layers + 1
-    if bert_config.num_hidden_layers < required_layers:
+    # Validate layer compatibility (only need main encoder layers)
+    if bert_config.num_hidden_layers < n_encoder_layers:
         raise ValueError(
-            f"BERT has {bert_config.num_hidden_layers} layers but RDT needs {required_layers} "
-            f"(1 input + {n_encoder_layers} main + 1 output). "
-            f"Use a larger BERT model or reduce n_encoder_layers."
+            f"BERT has {bert_config.num_hidden_layers} layers but RDT needs {n_encoder_layers} "
+            f"main encoder layers. Use a larger BERT model or reduce n_encoder_layers."
         )
     
     # Create RDT model
@@ -394,37 +352,37 @@ RECOMMENDED_BERT_MODELS = {
         "layers": 2,
         "hidden": 128,
         "heads": 2,
-        "notes": "Too small for RDT (needs min 8 layers)"
+        "notes": "Too small for RDT (needs min 6 layers)"
     },
     "prajjwal1/bert-mini": {
         "layers": 4,
         "hidden": 256,
         "heads": 4,
-        "notes": "Too small for RDT (needs min 8 layers)"
+        "notes": "Too small for RDT (needs min 6 layers)"
     },
     "prajjwal1/bert-small": {
         "layers": 4,
         "hidden": 512,
         "heads": 8,
-        "notes": "Too small for RDT (needs min 8 layers)"
+        "notes": "Too small for RDT (needs min 6 layers)"
     },
     "prajjwal1/bert-medium": {
         "layers": 8,
         "hidden": 512,
         "heads": 8,
-        "notes": "✓ Perfect for n_encoder_layers=6 (default RDT config)"
+        "notes": "✓ Perfect for n_encoder_layers=6-8 (default RDT config)"
     },
     "bert-base-uncased": {
         "layers": 12,
         "hidden": 768,
         "heads": 12,
-        "notes": "✓ Good for n_encoder_layers=6-10"
+        "notes": "✓ Good for n_encoder_layers=6-12"
     },
     "bert-large-uncased": {
         "layers": 24,
         "hidden": 1024,
         "heads": 16,
-        "notes": "✓ Good for large RDT (n_encoder_layers=10-22)"
+        "notes": "✓ Good for large RDT (n_encoder_layers=10-24)"
     }
 }
 
@@ -441,8 +399,8 @@ def print_bert_compatibility():
         print(f"{model_name:<30} {info['layers']:>7} {info['hidden']:>7} {info['heads']:>6}  {info['notes']}")
     
     print("\n" + "="*70)
-    print("RDT Layer Requirements: 1 (input) + N (main) + 1 (output) = N+2 layers")
-    print("Example: n_encoder_layers=6 requires minimum 8 BERT layers")
+    print("RDT Layer Requirements: N main encoder layers only")
+    print("Example: n_encoder_layers=6 requires minimum 6 BERT layers")
     print("="*70 + "\n")
 
 

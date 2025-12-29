@@ -15,10 +15,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils import CSVLogger
 
 
-class BaselineTrainer:
+class MLMTrainer:
     """
-    Trainer for standard Masked Language Model baselines.
-    Compatible with HuggingFace models wrapped in BaselineMLM.
+    Unified trainer for all MLM-based baselines (MLM, CMLM, future baselines).
+    Automatically detects model type and applies appropriate training logic.
     """
     
     def __init__(
@@ -34,6 +34,10 @@ class BaselineTrainer:
         self.val_loader = val_loader
         self.config = config
         self.device = device
+        
+        # Detect model type
+        self.model_type = self._detect_model_type(model)
+        print(f"Detected model type: {self.model_type.upper()}")
         
         # Training config
         self.training_mode = config['training'].get('training_mode', 'epoch')
@@ -94,6 +98,13 @@ class BaselineTrainer:
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model parameters: {num_params:,}")
     
+    def _detect_model_type(self, model):
+        """Detect model type from class name"""
+        class_name = model.__class__.__name__.lower()
+        if 'cmlm' in class_name:
+            return 'cmlm'
+        return 'mlm'
+    
     def _create_scheduler(self):
         """Create learning rate scheduler"""
         if self.training_mode == 'epoch':
@@ -120,7 +131,14 @@ class BaselineTrainer:
             )
     
     def train_step(self, batch):
-        """Single training step for MLM"""
+        """Unified training step with model-specific masking"""
+        if self.model_type == 'cmlm':
+            return self._train_step_cmlm(batch)
+        else:
+            return self._train_step_mlm(batch)
+    
+    def _train_step_mlm(self, batch):
+        """Standard MLM training (masking already done by collator)"""
         self.model.train()
         
         # Move batch to device
@@ -167,6 +185,59 @@ class BaselineTrainer:
             'lr': self.scheduler.get_last_lr()[0]
         }
     
+    def _train_step_cmlm(self, batch):
+        """CMLM training with on-the-fly uniform masking"""
+        self.model.train()
+        
+        # Move batch to device
+        input_ids = batch['input_ids'].to(self.device)  # Original tokens
+        attention_mask = batch.get('attention_mask')
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+        
+        # Apply uniform masking on-the-fly
+        masked_input_ids, labels, mask_ratio = self.model.uniform_masking(
+            input_ids, attention_mask
+        )
+        
+        # Forward pass with AMP
+        if self.use_amp:
+            with autocast():
+                loss, logits = self.model(masked_input_ids, attention_mask, labels)
+        else:
+            loss, logits = self.model(masked_input_ids, attention_mask, labels)
+        
+        # Backward pass
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+        
+        self.optimizer.zero_grad()
+        self.scheduler.step()
+        
+        # Calculate accuracy (on masked tokens only)
+        mask = labels != -100
+        if mask.sum() > 0:
+            pred_tokens = logits.argmax(dim=-1)
+            correct = (pred_tokens == labels) & mask
+            accuracy = correct.sum().float() / mask.sum().float()
+        else:
+            accuracy = torch.tensor(0.0)
+        
+        return {
+            'loss': loss.item(),
+            'accuracy': accuracy.item(),
+            'mask_ratio': mask_ratio,
+            'lr': self.scheduler.get_last_lr()[0]
+        }
+    
     def evaluate(self):
         """Evaluate on validation set"""
         self.model.eval()
@@ -180,13 +251,23 @@ class BaselineTrainer:
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(self.device)
-                labels = batch['labels'].to(self.device)
+                
+                # Handle masking based on model type
+                if self.model_type == 'cmlm':
+                    # Apply uniform masking for CMLM
+                    masked_input_ids, labels, _ = self.model.uniform_masking(
+                        input_ids, attention_mask
+                    )
+                else:
+                    # MLM: labels already in batch
+                    labels = batch['labels'].to(self.device)
+                    masked_input_ids = input_ids
                 
                 if self.use_amp:
                     with autocast():
-                        loss, logits = self.model(input_ids, attention_mask, labels)
+                        loss, logits = self.model(masked_input_ids, attention_mask, labels)
                 else:
-                    loss, logits = self.model(input_ids, attention_mask, labels)
+                    loss, logits = self.model(masked_input_ids, attention_mask, labels)
                 
                 # Calculate accuracy
                 mask = labels != -100
@@ -252,7 +333,7 @@ class BaselineTrainer:
     def train(self):
         """Main training loop"""
         print("\n" + "="*60)
-        print("Starting Baseline MLM Training")
+        print(f"Starting {self.model_type.upper()} Training")
         print("="*60)
         print(f"Training mode: {self.training_mode}")
         if self.training_mode == 'epoch':

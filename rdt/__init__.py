@@ -14,9 +14,9 @@ from . import evaluation
 from . import utils
 
 # Import commonly used classes for convenience
-from .models import RDT, BaselineMLM
+from .models import RDT, MLM
 from .data import create_dataloaders
-from .training import RDTTrainer, BaselineTrainer
+from .training import RDTTrainer, MLMTrainer
 from .evaluation import Evaluator
 from .utils import (
     load_config,
@@ -38,12 +38,12 @@ __all__ = [
     'utils',
     # Models
     'RDT',
-    'BaselineMLM',
+    'MLM',
     # Data
     'create_dataloaders',
     # Training
     'RDTTrainer',
-    'BaselineTrainer',
+    'MLMTrainer',
     # Evaluation
     'Evaluator',
     # Utilities
