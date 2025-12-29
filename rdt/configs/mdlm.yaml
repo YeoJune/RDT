@@ -65,7 +65,7 @@ mdlm:
 
 # Data
 data:
-  dataset_name: "wikitext-2"
+  dataset_name: "wikitext-103"
   streaming: false
   max_seq_length: 256
 
