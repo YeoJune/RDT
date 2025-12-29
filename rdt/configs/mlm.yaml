@@ -5,7 +5,9 @@ model_type: "mlm"
 
 # Model Architecture
 model:
-  name: "bert-base-uncased"
+  architecture: "bert-base-uncased" # Model architecture for config and tokenizer
+  pretrained: "bert-base-uncased" # Pretrained weights to load (null/empty for from-scratch)
+  # pretrained: null # Train from scratch (random initialization)
 
 # Training Strategy
 training:

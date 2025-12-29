@@ -7,49 +7,103 @@ from transformers import (
     AutoConfig,
     AutoTokenizer
 )
+from typing import Dict, Optional
 
 
 class MLM(nn.Module):
     """
     Wrapper for standard Masked Language Model baselines (BERT, RoBERTa, etc.)
     Provides consistent interface with RDT for unified training and evaluation.
+    
+    Supports both pretrained and from-scratch training:
+    - Pretrained: Load weights from HuggingFace hub
+    - From scratch: Initialize with random weights using architecture config
     """
     
     def __init__(
         self,
-        model_name='roberta-base',
-        vocab_size=None,
-        mask_token_id=None,
-        pad_token_id=None
+        architecture: str = 'bert-base-uncased',
+        pretrained: Optional[str] = None,
+        vocab_size: Optional[int] = None,
+        mask_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None
     ):
         """
         Args:
-            model_name: HuggingFace model identifier (e.g., 'roberta-base', 'bert-base-uncased')
-            vocab_size: Vocabulary size (optional, auto-detected from model)
-            mask_token_id: ID of [MASK] token (auto-detected if None)
-            pad_token_id: ID of [PAD] token (auto-detected if None)
+            architecture: Model architecture identifier (e.g., 'bert-base-uncased', 'roberta-base')
+                         Used for loading config and tokenizer
+            pretrained: Model name/path to load pretrained weights from (None = from scratch)
+                       If provided, loads pretrained weights from HuggingFace or local path
+            vocab_size: Vocabulary size (required for from-scratch training)
+            mask_token_id: ID of [MASK] token (auto-detected from tokenizer if None)
+            pad_token_id: ID of [PAD] token (auto-detected from tokenizer if None)
+        
+        Examples:
+            # Pretrained model
+            model = MLM(architecture='bert-base-uncased', pretrained='bert-base-uncased')
+            
+            # From scratch with custom vocab
+            model = MLM(architecture='bert-base-uncased', vocab_size=50000, 
+                       mask_token_id=3, pad_token_id=0)
         """
         super().__init__()
-        self.model_name = model_name
+        self.architecture = architecture
+        self.pretrained = pretrained
         
-        # Load pretrained model
+        # Load model config
+        config = AutoConfig.from_pretrained(architecture)
+        
+        # Override vocab size if provided
         if vocab_size is not None:
-            config = AutoConfig.from_pretrained(model_name)
             config.vocab_size = vocab_size
-            self.model = AutoModelForMaskedLM.from_config(config)
+        
+        # Load model: pretrained or from scratch
+        if pretrained is not None:
+            # Load pretrained weights
+            self.model = AutoModelForMaskedLM.from_pretrained(pretrained, config=config)
+            print(f"✓ Loaded pretrained weights from: {pretrained}")
         else:
-            self.model = AutoModelForMaskedLM.from_pretrained(model_name)
+            # Initialize from scratch
+            self.model = AutoModelForMaskedLM.from_config(config)
+            print(f"✓ Initialized from scratch: {architecture}")
+            if vocab_size is not None:
+                print(f"  - Custom vocab_size: {vocab_size}")
         
         self.vocab_size = self.model.config.vocab_size
         self.d_model = self.model.config.hidden_size
         
-        # Special token IDs
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.mask_token_id = mask_token_id if mask_token_id is not None else tokenizer.mask_token_id
-        self.pad_token_id = pad_token_id if pad_token_id is not None else tokenizer.pad_token_id
+        # Determine special token IDs
+        if mask_token_id is None or pad_token_id is None:
+            # Auto-detect from tokenizer
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(architecture)
+                self.mask_token_id = mask_token_id if mask_token_id is not None else tokenizer.mask_token_id
+                self.pad_token_id = pad_token_id if pad_token_id is not None else tokenizer.pad_token_id
+            except Exception as e:
+                raise ValueError(
+                    f"Could not load tokenizer for {architecture}. "
+                    f"Please provide mask_token_id and pad_token_id explicitly. Error: {e}"
+                )
+        else:
+            # Use provided IDs
+            self.mask_token_id = mask_token_id
+            self.pad_token_id = pad_token_id
         
+        # Validate special tokens
         if self.mask_token_id is None:
-            raise ValueError(f"Could not determine mask_token_id for {model_name}")
+            raise ValueError(
+                f"Could not determine mask_token_id. "
+                f"Please provide it explicitly via mask_token_id parameter."
+            )
+        if self.pad_token_id is None:
+            raise ValueError(
+                f"Could not determine pad_token_id. "
+                f"Please provide it explicitly via pad_token_id parameter."
+            )
+        
+        print(f"  - vocab_size: {self.vocab_size}")
+        print(f"  - mask_token_id: {self.mask_token_id}")
+        print(f"  - pad_token_id: {self.pad_token_id}")
         
     def forward(self, input_ids, attention_mask=None, labels=None):
         """
@@ -122,9 +176,41 @@ class MLM(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     @classmethod
+    def from_config(cls, config: Dict):
+        """
+        Create model from config dictionary.
+        
+        Config format:
+            model:
+              architecture: "bert-base-uncased"  # Required: model architecture
+              pretrained: "bert-base-uncased"    # Optional: None for from-scratch
+              vocab_size: 50000                   # Optional: custom vocab size
+              mask_token_id: 103                  # Optional: auto-detect from tokenizer
+              pad_token_id: 0                     # Optional: auto-detect from tokenizer
+        
+        Args:
+            config: Configuration dictionary
+            
+        Returns:
+            MLM instance
+        """
+        model_cfg = config['model']
+        
+        return cls(
+            architecture=model_cfg['architecture'],
+            pretrained=model_cfg.get('pretrained'),
+            vocab_size=model_cfg.get('vocab_size'),
+            mask_token_id=model_cfg.get('mask_token_id'),
+            pad_token_id=model_cfg.get('pad_token_id')
+        )
+    
+    @classmethod
     def from_pretrained(cls, model_name):
-        """Load pretrained model"""
-        return cls(model_name=model_name)
+        """
+        Load pretrained model (legacy API for compatibility).
+        Equivalent to: MLM(architecture=model_name, pretrained=model_name)
+        """
+        return cls(architecture=model_name, pretrained=model_name)
     
     def save_pretrained(self, save_path):
         """Save model"""

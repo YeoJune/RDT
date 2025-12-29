@@ -3,6 +3,7 @@
 import torch
 import torch.nn.functional as F
 from .mlm import MLM
+from typing import Dict, Optional
 
 
 class CMLM(MLM):
@@ -23,20 +24,57 @@ class CMLM(MLM):
     
     def __init__(
         self,
-        model_name='roberta-base',
-        vocab_size=None,
-        mask_token_id=None,
-        pad_token_id=None
+        architecture: str = 'bert-base-uncased',
+        pretrained: Optional[str] = None,
+        vocab_size: Optional[int] = None,
+        mask_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None
     ):
         """
         Initialize CMLM by extending MLM.
-        All parameters same as MLM base class.
+        
+        Args:
+            architecture: Model architecture identifier (e.g., 'bert-base-uncased')
+            pretrained: Model name/path to load pretrained weights from (None = from scratch)
+            vocab_size: Vocabulary size (required for from-scratch training)
+            mask_token_id: ID of [MASK] token (auto-detected if None)
+            pad_token_id: ID of [PAD] token (auto-detected if None)
         """
         super().__init__(
-            model_name=model_name,
+            architecture=architecture,
+            pretrained=pretrained,
             vocab_size=vocab_size,
             mask_token_id=mask_token_id,
             pad_token_id=pad_token_id
+        )
+    
+    @classmethod
+    def from_config(cls, config: Dict):
+        """
+        Create CMLM model from config dictionary.
+        
+        Config format:
+            model:
+              architecture: "bert-base-uncased"  # Required
+              pretrained: "bert-base-uncased"    # Optional: None for from-scratch
+              vocab_size: 50000                   # Optional
+              mask_token_id: 103                  # Optional
+              pad_token_id: 0                     # Optional
+        
+        Args:
+            config: Configuration dictionary
+            
+        Returns:
+            CMLM instance
+        """
+        model_cfg = config['model']
+        
+        return cls(
+            architecture=model_cfg['architecture'],
+            pretrained=model_cfg.get('pretrained'),
+            vocab_size=model_cfg.get('vocab_size'),
+            mask_token_id=model_cfg.get('mask_token_id'),
+            pad_token_id=model_cfg.get('pad_token_id')
         )
     
     def uniform_masking(self, input_ids, attention_mask=None):

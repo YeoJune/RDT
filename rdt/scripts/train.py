@@ -91,24 +91,21 @@ def main():
         print(f"Training {model_type.upper()} Model")
         print("="*60)
         
-        # Create model
-        model_name = config['model']['name']
-        print(f"\nLoading {model_name}...")
+        # Create model from config
+        print(f"\nInitializing {model_type.upper()} model...")
         
         if model_type == 'mlm':
-            model = MLM(model_name=model_name)
-            print(f"Model loaded: {model.count_parameters()/1e6:.1f}M parameters")
-            
-            # Create dataloaders with pre-masking
-            print("\nPreparing MLM data...")
-            train_loader, val_loader = create_mlm_dataloaders(config)
-            
+            model = MLM.from_config(config)
         elif model_type == 'cmlm':
-            model = CMLM(model_name=model_name)
-            print(f"Model loaded: {model.count_parameters()/1e6:.1f}M parameters")
-            
-            # Create dataloaders without pre-masking (masking done on-the-fly)
-            print("\nPreparing CMLM data...")
+            model = CMLM.from_config(config)
+        
+        print(f"\nModel parameters: {model.count_parameters()/1e6:.1f}M")
+        
+        # Create dataloaders
+        print(f"\nPreparing {model_type.upper()} data...")
+        if model_type == 'mlm':
+            train_loader, val_loader = create_mlm_dataloaders(config)
+        elif model_type == 'cmlm':
             train_loader, val_loader = create_cmlm_dataloaders(config)
         
         # Create unified trainer
