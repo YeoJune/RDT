@@ -695,44 +695,28 @@ def create_mlm_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     min_length = data_config.get('min_text_length', 50)
     
     def chunk_and_tokenize(examples):
-        """Tokenize and chunk texts into multiple samples"""
-        all_input_ids = []
-        all_attention_masks = []
+        """
+        RDT 방식과 동일하게 Tokenizer의 기능을 사용하여 Chunking.
+        - return_overflowing_tokens=True: 긴 텍스트를 자동으로 여러 시퀀스로 분할
+        - stride: 겹치는 구간 설정
+        - truncation: max_seq_length에 맞춰 자름 (특수 토큰 공간 확보 포함)
+        """
+        outputs = tokenizer(
+            examples["text"],
+            max_length=max_seq_length,
+            truncation=True,
+            stride=overlap,  # config의 chunk_overlap 적용
+            return_overflowing_tokens=True,
+            return_attention_mask=True,
+            padding=False  # 패딩은 Collator에서 수행
+        )
         
-        for text in examples['text']:
-            if len(text.strip()) < min_length:
-                continue
+        # 'overflow_to_sample_mapping' 키는 map 함수에서 반환 시 
+        # 샘플 개수 불일치 에러를 유발하므로 제거해야 함
+        if "overflow_to_sample_mapping" in outputs:
+            outputs.pop("overflow_to_sample_mapping")
             
-            # Tokenize full text
-            encoded = tokenizer(
-                text,
-                truncation=False,
-                add_special_tokens=True,
-                return_attention_mask=True
-            )
-            
-            input_ids = encoded['input_ids']
-            
-            # Chunk into multiple samples
-            stride = max_seq_length - overlap
-            for i in range(0, len(input_ids), stride):
-                chunk = input_ids[i:i + max_seq_length]
-                
-                # Pad if needed
-                if len(chunk) < max_seq_length:
-                    padding_length = max_seq_length - len(chunk)
-                    chunk = chunk + [tokenizer.pad_token_id] * padding_length
-                    attention_mask = [1] * (max_seq_length - padding_length) + [0] * padding_length
-                else:
-                    attention_mask = [1] * max_seq_length
-                
-                all_input_ids.append(chunk)
-                all_attention_masks.append(attention_mask)
-        
-        return {
-            'input_ids': all_input_ids,
-            'attention_mask': all_attention_masks
-        }
+        return outputs
     
     # Tokenize and chunk
     print("Tokenizing and chunking train data...")
@@ -816,44 +800,28 @@ def create_cmlm_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     min_length = data_config.get("min_text_length", 50)
     
     def chunk_and_tokenize(examples):
-        """Tokenize and chunk texts into multiple samples"""
-        all_input_ids = []
-        all_attention_masks = []
+        """
+        RDT 방식과 동일하게 Tokenizer의 기능을 사용하여 Chunking.
+        - return_overflowing_tokens=True: 긴 텍스트를 자동으로 여러 시퀀스로 분할
+        - stride: 겹치는 구간 설정
+        - truncation: max_seq_length에 맞춰 자름 (특수 토큰 공간 확보 포함)
+        """
+        outputs = tokenizer(
+            examples["text"],
+            max_length=max_seq_length,
+            truncation=True,
+            stride=overlap,  # config의 chunk_overlap 적용
+            return_overflowing_tokens=True,
+            return_attention_mask=True,
+            padding=False  # 패딩은 Collator에서 수행
+        )
         
-        for text in examples["text"]:
-            if len(text.strip()) < min_length:
-                continue
+        # 'overflow_to_sample_mapping' 키는 map 함수에서 반환 시 
+        # 샘플 개수 불일치 에러를 유발하므로 제거해야 함
+        if "overflow_to_sample_mapping" in outputs:
+            outputs.pop("overflow_to_sample_mapping")
             
-            # Tokenize full text
-            encoded = tokenizer(
-                text,
-                truncation=False,
-                add_special_tokens=True,
-                return_attention_mask=True
-            )
-            
-            input_ids = encoded["input_ids"]
-            
-            # Chunk into multiple samples
-            stride = max_seq_length - overlap
-            for i in range(0, len(input_ids), stride):
-                chunk = input_ids[i:i + max_seq_length]
-                
-                # Pad if needed
-                if len(chunk) < max_seq_length:
-                    padding_length = max_seq_length - len(chunk)
-                    chunk = chunk + [tokenizer.pad_token_id] * padding_length
-                    attention_mask = [1] * (max_seq_length - padding_length) + [0] * padding_length
-                else:
-                    attention_mask = [1] * max_seq_length
-                
-                all_input_ids.append(chunk)
-                all_attention_masks.append(attention_mask)
-        
-        return {
-            "input_ids": all_input_ids,
-            "attention_mask": all_attention_masks
-        }
+        return outputs
     
     # Tokenize and chunk
     print("Tokenizing and chunking train data...")
@@ -941,44 +909,28 @@ def create_mdlm_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     min_length = data_config.get("min_text_length", 50)
     
     def chunk_and_tokenize(examples):
-        """Tokenize and chunk texts into multiple samples"""
-        all_input_ids = []
-        all_attention_masks = []
+        """
+        RDT 방식과 동일하게 Tokenizer의 기능을 사용하여 Chunking.
+        - return_overflowing_tokens=True: 긴 텍스트를 자동으로 여러 시퀀스로 분할
+        - stride: 겹치는 구간 설정
+        - truncation: max_seq_length에 맞춰 자름 (특수 토큰 공간 확보 포함)
+        """
+        outputs = tokenizer(
+            examples["text"],
+            max_length=max_seq_length,
+            truncation=True,
+            stride=overlap,  # config의 chunk_overlap 적용
+            return_overflowing_tokens=True,
+            return_attention_mask=True,
+            padding=False  # 패딩은 Collator에서 수행
+        )
         
-        for text in examples["text"]:
-            if len(text.strip()) < min_length:
-                continue
+        # 'overflow_to_sample_mapping' 키는 map 함수에서 반환 시 
+        # 샘플 개수 불일치 에러를 유발하므로 제거해야 함
+        if "overflow_to_sample_mapping" in outputs:
+            outputs.pop("overflow_to_sample_mapping")
             
-            # Tokenize full text
-            encoded = tokenizer(
-                text,
-                truncation=False,
-                add_special_tokens=True,
-                return_attention_mask=True
-            )
-            
-            input_ids = encoded["input_ids"]
-            
-            # Chunk into multiple samples
-            stride = max_seq_length - overlap
-            for i in range(0, len(input_ids), stride):
-                chunk = input_ids[i:i + max_seq_length]
-                
-                # Pad if needed
-                if len(chunk) < max_seq_length:
-                    padding_length = max_seq_length - len(chunk)
-                    chunk = chunk + [tokenizer.pad_token_id] * padding_length
-                    attention_mask = [1] * (max_seq_length - padding_length) + [0] * padding_length
-                else:
-                    attention_mask = [1] * max_seq_length
-                
-                all_input_ids.append(chunk)
-                all_attention_masks.append(attention_mask)
-        
-        return {
-            "input_ids": all_input_ids,
-            "attention_mask": all_attention_masks
-        }
+        return outputs
     
     # Tokenize and chunk
     print("Tokenizing and chunking train data...")

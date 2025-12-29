@@ -17,9 +17,9 @@ model:
 
 # Data
 data:
-  dataset_name: "wikitext-103"
+  dataset_name: "wikitext-2"
   streaming: false
-  max_seq_length: 512
+  max_seq_length: 256
 
   # CMLM uses uniform masking during training
   # masking ratio is dynamically sampled per batch
@@ -40,7 +40,7 @@ cmlm:
 
 # BERT-style Masking (for consistency experiments)
 training:
-  batch_size: 16
+  batch_size: 32
   gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch"
   num_epochs: 3
