@@ -1,0 +1,62 @@
+# CMLM (Conditional Masked Language Model) Configuration
+
+# Model Type
+model_type: "cmlm"
+
+# Model Architecture
+model:
+  name: "bert-base-uncased"
+
+# Training Strategy
+training:
+  batch_size: 16
+  training_mode: "epoch"
+  num_epochs: 10
+  max_training_steps: 100000
+
+  learning_rate: 0.0001 # 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+
+  scheduler: "cosine"
+  max_grad_norm: 1.0
+
+  save_every_n_epochs: 1
+  save_every_n_steps: 1000
+  keep_last_n_checkpoints: 3
+
+# CMLM-specific Training
+cmlm:
+  # Uniform masking: masking ratio sampled uniformly from [0, 1]
+  # This trains the model on both easy (single mask) and difficult (fully masked) examples
+  uniform_masking: true
+
+  # Mask-Predict inference settings
+  max_iterations: 10 # Number of mask-predict refinement iterations
+  mask_decay: "linear" # How mask ratio decreases: 'linear' (1.0 → 0.0)
+
+# Data
+data:
+  dataset_name: "wikitext-2"
+  streaming: false
+  max_seq_length: 512
+
+  # CMLM uses uniform masking during training
+  # masking ratio is dynamically sampled per batch
+
+  tokenizer_name: "bert-base-uncased"
+  num_workers: 4
+  pin_memory: true
+
+# Logging & Checkpoints
+output:
+  checkpoint_dir: "checkpoints/cmlm"
+  log_dir: "runs/cmlm"
+  log_every_n_steps: 100
+  eval_every_n_epochs: 1
+  eval_every_n_steps: 1000
+
+# Hardware
+device: "cuda"
+mixed_precision: true
+seed: 42

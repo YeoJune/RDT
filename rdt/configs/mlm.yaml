@@ -9,9 +9,9 @@ model:
 
 # Training Strategy
 training:
-  batch_size: 64
+  batch_size: 16
   training_mode: "epoch"
-  num_epochs: 3
+  num_epochs: 10
   max_training_steps: 100000
 
   learning_rate: 0.0001 # 1e-4
@@ -29,7 +29,7 @@ training:
 data:
   dataset_name: "wikitext-2"
   streaming: false
-  max_seq_length: 128
+  max_seq_length: 512
   mlm_probability: 0.15
 
   tokenizer_name: "bert-base-uncased"
@@ -38,8 +38,8 @@ data:
 
 # Logging & Checkpoints
 output:
-  checkpoint_dir: "checkpoints/bert_baseline"
-  log_dir: "runs/bert_baseline"
+  checkpoint_dir: "checkpoints/mlm_baseline"
+  log_dir: "runs/mlm_baseline"
   log_every_n_steps: 100
   eval_every_n_epochs: 1
   eval_every_n_steps: 1000
