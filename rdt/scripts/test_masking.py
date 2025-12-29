@@ -18,6 +18,8 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 import nltk
 
 from rdt.models import RDT, MLM
+from rdt.models.cmlm import CMLM
+from rdt.models.mdlm import MDLM
 from rdt.utils import load_config, get_device
 
 
@@ -362,6 +364,283 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             aggregated['steps'][ratio] = np.mean(results['steps'][ratio])
         else:
             aggregated['steps'][ratio] = 0.0
+    
+    return aggregated
+
+
+def test_cmlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len,
+                   metric_calc, max_iterations=10, batch_size=32):
+    """Test CMLM model with iterative mask-predict refinement (batched)"""
+    model.eval()
+    mask_token_id = tokenizer.mask_token_id
+    pad_token_id = tokenizer.pad_token_id or 0
+    
+    # Initialize result storage
+    results = {
+        'exact_match': {ratio: [] for ratio in mask_ratios},
+        'bertscore': {ratio: {'refs': [], 'preds': []} for ratio in mask_ratios},
+        'perplexity': {ratio: [] for ratio in mask_ratios},
+        'bleu4': {ratio: {'refs': [], 'preds': []} for ratio in mask_ratios},
+        'steps': {ratio: [] for ratio in mask_ratios}
+    }
+    
+    print(f"\nTesting CMLM iterative reconstruction (max_iterations={max_iterations}, max_seq_len={max_seq_len}, batch_size={batch_size})...")
+    
+    # Get special token IDs to exclude from masking
+    special_token_ids = set(tokenizer.all_special_ids)
+    
+    # Tokenize all texts first
+    all_tokens = []
+    all_texts = []
+    
+    for text in tqdm(test_texts, desc="Tokenizing"):
+        encoded = tokenizer(
+            text, 
+            return_tensors='pt', 
+            truncation=True, 
+            max_length=max_seq_len,
+            padding=False
+        )
+        tokens = encoded['input_ids'].squeeze(0)
+        
+        if len(tokens) >= 10:
+            all_tokens.append(tokens)
+            all_texts.append(tokenizer.decode(tokens, skip_special_tokens=True))
+    
+    # Process in batches for each masking ratio
+    for ratio in mask_ratios:
+        print(f"\nProcessing masking ratio: {ratio*100:.0f}%")
+        
+        for i in tqdm(range(0, len(all_tokens), batch_size), desc=f"Batches ({ratio*100:.0f}%)"):
+            batch_tokens = all_tokens[i:i+batch_size]
+            batch_texts = all_texts[i:i+batch_size]
+            
+            # Prepare batch
+            batch_input_ids = []
+            batch_eval_masks = []
+            batch_original_tokens = []
+            
+            for tokens in batch_tokens:
+                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
+                batch_input_ids.append(masked_tokens)
+                batch_eval_masks.append(eval_mask)
+                batch_original_tokens.append(tokens)
+            
+            # Pad batch
+            max_len = max(len(t) for t in batch_input_ids)
+            padded_input_ids = []
+            padded_attention_masks = []
+            
+            for masked_tokens in batch_input_ids:
+                pad_len = max_len - len(masked_tokens)
+                if pad_len > 0:
+                    padded_input_ids.append(
+                        torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
+                    )
+                    padded_attention_masks.append(
+                        torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])
+                    )
+                else:
+                    padded_input_ids.append(masked_tokens)
+                    padded_attention_masks.append(torch.ones(len(masked_tokens)))
+            
+            batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
+            batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
+            
+            # CMLM iterative inference (batch)
+            with torch.no_grad():
+                pred_tokens_batch, _ = model.inference(
+                    batch_input_ids_tensor,
+                    attention_mask=batch_attention_masks_tensor,
+                    max_iterations=max_iterations
+                )
+                pred_tokens_batch = pred_tokens_batch.cpu()
+            
+            # Process each sample
+            for j in range(len(batch_tokens)):
+                original_tokens = batch_original_tokens[j]
+                eval_mask = batch_eval_masks[j]
+                pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
+                
+                # Calculate metrics
+                accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
+                results['exact_match'][ratio].append(accuracy)
+                
+                reconstructed_tokens = original_tokens.clone()
+                reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
+                reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
+                original_text = batch_texts[j]
+                
+                results['bertscore'][ratio]['refs'].append(original_text)
+                results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                results['perplexity'][ratio].append(reconstructed_text)
+                results['bleu4'][ratio]['refs'].append(original_text)
+                results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                results['steps'][ratio].append(max_iterations)
+    
+    # Aggregate results
+    aggregated = {
+        'exact_match': {},
+        'bertscore': {},
+        'perplexity': {},
+        'bleu4': {},
+        'steps': {}
+    }
+    
+    print("\nCalculating metrics...")
+    for ratio in tqdm(mask_ratios, desc="Aggregating"):
+        aggregated['exact_match'][ratio] = np.mean(results['exact_match'][ratio]) if results['exact_match'][ratio] else 0.0
+        aggregated['bertscore'][ratio] = metric_calc.calculate_bertscore(
+            results['bertscore'][ratio]['refs'],
+            results['bertscore'][ratio]['preds']
+        ) if results['bertscore'][ratio]['refs'] else 0.0
+        aggregated['perplexity'][ratio] = metric_calc.calculate_perplexity_batch(
+            results['perplexity'][ratio]
+        ) if results['perplexity'][ratio] else float('inf')
+        aggregated['bleu4'][ratio] = metric_calc.calculate_bleu4(
+            results['bleu4'][ratio]['refs'],
+            results['bleu4'][ratio]['preds']
+        ) if results['bleu4'][ratio]['refs'] else 0.0
+        aggregated['steps'][ratio] = np.mean(results['steps'][ratio]) if results['steps'][ratio] else max_iterations
+    
+    return aggregated
+
+
+def test_mdlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len,
+                   metric_calc, num_steps=1000, sampler='ddpm_cache', batch_size=32):
+    """Test MDLM model with diffusion-based sampling (batched)"""
+    model.eval()
+    mask_token_id = tokenizer.mask_token_id
+    pad_token_id = tokenizer.pad_token_id or 0
+    
+    # Initialize result storage
+    results = {
+        'exact_match': {ratio: [] for ratio in mask_ratios},
+        'bertscore': {ratio: {'refs': [], 'preds': []} for ratio in mask_ratios},
+        'perplexity': {ratio: [] for ratio in mask_ratios},
+        'bleu4': {ratio: {'refs': [], 'preds': []} for ratio in mask_ratios},
+        'steps': {ratio: [] for ratio in mask_ratios}
+    }
+    
+    print(f"\nTesting MDLM diffusion sampling (num_steps={num_steps}, sampler={sampler}, max_seq_len={max_seq_len}, batch_size={batch_size})...")
+    
+    # Get special token IDs to exclude from masking
+    special_token_ids = set(tokenizer.all_special_ids)
+    
+    # Tokenize all texts first
+    all_tokens = []
+    all_texts = []
+    
+    for text in tqdm(test_texts, desc="Tokenizing"):
+        encoded = tokenizer(
+            text, 
+            return_tensors='pt', 
+            truncation=True, 
+            max_length=max_seq_len,
+            padding=False
+        )
+        tokens = encoded['input_ids'].squeeze(0)
+        
+        if len(tokens) >= 10:
+            all_tokens.append(tokens)
+            all_texts.append(tokenizer.decode(tokens, skip_special_tokens=True))
+    
+    # Process in batches for each masking ratio
+    for ratio in mask_ratios:
+        print(f"\nProcessing masking ratio: {ratio*100:.0f}%")
+        
+        for i in tqdm(range(0, len(all_tokens), batch_size), desc=f"Batches ({ratio*100:.0f}%)"):
+            batch_tokens = all_tokens[i:i+batch_size]
+            batch_texts = all_texts[i:i+batch_size]
+            
+            # Prepare batch
+            batch_input_ids = []
+            batch_eval_masks = []
+            batch_original_tokens = []
+            
+            for tokens in batch_tokens:
+                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
+                batch_input_ids.append(masked_tokens)
+                batch_eval_masks.append(eval_mask)
+                batch_original_tokens.append(tokens)
+            
+            # Pad batch
+            max_len = max(len(t) for t in batch_input_ids)
+            padded_input_ids = []
+            padded_attention_masks = []
+            
+            for masked_tokens in batch_input_ids:
+                pad_len = max_len - len(masked_tokens)
+                if pad_len > 0:
+                    padded_input_ids.append(
+                        torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
+                    )
+                    padded_attention_masks.append(
+                        torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])
+                    )
+                else:
+                    padded_input_ids.append(masked_tokens)
+                    padded_attention_masks.append(torch.ones(len(masked_tokens)))
+            
+            batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
+            batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
+            
+            # MDLM diffusion sampling (batch)
+            with torch.no_grad():
+                pred_tokens_batch, actual_steps = model.inference(
+                    batch_input_ids_tensor,
+                    attention_mask=batch_attention_masks_tensor,
+                    num_steps=num_steps,
+                    sampler=sampler
+                )
+                pred_tokens_batch = pred_tokens_batch.cpu()
+            
+            # Process each sample
+            for j in range(len(batch_tokens)):
+                original_tokens = batch_original_tokens[j]
+                eval_mask = batch_eval_masks[j]
+                pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
+                
+                # Calculate metrics
+                accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
+                results['exact_match'][ratio].append(accuracy)
+                
+                reconstructed_tokens = original_tokens.clone()
+                reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
+                reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
+                original_text = batch_texts[j]
+                
+                results['bertscore'][ratio]['refs'].append(original_text)
+                results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                results['perplexity'][ratio].append(reconstructed_text)
+                results['bleu4'][ratio]['refs'].append(original_text)
+                results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                results['steps'][ratio].append(actual_steps)
+    
+    # Aggregate results
+    aggregated = {
+        'exact_match': {},
+        'bertscore': {},
+        'perplexity': {},
+        'bleu4': {},
+        'steps': {}
+    }
+    
+    print("\nCalculating metrics...")
+    for ratio in tqdm(mask_ratios, desc="Aggregating"):
+        aggregated['exact_match'][ratio] = np.mean(results['exact_match'][ratio]) if results['exact_match'][ratio] else 0.0
+        aggregated['bertscore'][ratio] = metric_calc.calculate_bertscore(
+            results['bertscore'][ratio]['refs'],
+            results['bertscore'][ratio]['preds']
+        ) if results['bertscore'][ratio]['refs'] else 0.0
+        aggregated['perplexity'][ratio] = metric_calc.calculate_perplexity_batch(
+            results['perplexity'][ratio]
+        ) if results['perplexity'][ratio] else float('inf')
+        aggregated['bleu4'][ratio] = metric_calc.calculate_bleu4(
+            results['bleu4'][ratio]['refs'],
+            results['bleu4'][ratio]['preds']
+        ) if results['bleu4'][ratio]['refs'] else 0.0
+        aggregated['steps'][ratio] = np.mean(results['steps'][ratio]) if results['steps'][ratio] else num_steps
     
     return aggregated
 
@@ -844,11 +1123,8 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         
     elif model_type == 'mlm':
         # Load MLM model (BERT/RoBERTa) using wrapper class
-        model_name_hf = config['model']['name']
-        tokenizer = AutoTokenizer.from_pretrained(model_name_hf)
-        
-        # Use MLM wrapper class to match checkpoint keys
-        model = MLM(model_name=model_name_hf)
+        model = MLM.from_config(config)
+        tokenizer = AutoTokenizer.from_pretrained(config['model'].get('architecture', config['model'].get('name', 'bert-base-uncased')))
         
         checkpoint_path = Path(checkpoint_path)
         if checkpoint_path.suffix == '.pt':
@@ -879,15 +1155,81 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         )
         
         # Extract model name from config
-        if 'bert' in model_name_hf.lower():
+        architecture = config['model'].get('architecture', config['model'].get('name', 'bert-base-uncased'))
+        if 'bert' in architecture.lower():
             model_name = "BERT-base"
-        elif 'roberta' in model_name_hf.lower():
+        elif 'roberta' in architecture.lower():
             model_name = "RoBERTa-base"
         else:
-            model_name = model_name_hf
+            model_name = architecture
+    
+    elif model_type == 'cmlm':
+        # Load CMLM model
+        model = CMLM.from_config(config)
+        tokenizer = AutoTokenizer.from_pretrained(config['model'].get('architecture', 'bert-base-uncased'))
+        
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        
+        model = model.to(device)
+        model.eval()
+        
+        # Load test data
+        test_texts = load_test_texts_roberta(config, tokenizer, num_samples=num_samples)
+        print(f"Loaded {len(test_texts)} test texts")
+        
+        # Set parameters
+        max_seq_len = max_seq_len if max_seq_len is not None else config['data'].get('max_seq_length', 512)
+        max_iterations = config.get('cmlm', {}).get('max_iterations', 10)
+        
+        # Test CMLM model (similar to roberta but with iterative refinement)
+        results = test_cmlm_model(
+            model, tokenizer, test_texts, mask_ratios,
+            device, max_seq_len, metric_calc, max_iterations, batch_size
+        )
+        
+        model_name = "CMLM"
+    
+    elif model_type == 'mdlm':
+        # Load MDLM model
+        model = MDLM.from_config(config)
+        tokenizer = AutoTokenizer.from_pretrained(config['model'].get('architecture', 'bert-base-uncased'))
+        
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        
+        model = model.to(device)
+        model.eval()
+        
+        # Load test data
+        test_texts = load_test_texts_roberta(config, tokenizer, num_samples=num_samples)
+        print(f"Loaded {len(test_texts)} test texts")
+        
+        # Set parameters
+        max_seq_len = max_seq_len if max_seq_len is not None else config['data'].get('max_seq_length', 512)
+        num_steps = config.get('mdlm', {}).get('num_steps', 1000)
+        sampler = config.get('mdlm', {}).get('sampler', 'ddpm_cache')
+        
+        # Test MDLM model (diffusion-based generation)
+        results = test_mdlm_model(
+            model, tokenizer, test_texts, mask_ratios,
+            device, max_seq_len, metric_calc, num_steps, sampler, batch_size
+        )
+        
+        model_name = "MDLM"
     
     else:
-        raise ValueError(f"Unknown model type: {model_type}")
+        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', 'cmlm', or 'mdlm'")
     
     # Print results
     print("\n" + "="*80)

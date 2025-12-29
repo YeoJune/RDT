@@ -7,7 +7,8 @@ from transformers import AutoTokenizer
 
 from rdt.models import RDT, MLM
 from rdt.models.cmlm import CMLM
-from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders
+from rdt.models.mdlm import MDLM
+from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders, create_mdlm_dataloaders
 from rdt.evaluation import Evaluator
 from rdt.utils import load_config, load_checkpoint, get_device, create_model_from_config
 
@@ -33,6 +34,12 @@ def main():
     # CMLM-specific arguments
     parser.add_argument('--max-iterations', type=int, default=10,
                         help='Max mask-predict iterations for CMLM')
+    # MDLM-specific arguments
+    parser.add_argument('--num-steps', type=int, default=1000,
+                        help='Number of denoising steps for MDLM')
+    parser.add_argument('--sampler', type=str, default='ddpm_cache',
+                        choices=['ddpm', 'ddpm_cache', 'analytic'],
+                        help='Sampling strategy for MDLM')
     
     args = parser.parse_args()
     
@@ -91,16 +98,24 @@ def main():
         
     elif model_type == 'cmlm':
         # Load CMLM model
-        model_name = config['model']['name']
-        model = CMLM(model_name=model_name)
+        model = CMLM.from_config(config)
         checkpoint = load_checkpoint(args.checkpoint, model)
         
         # Create dataloader
         print(f"\nPreparing CMLM {args.split} data...")
         _, dataloader = create_cmlm_dataloaders(config)
         
+    elif model_type == 'mdlm':
+        # Load MDLM model
+        model = MDLM.from_config(config)
+        checkpoint = load_checkpoint(args.checkpoint, model)
+        
+        # Create dataloader
+        print(f"\nPreparing MDLM {args.split} data...")
+        _, dataloader = create_mdlm_dataloaders(config)
+        
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', or 'cmlm'")
+        raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', 'cmlm', or 'mdlm'")
     
     model = model.to(device)
     print("Model loaded successfully!")
@@ -124,6 +139,12 @@ def main():
             dataloader,
             max_iterations=args.max_iterations
         )
+    elif model_type == 'mdlm':
+        results = evaluator.evaluate(
+            dataloader,
+            num_steps=args.num_steps,
+            sampler=args.sampler
+        )
     else:  # mlm
         results = evaluator.evaluate(dataloader)
     
@@ -137,6 +158,9 @@ def main():
         results['threshold'] = args.threshold
     elif model_type == 'cmlm':
         results['max_iterations'] = args.max_iterations
+    elif model_type == 'mdlm':
+        results['num_steps'] = args.num_steps
+        results['sampler'] = args.sampler
     
     # Print results
     evaluator.print_results(results)

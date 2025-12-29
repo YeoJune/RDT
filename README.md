@@ -91,39 +91,50 @@ The project is organized to clearly separate the neural architecture, training l
 ```bash
 rdt/
 ├── models/              # Core Neural Architectures
+│   ├── __init__.py
 │   ├── rdt.py              # RDT Implementation (RoPE, MLP I/O, AdaLN, Gate MLP)
-│   ├── mlm.py              # MLM Wrapper for BERT/RoBERTa
-│   ├── cmlm.py             # Conditional MLM (Mask-Predict)
+│   ├── mlm.py              # MLM Wrapper for BERT/RoBERTa (single-pass)
+│   ├── cmlm.py             # Conditional MLM (Mask-Predict, confidence-based)
+│   ├── mdlm.py             # Masked Diffusion LM (SUBS parameterization)
 │   └── bert_init.py        # Pretrained weight initialization utilities
 │
 ├── training/            # Training Logic
+│   ├── __init__.py
 │   ├── rdt_trainer.py      # RDT Trainer (Latent Consistency + Gate Loss)
 │   │                       #   with Scheduled Sampling for gate predictions
-│   └── mlm_trainer.py      # Standard MLM Trainer for baselines
+│   └── mlm_trainer.py      # Unified Trainer for MLM/CMLM/MDLM baselines
 │
 ├── data/                # Data Pipeline
+│   ├── __init__.py
 │   ├── datasets.py         # StreamingTextDataset & WikiTextDataset
 │   └── collators.py        # RDTCollator, MLMCollator (masking & chain generation)
 │
 ├── evaluation/          # Evaluation Tools
-│   ├── evaluator.py        # Unified evaluator for RDT/MLM/CMLM
+│   ├── __init__.py
+│   ├── evaluator.py        # Unified evaluator for RDT/MLM/CMLM/MDLM
 │   └── metrics.py          # Perplexity, Accuracy calculations
 │
 ├── scripts/             # CLI Entry Points
-│   ├── train.py            # Unified training script (RDT/MLM/CMLM)
+│   ├── __init__.py
+│   ├── train.py            # Unified training script (RDT/MLM/CMLM/MDLM)
 │   ├── evaluate.py         # Model evaluation script
 │   ├── inference.py        # Interactive inference for all models
 │   ├── test_masking.py     # Masking sensitivity analysis
 │   └── plot_training.py    # Training metrics visualization
 │
 ├── configs/             # Hyperparameter Configurations
-│   ├── base.yaml           # Default RDT configuration
-│   ├── bert_baseline.yaml  # BERT baseline settings
-│   └── roberta_baseline.yaml # RoBERTa baseline settings
+│   ├── __init__.py
+│   ├── rdt.yaml            # RDT configuration (recursive denoising)
+│   ├── mlm.yaml            # MLM baseline (BERT-style single-pass)
+│   ├── cmlm.yaml           # CMLM baseline (iterative mask-predict)
+│   └── mdlm.yaml           # MDLM baseline (diffusion-based generation)
 │
-└── utils/
-    ├── utils.py            # General utilities & model creation
-    └── logger.py           # Logging utilities
+├── utils/               # Utility Functions
+│   ├── __init__.py
+│   └── logger.py           # CSV logging utilities
+│
+├── utils.py             # Main utility functions (config, checkpoint, etc.)
+└── __init__.py          # Package initialization
 ```
 
 ---
@@ -157,20 +168,23 @@ pip install -e ".[dev]"
 Train RDT, MLM, or CMLM models using the unified training script. The RDT trainer supports **Scheduled Sampling**, transitioning from Ground-Truth gate scores to Predicted gate scores to reduce exposure bias.
 
 ```bash
-# Train RDT with default configuration
-rdt-train --config rdt/configs/base.yaml --model_type rdt
+# Train RDT (Recursive Denoising Transformer)
+rdt-train --config rdt/configs/rdt.yaml
 
-# Train BERT baseline
-rdt-train --config rdt/configs/bert_baseline.yaml --model_type mlm
+# Train MLM baseline (BERT-style single-pass)
+rdt-train --config rdt/configs/mlm.yaml
 
-# Train CMLM baseline
-rdt-train --config rdt/configs/base.yaml --model_type cmlm --model_name bert-base-uncased
+# Train CMLM baseline (iterative mask-predict)
+rdt-train --config rdt/configs/cmlm.yaml
 
-# Custom output directory
-rdt-train --config rdt/configs/base.yaml --output_dir ./checkpoints/exp_01
+# Train MDLM baseline (diffusion-based generation)
+rdt-train --config rdt/configs/mdlm.yaml
 
-# Resume from checkpoint
-rdt-train --config rdt/configs/base.yaml --resume ./checkpoints/exp_01/checkpoint_epoch_5.pt
+# Resume from checkpoint (all models)
+rdt-train --config rdt/configs/rdt.yaml --checkpoint ./checkpoints/rdt/checkpoint_epoch_5.pt
+
+# Load pretrained weights only (start training from scratch)
+rdt-train --config rdt/configs/mlm.yaml --pretrained ./checkpoints/mlm/best_model.pt
 ```
 
 ### 2. Inference
@@ -178,28 +192,36 @@ rdt-train --config rdt/configs/base.yaml --resume ./checkpoints/exp_01/checkpoin
 Run inference with any trained model (RDT/MLM/CMLM). RDT uses **Adaptive Stopping** based on gate scores for efficient computation.
 
 ```bash
-# Interactive mode - RDT
-rdt-inference --checkpoint checkpoints/rdt_best.pt --model_type rdt --interactive
+# Interactive mode - RDT (recursive denoising)
+rdt-inference --checkpoint checkpoints/rdt/best_model.pt --config rdt/configs/rdt.yaml --interactive
 
-# Interactive mode - MLM
-rdt-inference --checkpoint checkpoints/mlm_best.pt --model_type mlm --interactive
+# Interactive mode - MLM (single-pass)
+rdt-inference --checkpoint checkpoints/mlm/best_model.pt --config rdt/configs/mlm.yaml --interactive
 
-# Interactive mode - CMLM
-rdt-inference --checkpoint checkpoints/cmlm_best.pt --model_type cmlm --interactive
+# Interactive mode - CMLM (iterative mask-predict)
+rdt-inference --checkpoint checkpoints/cmlm/best_model.pt --config rdt/configs/cmlm.yaml --interactive
+
+# Interactive mode - MDLM (diffusion sampling)
+rdt-inference --checkpoint checkpoints/mdlm/best_model.pt --config rdt/configs/mdlm.yaml --interactive
 
 # Single text inference - RDT
-rdt-inference --checkpoint checkpoints/rdt_best.pt --model_type rdt \
+rdt-inference --checkpoint checkpoints/rdt/best_model.pt --config rdt/configs/rdt.yaml \
     --text "The quick brown [MASK] jumps over the lazy [MASK]." \
-    --max_steps 10 --threshold 0.05
+    --max-steps 10 --threshold 0.05
 
 # Single text inference - MLM (single pass)
-rdt-inference --checkpoint checkpoints/mlm_best.pt --model_type mlm \
+rdt-inference --checkpoint checkpoints/mlm/best_model.pt --config rdt/configs/mlm.yaml \
     --text "The capital of France is [MASK]."
 
 # Single text inference - CMLM (iterative refinement)
-rdt-inference --checkpoint checkpoints/cmlm_best.pt --model_type cmlm \
+rdt-inference --checkpoint checkpoints/cmlm/best_model.pt --config rdt/configs/cmlm.yaml \
     --text "The quick brown [MASK] jumps over the lazy [MASK]." \
-    --max_iterations 10
+    --max-iterations 10
+
+# Single text inference - MDLM (diffusion sampling)
+rdt-inference --checkpoint checkpoints/mdlm/best_model.pt --config rdt/configs/mdlm.yaml \
+    --text "The quick brown [MASK] jumps over the lazy [MASK]." \
+    --num-steps 1000 --sampler ddpm_cache
 ```
 
 **RDT Output Example:**
@@ -212,35 +234,51 @@ rdt-inference --checkpoint checkpoints/cmlm_best.pt --model_type cmlm \
 ✓ Completed in 3 steps (Gate < 0.05)
 ```
 
+**Model Comparison:**
+
+| Model    | Method              | Key Feature                           | Inference Steps  |
+| -------- | ------------------- | ------------------------------------- | ---------------- |
+| **RDT**  | Recursive denoising | Gate-based adaptive stopping          | Variable (1-20)  |
+| **MLM**  | Single-pass         | Direct token prediction               | Fixed (1)        |
+| **CMLM** | Mask-predict        | Confidence-based iterative refinement | Fixed (10-15)    |
+| **MDLM** | Diffusion           | Random remasking with cosine schedule | Fixed (100-1000) |
+
 ### 3. Evaluation
 
 Evaluate model performance on standard benchmarks. Supports accuracy, BLEU, and BERTScore metrics.
 
 ```bash
 # Evaluate RDT model
-rdt-evaluate --checkpoint checkpoints/rdt_best.pt --model_type rdt \
-    --dataset wikitext --split test --mask_ratio 0.5
+rdt-evaluate --config rdt/configs/rdt.yaml --checkpoint checkpoints/rdt/best_model.pt \
+    --split test --max-steps 20 --threshold 0.02
 
 # Evaluate MLM baseline
-rdt-evaluate --checkpoint checkpoints/mlm_best.pt --model_type mlm \
-    --dataset wikitext --split test
+rdt-evaluate --config rdt/configs/mlm.yaml --checkpoint checkpoints/mlm/best_model.pt \
+    --split test
 
 # Evaluate CMLM baseline
-rdt-evaluate --checkpoint checkpoints/cmlm_best.pt --model_type cmlm \
-    --dataset wikitext --split test --max_iterations 10
+rdt-evaluate --config rdt/configs/cmlm.yaml --checkpoint checkpoints/cmlm/best_model.pt \
+    --split test --max-iterations 10
 
-# Masking sensitivity analysis
-rdt-test-masking --checkpoint checkpoints/rdt_best.pt --model_type rdt \
-    --dataset wikitext --num_samples 100
+# Evaluate MDLM baseline
+rdt-evaluate --config rdt/configs/mdlm.yaml --checkpoint checkpoints/mdlm/best_model.pt \
+    --split test --num-steps 1000 --sampler ddpm_cache
+
+# Masking sensitivity analysis (all models)
+rdt-test-masking --config rdt/configs/rdt.yaml --checkpoint checkpoints/rdt/best_model.pt \
+    --num-samples 100
+
+rdt-test-masking --config rdt/configs/mdlm.yaml --checkpoint checkpoints/mdlm/best_model.pt \
+    --num-samples 100
 ```
 
 **Available Commands:**
 
-- `rdt-train` - Train models (RDT/MLM/CMLM)
-- `rdt-evaluate` - Evaluate trained models
-- `rdt-inference` - Interactive or single-text inference
-- `rdt-test-masking` - Analyze performance across different masking ratios
-- `rdt-plot` - Visualize training metrics from logs
+- `rdt-train` - Train models (RDT/MLM/CMLM/MDLM)
+- `rdt-evaluate` - Evaluate trained models on test datasets
+- `rdt-inference` - Interactive or single-text inference for all models
+- `rdt-test-masking` - Analyze reconstruction performance across masking ratios
+- `rdt-plot` - Visualize training metrics from CSV logs
 
 ---
 

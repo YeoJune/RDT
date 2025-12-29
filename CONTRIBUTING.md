@@ -35,7 +35,8 @@ This installs:
 
 ```bash
 python -c "import rdt; print(rdt.__version__)"
-python -c "from rdt.models import RDT, MLM, CMLM; print('OK')"
+python -c "from rdt.models import RDT, MLM, CMLM, MDLM; print('All models imported successfully!')"
+python -c "from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders, create_mdlm_dataloaders; print('All dataloaders available!')"
 ```
 
 ## Code Style
