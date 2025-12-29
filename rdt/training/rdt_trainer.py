@@ -12,7 +12,7 @@ from typing import Dict, Tuple, Optional
 import math
 
 from ..models.rdt import RDT
-from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters, CSVLogger
+from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters, count_parameters_without_context, CSVLogger
 
 
 class RDTTrainer:
@@ -100,7 +100,9 @@ class RDTTrainer:
         
         # Print model info
         num_params = count_parameters(model)
+        num_params_no_context = count_parameters_without_context(model)
         print(f"Model parameters: {num_params:,}")
+        print(f"Model parameters (without context): {num_params_no_context:,}")
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""
