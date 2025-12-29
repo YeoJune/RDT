@@ -803,6 +803,90 @@ class RDT(nn.Module):
         
         return hidden, next_gate_pred, next_pooled
     
+    def encode_tokens(self, tokens):
+        """
+        Initial encoding: tokens → h_0
+        
+        Args:
+            tokens: [B, L] token indices
+        
+        Returns:
+            hidden: [B, L, D] initial hidden states (before any recursive steps)
+        """
+        x = self.token_embedding(tokens) * math.sqrt(self.d_model)
+        hidden = self.input_processor(x)
+        hidden = self.input_norm(hidden)
+        return hidden
+    
+    def forward_step(self, hidden, attention_mask=None,
+                     last_gate_score=None, last_pooled=None,
+                     gt_timestep=None, sampling_prob=0.0):
+        """
+        Single recursive step: h_i → h_{i+1}
+        
+        Args:
+            hidden: [B, L, D] current hidden states
+            attention_mask: [B, L] attention mask (1=valid, 0=padding)
+            last_gate_score: [B, 1] previous gate prediction
+            last_pooled: [B, D] previous pooled features
+            gt_timestep: [B, 1] ground truth timestep for scheduled sampling
+            sampling_prob: probability of using GT vs predicted gate
+        
+        Returns:
+            hidden: [B, L, D] next hidden states (after recursive blocks)
+            predicted_gate: [B, 1] gate prediction for current hidden
+            current_pooled: [B, D] current pooled features
+        """
+        # 1. Gate prediction for current state
+        predicted_gate, current_pooled = self.gate(
+            hidden, attention_mask, last_pooled, last_gate_score
+        )
+        
+        # 2. Scheduled sampling
+        if self.training and gt_timestep is not None:
+            if sampling_prob > 0.0:
+                use_gt = torch.rand(1).item() < sampling_prob
+                if use_gt:
+                    current_noise = gt_timestep
+                else:
+                    current_noise = predicted_gate.detach()
+            else:
+                current_noise = predicted_gate.detach()
+        else:
+            current_noise = predicted_gate.detach()
+        
+        # 3. Create noise embedding
+        noise_vec = self.noise_emb(current_noise)
+        
+        # 4. Prepare masks
+        src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        
+        # 5. Recursive encoding with AdaLN
+        for layer in self.encoder_layers:
+            if self.gradient_checkpointing and self.training:
+                def create_custom_forward(module):
+                    def custom_forward(h, n_emb, sm):
+                        return module(h, noise_emb=n_emb, context=None,
+                                    src_key_padding_mask=sm,
+                                    context_key_padding_mask=None)
+                    return custom_forward
+                
+                hidden = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    hidden, noise_vec, src_key_padding_mask,
+                    use_reentrant=False
+                )
+            else:
+                hidden = layer(
+                    hidden,
+                    noise_emb=noise_vec,
+                    context=None,
+                    src_key_padding_mask=src_key_padding_mask,
+                    context_key_padding_mask=None
+                )
+        
+        return hidden, predicted_gate, current_pooled
+    
     def decode(self, hidden, attention_mask=None):
         """
         Output Decoder: hidden -> logits

@@ -149,75 +149,78 @@ class RDTTrainer:
         
         return sampling_prob
     
-    def train_step(self, batch: Dict) -> Tuple[float, float, float]:
+    def train_step(self, batch: Dict) -> Tuple[float, float, float, float]:
         self.model.train()
         
-        # 데이터 로드
+        # Load data
         input_tokens = batch['input'].to(self.device)
         targets = batch['targets'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)
         loss_masks = batch['loss_masks'].to(self.device)
-        gate_targets = batch['gate_targets'].to(self.device)  # [B, L+1] - s_0~s_L의 step
+        gate_targets = batch['gate_targets'].to(self.device)  # [B, L+1]
         chain_lengths = batch['chain_lengths']
         
         batch_size, seq_len = input_tokens.shape
         actual_max_length = chain_lengths.max().item()
         
-        accumulated_loss = 0
-        total_recon_loss = 0
-        total_gate_loss = 0
-        num_valid_steps = 0
-        
         # Scheduled Sampling Probability
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
         
         with torch.amp.autocast('cuda', enabled=self.use_amp):
-            # 0. Initial embedding and gate prediction for h_0
-            # s_0 -> input_encoder -> h_0
-            # h_0 -> gate -> gate_pred_0 (should predict s_0's step)
-            init_emb = self.model.token_embedding(input_tokens) * math.sqrt(self.model.d_model)
-            init_emb = self.model.pos_encoding(init_emb)
-            src_key_padding_mask = (attention_mask == 0)
-            h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
-            h_0 = self.model.input_norm(h_0)
-            # First gate prediction (no previous prediction, so prev_pooled=None, prev_gate=None)
-            gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask, prev_pooled=None, prev_gate=None)
+            # === Step 0: Initial Encoding ===
+            # s_0 → h_0
+            h_0 = self.model.encode_tokens(input_tokens)
             
-            # Gate Loss for h_0 (predicting s_0's step)
-            gate_target_0 = gate_targets[:, 0].unsqueeze(1)  # s_0의 step
+            # h_0 → gate_pred_0 (predicting s_0's noise level)
+            gate_pred_0, pooled_0 = self.model.gate(
+                h_0, attention_mask, 
+                prev_pooled=None, 
+                prev_gate=None
+            )
+            
+            # Gate Loss for h_0
+            gate_target_0 = gate_targets[:, 0].unsqueeze(1)
             gate_loss_0 = self.gate_criterion(gate_pred_0, gate_target_0)
+            
             accumulated_loss = self.loss_weight_gate * gate_loss_0
-            total_gate_loss += gate_loss_0.item()
-            num_valid_steps += 1
+            total_recon_loss = 0.0
+            total_gate_loss = gate_loss_0.item()
+            num_valid_steps = 1
             
             # Store hidden states for aux loss (if enabled)
             hidden_states = [] if self.loss_weight_aux > 0 else None
             
-            # 1. First main encoder forward: h_0 -> h_1
-            step_gt_timestep = gate_targets[:, 0].unsqueeze(1)  # s_0의 step (for scheduled sampling)
-            hidden, gate_pred, pooled = self.model(
-                h_0,  # Pass h_0 directly
-                attention_mask=attention_mask,
-                last_gate_score=gate_pred_0,
-                last_pooled=pooled_0,  # Pass pooled features from h_0
-                is_first_step=False,  # Already processed by input_encoder
-                gt_timestep=step_gt_timestep,
-                sampling_prob=sampling_prob
-            )
+            # === Iterative Recursive Steps ===
+            hidden = h_0
+            gate_pred = gate_pred_0
+            pooled = pooled_0
             
             for step_idx in range(actual_max_length):
                 valid_mask = chain_lengths > step_idx
-                if valid_mask.sum() == 0: break
+                if valid_mask.sum() == 0:
+                    break
                 
-                # Store hidden for aux loss (gradient flow 유지!)
+                # Forward step: h_i → h_{i+1}
+                step_gt_timestep = gate_targets[:, step_idx].unsqueeze(1)
+                hidden, gate_pred, pooled = self.model.forward_step(
+                    hidden,
+                    attention_mask=attention_mask,
+                    last_gate_score=gate_pred,
+                    last_pooled=pooled,
+                    gt_timestep=step_gt_timestep,
+                    sampling_prob=sampling_prob
+                )
+                
+                # Store hidden for aux loss
                 if hidden_states is not None:
                     hidden_states.append(hidden)
                 
+                # Get targets and masks for this step
                 step_targets = targets[:, step_idx, :]
                 step_loss_mask = loss_masks[:, step_idx, :]
-                step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)  # L+1\uac1c \uc911 1~L\ubc88\uc9f8
+                step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)
                 
-                # 2. Reconstruction Loss (Masked Selection)
+                # Reconstruction Loss
                 if step_loss_mask.sum() > 0:
                     logits = self.model.decode(hidden, attention_mask)
                     selected_logits = logits[step_loss_mask]
@@ -226,59 +229,38 @@ class RDTTrainer:
                 else:
                     recon_loss = torch.tensor(0.0, device=self.device)
                 
-                # 3. Gate Loss (h_{step_idx+1}이 s_{step_idx+1}의 step 예측)
+                # Gate Loss (h_{i+1} predicting s_{i+1}'s noise level)
                 gate_pred_valid = gate_pred[valid_mask]
                 gate_target_valid = step_gate_targets[valid_mask]
                 gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.device)
                 
-                # Step Loss Accumulation
+                # Accumulate losses
                 step_loss = self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss
                 accumulated_loss = accumulated_loss + step_loss
                 
                 total_recon_loss += recon_loss.item()
                 total_gate_loss += gate_loss.item()
                 num_valid_steps += 1
-                
-                # Next Step (Recursive)
-                if step_idx < actual_max_length - 1:
-                    next_gt_timestep = gate_targets[:, step_idx + 1].unsqueeze(1)  # [B, 1]
-                    hidden, gate_pred, pooled = self.model.forward(
-                        hidden,
-                        attention_mask=attention_mask,
-                        last_gate_score=gate_pred,
-                        last_pooled=pooled,
-                        is_first_step=False,
-                        gt_timestep=next_gt_timestep,
-                        sampling_prob=sampling_prob
-                    )
             
-            # Final Loss Calculation
+            # Average main loss
             main_loss = accumulated_loss / max(1, num_valid_steps)
             
-            # === Auxiliary Loss: Latent Consistency (Sub-sampling) ===
-            if self.loss_weight_aux > 0:
-                # Compute micro-batch size (at least 1 sample)
+            # === Auxiliary Loss: Latent Consistency ===
+            if self.loss_weight_aux > 0 and len(hidden_states) > 0:
                 aux_batch_size = max(1, int(batch_size * self.aux_ratio))
                 
                 aux_loss = 0
                 num_aux_steps = 0
                 
-                src_key_padding_mask = (attention_mask[:aux_batch_size, :] == 0)
-                
-                # Latent Consistency Loss for each step
                 for step_idx in range(len(hidden_states)):
-                    # 1. Ground Truth hidden: s_{i+1} -> input_encoder -> h_GT (detached!)
-                    step_target = targets[:aux_batch_size, step_idx, :]  # [Aux_B, Seq]
+                    # Ground truth hidden: s_{i+1} → h_GT
+                    step_target = targets[:aux_batch_size, step_idx, :]
+                    h_GT = self.model.encode_tokens(step_target)
                     
-                    target_emb = self.model.token_embedding(step_target) * math.sqrt(self.model.d_model)
-                    target_emb = self.model.pos_encoding(target_emb)
-                    h_GT = self.model.input_encoder(target_emb, src_key_padding_mask=src_key_padding_mask)
-                    h_GT = self.model.input_norm(h_GT)
+                    # Predicted hidden: h_{i+1}
+                    h_pred = hidden_states[step_idx][:aux_batch_size]
                     
-                    # 2. Predicted hidden: h_{i+1} (from main loop, already computed)
-                    h_pred = hidden_states[step_idx][:aux_batch_size]  # [Aux_B, Seq, D]
-                    
-                    # 3. Latent Consistency Loss (MSE on hidden vectors)
+                    # Latent consistency loss
                     latent_loss = nn.functional.mse_loss(h_pred, h_GT)
                     aux_loss += latent_loss
                     num_aux_steps += 1
@@ -289,18 +271,31 @@ class RDTTrainer:
                 aux_loss = torch.tensor(0.0, device=self.device)
                 final_loss = main_loss
         
-        # [수정] Standard Optimization (No Accumulation)
+        # Backward pass
         self.optimizer.zero_grad()
-        final_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-        self.optimizer.step()
+        
+        if self.use_amp:
+            self.scaler.scale(final_loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            final_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.optimizer.step()
         
         if self.scheduler:
             self.scheduler.step()
         
-        return final_loss.item(), total_recon_loss / max(1, num_valid_steps), total_gate_loss / max(1, num_valid_steps), aux_loss.item()
+        return (
+            final_loss.item(),
+            total_recon_loss / max(1, num_valid_steps),
+            total_gate_loss / max(1, num_valid_steps),
+            aux_loss.item()
+        )
     
-    def validate(self) -> Tuple[float, float, float, float]:
+    def validate(self) -> Tuple[float, float, float]:
         self.model.eval()
         total_loss = 0
         total_recon = 0
@@ -313,7 +308,7 @@ class RDTTrainer:
                 targets = batch['targets'].to(self.device)
                 loss_masks = batch['loss_masks'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
-                gate_targets = batch['gate_targets'].to(self.device)  # [B, L+1] - s_0~s_L의 step
+                gate_targets = batch['gate_targets'].to(self.device)
                 chain_lengths = batch['chain_lengths']
                 
                 actual_max_length = chain_lengths.max().item()
@@ -321,36 +316,37 @@ class RDTTrainer:
                 batch_gate = 0
                 num_valid = 0
                 
-                # 0. Initial embedding and gate prediction for h_0
-                init_emb = self.model.token_embedding(input_tokens) * math.sqrt(self.model.d_model)
-                init_emb = self.model.pos_encoding(init_emb)
-                src_key_padding_mask = (attention_mask == 0)
-                h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
-                h_0 = self.model.input_norm(h_0)
-                # First gate prediction (no previous prediction, so prev_pooled=None, prev_gate=None)
-                gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask, prev_pooled=None, prev_gate=None)
+                # Initial encoding
+                h_0 = self.model.encode_tokens(input_tokens)
+                gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask, None, None)
                 
-                # Gate Loss for h_0
+                # Gate loss for h_0
                 gate_target_0 = gate_targets[:, 0].unsqueeze(1)
                 gate_loss_0 = self.gate_criterion(gate_pred_0, gate_target_0)
                 batch_gate += gate_loss_0.item()
                 num_valid += 1
                 
-                hidden, gate_pred, pooled = self.model(
-                    h_0,
-                    attention_mask=attention_mask,
-                    last_gate_score=gate_pred_0,
-                    last_pooled=pooled_0,
-                    is_first_step=False
-                )
+                # Iterative steps
+                hidden = h_0
+                gate_pred = gate_pred_0
+                pooled = pooled_0
                 
                 for step_idx in range(actual_max_length):
                     valid_mask = chain_lengths > step_idx
-                    if valid_mask.sum() == 0: break
+                    if valid_mask.sum() == 0:
+                        break
                     
+                    # Forward step
+                    hidden, gate_pred, pooled = self.model.forward_step(
+                        hidden,
+                        attention_mask=attention_mask,
+                        last_gate_score=gate_pred,
+                        last_pooled=pooled
+                    )
+                    
+                    # Reconstruction loss
                     step_targets = targets[:, step_idx, :]
                     step_loss_mask = loss_masks[:, step_idx, :]
-                    step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)  # L+1\uac1c \uc911 1~L\ubc88\uc9f8
                     
                     if step_loss_mask.sum() > 0:
                         logits = self.model.decode(hidden, attention_mask)
@@ -360,6 +356,8 @@ class RDTTrainer:
                     else:
                         recon_loss = torch.tensor(0.0, device=self.device)
                     
+                    # Gate loss
+                    step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)
                     gate_pred_valid = gate_pred[valid_mask]
                     gate_target_valid = step_gate_targets[valid_mask]
                     gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.device)
@@ -367,15 +365,6 @@ class RDTTrainer:
                     batch_recon += recon_loss.item()
                     batch_gate += gate_loss.item()
                     num_valid += 1
-                    
-                    if step_idx < actual_max_length - 1:
-                        hidden, gate_pred, pooled = self.model.forward(
-                            hidden,
-                            attention_mask=attention_mask,
-                            last_gate_score=gate_pred,
-                            last_pooled=pooled,
-                            is_first_step=False
-                        )
                 
                 if num_valid > 0:
                     avg_recon = batch_recon / num_valid
@@ -387,8 +376,14 @@ class RDTTrainer:
                     total_gate += avg_gate
                     num_batches += 1
         
-        if num_batches == 0: return 0, 0, 0, 0
-        return total_loss / num_batches, total_recon / num_batches, total_gate / num_batches
+        if num_batches == 0:
+            return 0, 0, 0
+        
+        return (
+            total_loss / num_batches,
+            total_recon / num_batches,
+            total_gate / num_batches
+        )
 
     def train(self):
         if self.training_mode == 'epoch':
