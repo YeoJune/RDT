@@ -259,7 +259,7 @@ class RDTTrainer:
                 for step_idx in range(len(hidden_states)):
                     # Ground truth hidden: s_{i+1} → h_GT
                     step_target = targets[:aux_batch_size, step_idx, :]
-                    h_GT = self.model.encode_tokens(step_target)
+                    h_GT = self.model.encode_tokens(step_target).detach()
                     
                     # Predicted hidden: h_{i+1}
                     h_pred = hidden_states[step_idx][:aux_batch_size]
