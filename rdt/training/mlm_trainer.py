@@ -353,10 +353,20 @@ class MLMTrainer:
                     attention_mask = attention_mask.to(self.device)
 
                 if self.model_type == 'mdlm':
-                    # MDLM: masking 및 labels 생성
-                    masked_input_ids, labels, _, _ = self.model.continuous_time_masking(
-                        input_ids, attention_mask
+                    # Weight까지 받아옴
+                    masked_input_ids, labels, t, loss_weight = self.model.continuous_time_masking(
+                        input_ids, attention_mask, low_discrepancy_sampling=True
                     )
+                    # Weighted Loss 계산 (Train과 동일한 기준)
+                    if self.use_amp:
+                        with autocast('cuda'):
+                            loss, logits = self.model.forward_with_time_weighting(
+                                masked_input_ids, attention_mask, labels, loss_weight
+                            )
+                    else:
+                        loss, logits = self.model.forward_with_time_weighting(
+                            masked_input_ids, attention_mask, labels, loss_weight
+                        )
                 elif self.model_type == 'cmlm':
                     # CMLM: masking 및 labels 생성
                     masked_input_ids, labels, _ = self.model.uniform_masking(
