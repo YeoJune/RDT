@@ -76,5 +76,5 @@ output:
 
 # Hardware
 device: "cuda"
-mixed_precision: true
+mixed_precision: false
 seed: 42
