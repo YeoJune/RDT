@@ -474,8 +474,8 @@ class MLMTrainer:
                     self.csv_logger.log(log_data)
                     
                     if self.use_wandb:
-                        wandb.log({f'train/{key}': value for key, value in metrics.items()})
-                        wandb.log({'global_step': self.global_step})
+                        wandb.log({'train/' + k if k not in ['epoch', 'step'] else k: v 
+                                  for k, v in log_data.items()})
                     pbar.set_postfix(loss=f"{metrics['loss']:.4f}", 
                                     acc=f"{metrics['accuracy']:.4f}")
             
@@ -486,8 +486,12 @@ class MLMTrainer:
                 self.csv_logger.log(val_data)
                 
                 if self.use_wandb:
-                    wandb.log({key: value for key, value in val_metrics.items()})
-                    wandb.log({'epoch': epoch})
+                    wandb.log({
+                        'val/loss': val_metrics['val_loss'],
+                        'val/accuracy': val_metrics['val_accuracy'],
+                        'val/perplexity': val_metrics['val_perplexity'],
+                        'epoch': epoch
+                    })
                 
                 print(f"\nValidation - Loss: {val_metrics['val_loss']:.4f}, "
                       f"Accuracy: {val_metrics['val_accuracy']:.4f}, "
@@ -523,8 +527,8 @@ class MLMTrainer:
                     self.csv_logger.log(log_data)
                     
                     if self.use_wandb:
-                        wandb.log({f'train/{key}': value for key, value in metrics.items()})
-                        wandb.log({'step': self.global_step})
+                        wandb.log({'train/' + k if k not in ['epoch', 'step'] else k: v 
+                                  for k, v in log_data.items()})
                     pbar.set_postfix(loss=f"{metrics['loss']:.4f}",
                                     acc=f"{metrics['accuracy']:.4f}")
                 
@@ -535,8 +539,12 @@ class MLMTrainer:
                     self.csv_logger.log(val_data)
                     
                     if self.use_wandb:
-                        wandb.log({key: value for key, value in val_metrics.items()})
-                        wandb.log({'step': self.global_step})
+                        wandb.log({
+                            'val/loss': val_metrics['val_loss'],
+                            'val/accuracy': val_metrics['val_accuracy'],
+                            'val/perplexity': val_metrics['val_perplexity'],
+                            'step': self.global_step
+                        })
                     
                     print(f"\nStep {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}, "
                           f"Accuracy: {val_metrics['val_accuracy']:.4f}, "
