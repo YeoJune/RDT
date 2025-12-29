@@ -729,8 +729,7 @@ def test_mlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             
             # Batch inference
             with torch.no_grad():
-                outputs = model(input_ids=batch_input_ids_tensor, attention_mask=batch_attention_masks_tensor)
-                logits = outputs.logits
+                logits = model(input_ids=batch_input_ids_tensor, attention_mask=batch_attention_masks_tensor)
                 pred_tokens_batch = torch.argmax(logits, dim=-1).cpu()
             
             # Process each sample in batch
