@@ -1,4 +1,4 @@
-"""Test reconstruction capability across different masking levels for RDT and RoBERTa models
+"""Test reconstruction capability across different masking levels for RDT and baseline models (MLM, CMLM, MDLM)
 Enhanced with multiple metrics: BERTScore, Oracle PPL, BLEU-4, Exact Match
 """
 
@@ -184,8 +184,8 @@ def create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids=Non
     return masked_tokens, eval_mask
 
 
-def roberta_single_pass_inference(model, input_ids, attention_mask):
-    """Single forward pass through RoBERTa"""
+def mlm_single_pass_inference(model, input_ids, attention_mask):
+    """Single forward pass through MLM model (BERT/RoBERTa)"""
     with torch.no_grad():
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits
@@ -645,9 +645,9 @@ def test_mdlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_l
     return aggregated
 
 
-def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, 
-                      metric_calc, batch_size=32):
-    """Test RoBERTa model with single-pass inference (batched)"""
+def test_mlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, 
+                   metric_calc, batch_size=32):
+    """Test MLM model with single-pass inference (batched)"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
     pad_token_id = tokenizer.pad_token_id or 0
@@ -661,7 +661,7 @@ def test_roberta_model(model, tokenizer, test_texts, mask_ratios, device, max_se
         'steps': {ratio: [] for ratio in mask_ratios}
     }
     
-    print(f"\nTesting RoBERTa Single-pass reconstruction (max_seq_len={max_seq_len}, batch_size={batch_size})...")
+    print(f"\nTesting MLM single-pass reconstruction (max_seq_len={max_seq_len}, batch_size={batch_size})...")
     
     # Get special token IDs to exclude from masking
     special_token_ids = set(tokenizer.all_special_ids)
@@ -991,8 +991,13 @@ def save_detailed_csv(mask_ratios, results, model_name, output_path):
             ])
 
 
-def load_test_texts_rdt(config, num_samples=1000):
-    """Load test texts using WikiTextDataset for RDT"""
+def load_test_texts_rdt(config, num_samples=None):
+    """Load test texts using WikiTextDataset for RDT
+    
+    Args:
+        config: Configuration dictionary
+        num_samples: Number of samples to load (None = all test samples)
+    """
     from rdt.data import WikiTextDataset
     
     print(f"Loading test data from {config['data']['dataset_name']}...")
@@ -1014,7 +1019,10 @@ def load_test_texts_rdt(config, num_samples=1000):
     texts = []
     tokenizer = dataset.tokenizer
     
-    for tokens in dataset.tokenized_data[:num_samples]:
+    # Use all samples if num_samples is None
+    data_to_process = dataset.tokenized_data if num_samples is None else dataset.tokenized_data[:num_samples]
+    
+    for tokens in data_to_process:
         text = tokenizer.decode(tokens, skip_special_tokens=True)
         if len(text) > 50:
             texts.append(text)
@@ -1022,8 +1030,14 @@ def load_test_texts_rdt(config, num_samples=1000):
     return texts
 
 
-def load_test_texts_roberta(config, tokenizer, num_samples=1000):
-    """Load test texts from WikiText for RoBERTa/MLM models"""
+def load_test_texts_baseline(config, tokenizer, num_samples=None):
+    """Load test texts from WikiText for baseline models (MLM/CMLM/MDLM)
+    
+    Args:
+        config: Configuration dictionary
+        tokenizer: Tokenizer instance
+        num_samples: Number of samples to load (None = all test samples)
+    """
     from datasets import load_dataset
     
     dataset_name = config['data'].get('dataset_name', 'wikitext-2')
@@ -1047,7 +1061,7 @@ def load_test_texts_roberta(config, tokenizer, num_samples=1000):
         text = item['text'].strip()
         if len(text) > 50:
             texts.append(text)
-        if len(texts) >= num_samples:
+        if num_samples is not None and len(texts) >= num_samples:
             break
     
     return texts
@@ -1122,7 +1136,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         model_name = f"RDT"
         
     elif model_type == 'mlm':
-        # Load MLM model (BERT/RoBERTa) using wrapper class
+        # Load MLM model (BERT-based baseline) using wrapper class
         model = MLM.from_config(config)
         tokenizer = AutoTokenizer.from_pretrained(config['model'].get('architecture', config['model'].get('name', 'bert-base-uncased')))
         
@@ -1142,14 +1156,14 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         model.eval()
         
         # Load test data
-        test_texts = load_test_texts_roberta(config, tokenizer, num_samples=num_samples)
+        test_texts = load_test_texts_baseline(config, tokenizer, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")
         
         # Set parameters
         max_seq_len = max_seq_len if max_seq_len is not None else config['data'].get('max_seq_length', 128)
         
         # Test model
-        results = test_roberta_model(
+        results = test_mlm_model(
             model, tokenizer, test_texts, mask_ratios, 
             device, max_seq_len, metric_calc, batch_size
         )
@@ -1157,11 +1171,11 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         # Extract model name from config
         architecture = config['model'].get('architecture', config['model'].get('name', 'bert-base-uncased'))
         if 'bert' in architecture.lower():
-            model_name = "BERT-base"
+            model_name = "BERT"
         elif 'roberta' in architecture.lower():
-            model_name = "RoBERTa-base"
+            model_name = "RoBERTa"
         else:
-            model_name = architecture
+            model_name = "MLM"
     
     elif model_type == 'cmlm':
         # Load CMLM model
@@ -1180,14 +1194,14 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         model.eval()
         
         # Load test data
-        test_texts = load_test_texts_roberta(config, tokenizer, num_samples=num_samples)
+        test_texts = load_test_texts_baseline(config, tokenizer, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")
         
         # Set parameters
         max_seq_len = max_seq_len if max_seq_len is not None else config['data'].get('max_seq_length', 512)
         max_iterations = config.get('cmlm', {}).get('max_iterations', 10)
         
-        # Test CMLM model (similar to roberta but with iterative refinement)
+        # Test CMLM model (iterative refinement baseline)
         results = test_cmlm_model(
             model, tokenizer, test_texts, mask_ratios,
             device, max_seq_len, metric_calc, max_iterations, batch_size
@@ -1212,7 +1226,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         model.eval()
         
         # Load test data
-        test_texts = load_test_texts_roberta(config, tokenizer, num_samples=num_samples)
+        test_texts = load_test_texts_baseline(config, tokenizer, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")
         
         # Set parameters
@@ -1269,7 +1283,7 @@ def main():
     
     # Common arguments
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
-    parser.add_argument('--num_samples', type=int, default=1000, help='Number of test samples')
+    parser.add_argument('--num_samples', type=int, default=None, help='Number of test samples (default: all)')
     parser.add_argument('--max_seq_len', type=int, default=None, help='Maximum sequence length')
     parser.add_argument('--max_steps', type=int, default=None, help='Maximum inference steps (RDT)')
     parser.add_argument('--threshold', type=float, default=None, help='Confidence threshold (RDT)')
