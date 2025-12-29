@@ -25,7 +25,7 @@ training:
 
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
-  warmup_ratio: 0.1
+  warmup_ratio: 0.05
 
   scheduler: "cosine"
   max_grad_norm: 1.0
@@ -38,7 +38,7 @@ training:
   # Default: true (MLM uses BERT-style by default via HuggingFace DataCollatorForLanguageModeling)
   # Set to false to use 100% [MASK] for consistency with baseline CMLM/MDLM
   bert_masking:
-    enabled: true
+    enabled: false
     mask_prob: 0.8 # Probability of [MASK] token
     random_prob: 0.1 # Probability of random token
     keep_prob: 0.1 # Probability of keeping original

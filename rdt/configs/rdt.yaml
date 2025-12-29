@@ -46,7 +46,7 @@ training:
 
   # BERT-style masking (for masked tokens)
   bert_masking:
-    enabled: true # BERT 스타일 마스킹 활성화 여부
+    enabled: false # BERT 스타일 마스킹 활성화 여부
     mask_prob: 0.8 # [MASK] 토큰으로 대체할 확률
     random_prob: 0.1 # 랜덤 토큰으로 대체할 확률
     keep_prob: 0.1 # 원본 유지 확률 (합: 1.0)
