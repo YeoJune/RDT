@@ -338,6 +338,7 @@ class MLMTrainer:
             'avg_loss_weight': loss_weight.mean().item(),
             'lr': self.scheduler.get_last_lr()[0]
         }
+    
     def evaluate(self):
         """Evaluate on validation set"""
         self.model.eval()
@@ -367,21 +368,22 @@ class MLMTrainer:
                         loss, logits = self.model.forward_with_time_weighting(
                             masked_input_ids, attention_mask, labels, loss_weight
                         )
-                elif self.model_type == 'cmlm':
-                    # CMLM: masking 및 labels 생성
-                    masked_input_ids, labels, _ = self.model.uniform_masking(
-                        input_ids, attention_mask
-                    )
                 else:
-                    # MLM: labels는 collator에서 batch에 포함
-                    labels = batch['labels'].to(self.device)
-                    masked_input_ids = input_ids
+                    if self.model_type == 'cmlm':
+                        # CMLM: masking 및 labels 생성
+                        masked_input_ids, labels, _ = self.model.uniform_masking(
+                            input_ids, attention_mask
+                        )
+                    else:
+                        # MLM: labels는 collator에서 batch에 포함
+                        labels = batch['labels'].to(self.device)
+                        masked_input_ids = input_ids
 
-                if self.use_amp:
-                    with autocast('cuda'):
+                    if self.use_amp:
+                        with autocast('cuda'):
+                            loss, logits = self.model(masked_input_ids, attention_mask, labels)
+                    else:
                         loss, logits = self.model(masked_input_ids, attention_mask, labels)
-                else:
-                    loss, logits = self.model(masked_input_ids, attention_mask, labels)
 
                 # Calculate accuracy
                 mask = labels != -100
@@ -398,12 +400,10 @@ class MLMTrainer:
         
         avg_loss = total_loss / num_batches
         avg_accuracy = total_accuracy / num_batches
-        perplexity = math.exp(avg_loss)
         
         return {
             'val_loss': avg_loss,
-            'val_accuracy': avg_accuracy,
-            'val_perplexity': perplexity
+            'val_accuracy': avg_accuracy
         }
     
     def save_checkpoint(self, filename=None):
@@ -498,13 +498,11 @@ class MLMTrainer:
                     wandb.log({
                         'val/loss': val_metrics['val_loss'],
                         'val/accuracy': val_metrics['val_accuracy'],
-                        'val/perplexity': val_metrics['val_perplexity'],
                         'epoch': epoch
                     })
                 
                 print(f"\nValidation - Loss: {val_metrics['val_loss']:.4f}, "
-                      f"Accuracy: {val_metrics['val_accuracy']:.4f}, "
-                      f"Perplexity: {val_metrics['val_perplexity']:.2f}")
+                      f"Accuracy: {val_metrics['val_accuracy']:.4f}, ")
                 
                 # Save best model
                 if val_metrics['val_loss'] < self.best_val_loss:
@@ -551,13 +549,11 @@ class MLMTrainer:
                         wandb.log({
                             'val/loss': val_metrics['val_loss'],
                             'val/accuracy': val_metrics['val_accuracy'],
-                            'val/perplexity': val_metrics['val_perplexity'],
                             'step': self.global_step
                         })
                     
                     print(f"\nStep {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}, "
-                          f"Accuracy: {val_metrics['val_accuracy']:.4f}, "
-                          f"Perplexity: {val_metrics['val_perplexity']:.2f}")
+                          f"Accuracy: {val_metrics['val_accuracy']:.4f}, ")
                     
                     # Save best model
                     if val_metrics['val_loss'] < self.best_val_loss:
