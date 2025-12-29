@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import wandb
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Optional
@@ -150,7 +150,7 @@ class MLMTrainer:
         
         # Forward pass with AMP
         if self.use_amp:
-            with autocast():
+            with autocast('cuda'):
                 loss, logits = self.model(input_ids, attention_mask, labels)
         else:
             loss, logits = self.model(input_ids, attention_mask, labels)
