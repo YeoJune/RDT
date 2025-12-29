@@ -384,12 +384,10 @@ class MLMTrainer:
         
         avg_loss = total_loss / num_batches
         avg_accuracy = total_accuracy / num_batches
-        perplexity = math.exp(avg_loss)
         
         return {
             'val_loss': avg_loss,
-            'val_accuracy': avg_accuracy,
-            'val_perplexity': perplexity
+            'val_accuracy': avg_accuracy
         }
     
     def _evaluate_cmlm(self):
@@ -432,12 +430,10 @@ class MLMTrainer:
         
         avg_loss = total_loss / num_batches
         avg_accuracy = total_accuracy / num_batches
-        perplexity = math.exp(avg_loss)
         
         return {
             'val_loss': avg_loss,
-            'val_accuracy': avg_accuracy,
-            'val_perplexity': perplexity
+            'val_accuracy': avg_accuracy
         }
     
     def _evaluate_mdlm(self):
@@ -522,13 +518,9 @@ class MLMTrainer:
         avg_loss = total_weighted_loss / total_tokens
         avg_accuracy = total_accuracy / num_batches
         
-        # Cap perplexity for numerical stability
-        perplexity = math.exp(min(avg_loss, 100))
-        
         return {
             'val_loss': avg_loss,
             'val_accuracy': avg_accuracy,
-            'val_perplexity': perplexity,
             'mc_samples': num_mc_samples
         }
 
