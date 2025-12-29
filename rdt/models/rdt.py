@@ -84,8 +84,8 @@ class RotaryPositionalEmbedding(nn.Module):
         
         # Get cached values for current sequence length
         # Shape: [seq_len, dim]
-        cos = self._cos_cached[:seq_len]
-        sin = self._sin_cached[:seq_len]
+        cos = self._cos_cached[:seq_len].to(x.device)
+        sin = self._sin_cached[:seq_len].to(x.device)
         
         # Reshape for broadcasting
         # Need to match x's shape: [..., seq_len, ..., dim]
