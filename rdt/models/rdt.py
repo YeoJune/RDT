@@ -148,6 +148,8 @@ class MLPProcessor(nn.Module):
         layers.append(nn.Linear(hidden_dims[-1], d_model))
         
         self.mlp = nn.Sequential(*layers)
+
+        self.norm = nn.LayerNorm(d_model)
         
         self._init_weights()
     
@@ -179,7 +181,7 @@ class MLPProcessor(nn.Module):
         Returns:
             [B, L, d_model]
         """
-        return self.mlp(x)
+        return x + self.mlp(self.norm(x))
 
 
 # ============================================================================
