@@ -12,8 +12,12 @@ model:
   dropout: 0.1
 
   # MLP I/O Processors
-  input_mlp_hidden: [2048] # Input MLP hidden layers
-  output_mlp_hidden: [2048] # Output MLP hidden layers
+  input_processor_layers: 1
+  input_processor_heads: 8
+  input_processor_ff: 2048
+  output_processor_layers: 1
+  output_processor_heads: 8
+  output_processor_ff: 2048
 
   # RoPE Configuration
   rope_base: 10000.0 # RoPE frequency base

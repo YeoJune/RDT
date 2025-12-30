@@ -1,4 +1,4 @@
-"""RDT Model Architecture (Refactored with RoPE & MLP I/O)"""
+"""RDT Model Architecture (Refactored with RoPE & Transformer I/O)"""
 
 import torch
 import torch.nn as nn
@@ -102,99 +102,138 @@ class RotaryPositionalEmbedding(nn.Module):
 
 
 # ============================================================================
-# Configurable MLP Processor
+# Transformer Encoder Processor
 # ============================================================================
 
-class MLPProcessor(nn.Module):
+class TransformerEncoderLayer(nn.Module):
     """
-    Configurable Multi-Layer Perceptron for input/output processing.
+    Single Transformer Encoder Layer with RoPE
     
-    Architecture: d_model -> hidden_dims[0] -> ... -> hidden_dims[-1] -> d_model
-    
-    Args:
-        d_model: Input/output dimension
-        hidden_dims: List of hidden layer dimensions e.g., [256] -> 512->256->512 (2 layers)
-        dropout: Dropout probability
-        activation: Activation function (default: GELU)
+    Architecture: Self-Attention -> Add & Norm -> FFN -> Add & Norm
     """
     def __init__(
-        self, 
-        d_model: int, 
-        hidden_dims: List[int], 
-        dropout: float = 0.1,
-        activation: str = 'gelu'
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        rope_layer: nn.Module,
+        dropout: float = 0.1
     ):
         super().__init__()
-        self.d_model = d_model
-        self.hidden_dims = hidden_dims
         
-        # Build layers
-        layers = []
+        # Self-Attention with RoPE
+        self.self_attn = RoPESelfAttention(d_model, n_heads, rope_layer, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
         
-        # Input projection: d_model -> hidden_dims[0]
-        layers.append(nn.Linear(d_model, hidden_dims[0]))
-        layers.append(self._get_activation(activation))
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-        
-        # Hidden layers: hidden_dims[i] -> hidden_dims[i+1]
-        for i in range(len(hidden_dims) - 1):
-            layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
-            layers.append(self._get_activation(activation))
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-        
-        # Output projection: hidden_dims[-1] -> d_model
-        layers.append(nn.Linear(hidden_dims[-1], d_model))
-        
-        self.mlp = nn.Sequential(*layers)
-
-        self.norm = nn.LayerNorm(d_model)
-        
-        self._init_weights()
+        # Feed-Forward Network
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
     
-    def _get_activation(self, name: str) -> nn.Module:
-        """Get activation function by name"""
-        activations = {
-            'gelu': nn.GELU(),
-            'relu': nn.ReLU(),
-            'silu': nn.SiLU(),
-            'tanh': nn.Tanh()
-        }
-        return activations.get(name.lower(), nn.GELU())
-    
-    def _init_weights(self):
-        """Initialize weights using Xavier uniform"""
-        for module in self.mlp.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                    
-        last_linear = self.mlp[-1]
-        
-        if isinstance(last_linear, nn.Linear):
-            # Zero Init
-            nn.init.zeros_(last_linear.weight)
-            
-            if last_linear.bias is not None:
-                nn.init.zeros_(last_linear.bias)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass
         
         Args:
             x: [B, L, d_model]
+            key_padding_mask: [B, L] where True means ignore (padding)
         
         Returns:
             [B, L, d_model]
         """
-        return x + self.mlp(self.norm(x))
+        # Self-Attention
+        res = x
+        x_norm = self.norm1(x)
+        attn_out = self.self_attn(x_norm, key_padding_mask=key_padding_mask)
+        x = res + self.dropout1(attn_out)
+        
+        # Feed-Forward
+        res = x
+        x_norm = self.norm2(x)
+        ffn_out = self.ffn(x_norm)
+        x = res + self.dropout2(ffn_out)
+        
+        return x
+
+
+class TransformerProcessor(nn.Module):
+    """
+    Transformer Encoder for input/output processing.
+    
+    Uses standard transformer encoder layers with RoPE positional encoding.
+    
+    Args:
+        d_model: Model dimension
+        n_layers: Number of transformer layers
+        n_heads: Number of attention heads
+        d_ff: Feed-forward dimension
+        rope_layer: Rotary position embedding module
+        dropout: Dropout probability
+    """
+    def __init__(
+        self, 
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        d_ff: int,
+        rope_layer: nn.Module,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        
+        # Build transformer encoder layers
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(
+                d_model=d_model,
+                n_heads=n_heads,
+                d_ff=d_ff,
+                rope_layer=rope_layer,
+                dropout=dropout
+            )
+            for _ in range(n_layers)
+        ])
+        
+        self.norm = nn.LayerNorm(d_model)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using Xavier uniform"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass
+        
+        Args:
+            x: [B, L, d_model]
+            key_padding_mask: [B, L] where True means ignore (padding)
+        
+        Returns:
+            [B, L, d_model]
+        """
+        hidden = x
+        
+        for layer in self.layers:
+            hidden = layer(hidden, key_padding_mask=key_padding_mask)
+        
+        return self.norm(hidden)
 
 
 # ============================================================================
-# Core RDT Components (Unchanged)
+# Core RDT Components
 # ============================================================================
 
 class TimestepEmbedder(nn.Module):
@@ -608,14 +647,14 @@ class GateMLP(nn.Module):
 
 
 # ============================================================================
-# Main RDT Model (Refactored with RoPE & MLP I/O)
+# Main RDT Model (Refactored with RoPE & Transformer I/O)
 # ============================================================================
 
 class RDT(nn.Module):
     """
     Recursive Denoising Transformer with:
     - RoPE for positional encoding
-    - Configurable MLP for input/output processing
+    - Transformer Encoder for input/output processing
     - AdaLN-based recursive blocks
     """
     def __init__(
@@ -627,9 +666,13 @@ class RDT(nn.Module):
         d_ff: int = 2048,
         dropout: float = 0.1,
         max_seq_len: int = 512,
-        # MLP I/O Configuration
-        input_mlp_hidden: List[int] = [512],
-        output_mlp_hidden: List[int] = [512],
+        # Transformer I/O Configuration
+        input_processor_layers: int = 1,
+        input_processor_heads: int = 8,
+        input_processor_ff: int = 2048,
+        output_processor_layers: int = 1,
+        output_processor_heads: int = 8,
+        output_processor_ff: int = 2048,
         # Gate Configuration
         gate_hidden_dim: int = 512,
         gate_num_layers: int = 3,
@@ -656,10 +699,13 @@ class RDT(nn.Module):
             base=rope_base
         )
         
-        # Input Processor (MLP-based)
-        self.input_processor = MLPProcessor(
+        # Input Processor (Transformer Encoder)
+        self.input_processor = TransformerProcessor(
             d_model=d_model,
-            hidden_dims=input_mlp_hidden,
+            n_layers=input_processor_layers,
+            n_heads=input_processor_heads,
+            d_ff=input_processor_ff,
+            rope_layer=self.rope,
             dropout=dropout
         )
         
@@ -675,10 +721,13 @@ class RDT(nn.Module):
             for _ in range(n_encoder_layers)
         ])
         
-        # Output Processor (MLP-based)
-        self.output_processor = MLPProcessor(
+        # Output Processor (Transformer Encoder)
+        self.output_processor = TransformerProcessor(
             d_model=d_model,
-            hidden_dims=output_mlp_hidden,
+            n_layers=output_processor_layers,
+            n_heads=output_processor_heads,
+            d_ff=output_processor_ff,
+            rope_layer=self.rope,
             dropout=dropout
         )
         
@@ -741,12 +790,11 @@ class RDT(nn.Module):
             # Token embedding
             x = self.token_embedding(x) * math.sqrt(self.d_model)
             
-            # Input processing (MLP)
-            # Note: RoPE is NOT applied here - it will be applied inside attention layers
-            hidden = self.input_processor(x)
+            # Input processing (Transformer Encoder with RoPE)
+            key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+            hidden = self.input_processor(x, key_padding_mask=key_padding_mask)
         else:
             # Already processed hidden states
-            # Note: RoPE is NOT applied here - it will be applied inside attention layers
             hidden = x
         
         # Recursive Norm (Reset Distribution)
@@ -814,18 +862,20 @@ class RDT(nn.Module):
         
         return hidden, next_gate_pred, next_pooled
     
-    def encode_tokens(self, tokens):
+    def encode_tokens(self, tokens, attention_mask=None):
         """
         Initial encoding: tokens → h_0
         
         Args:
             tokens: [B, L] token indices
+            attention_mask: [B, L] attention mask (1=valid, 0=padding)
         
         Returns:
             hidden: [B, L, D] initial hidden states (before any recursive steps)
         """
         x = self.token_embedding(tokens) * math.sqrt(self.d_model)
-        hidden = self.input_processor(x)
+        key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        hidden = self.input_processor(x, key_padding_mask=key_padding_mask)
         hidden = self.input_norm(hidden)
         return hidden
     
@@ -909,9 +959,9 @@ class RDT(nn.Module):
         Returns:
             logits: [B, L, vocab_size]
         """
-        # Output processing (MLP)
-        # Note: RoPE is NOT applied here - positional info is already in hidden states
-        decoded = self.output_processor(hidden)
+        # Output processing (Transformer Encoder with RoPE)
+        key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        decoded = self.output_processor(hidden, key_padding_mask=key_padding_mask)
         
         # Project to vocabulary
         logits = self.output_projection(decoded)
