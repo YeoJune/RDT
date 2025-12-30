@@ -668,11 +668,7 @@ class RDT(nn.Module):
         max_seq_len: int = 512,
         # Transformer I/O Configuration
         input_processor_layers: int = 1,
-        input_processor_heads: int = 8,
-        input_processor_ff: int = 2048,
         output_processor_layers: int = 1,
-        output_processor_heads: int = 8,
-        output_processor_ff: int = 2048,
         # Gate Configuration
         gate_hidden_dim: int = 512,
         gate_num_layers: int = 3,
@@ -703,8 +699,8 @@ class RDT(nn.Module):
         self.input_processor = TransformerProcessor(
             d_model=d_model,
             n_layers=input_processor_layers,
-            n_heads=input_processor_heads,
-            d_ff=input_processor_ff,
+            n_heads=n_heads,
+            d_ff=d_ff,
             rope_layer=self.rope,
             dropout=dropout
         )
@@ -725,8 +721,8 @@ class RDT(nn.Module):
         self.output_processor = TransformerProcessor(
             d_model=d_model,
             n_layers=output_processor_layers,
-            n_heads=output_processor_heads,
-            d_ff=output_processor_ff,
+            n_heads=n_heads,
+            d_ff=d_ff,
             rope_layer=self.rope,
             dropout=dropout
         )
