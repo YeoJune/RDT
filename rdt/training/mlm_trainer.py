@@ -112,9 +112,12 @@ class MLMTrainer:
     def _create_scheduler(self):
         """Create learning rate scheduler"""
         if self.training_mode == 'epoch':
-            total_steps = len(self.train_loader) * self.num_epochs
+            total_batches = len(self.train_loader) * self.num_epochs
         else:
-            total_steps = self.max_training_steps
+            total_batches = self.max_training_steps
+        
+        # Gradient accumulation을 고려한 실제 optimizer step 수
+        total_steps = total_batches // self.gradient_accumulation_steps
         
         warmup_steps = int(total_steps * self.config['training'].get('warmup_ratio', 0.1))
         
@@ -133,7 +136,7 @@ class MLMTrainer:
                 lr_lambda=lambda step: min(1.0, step / warmup_steps) if step < warmup_steps 
                 else max(0.0, (total_steps - step) / (total_steps - warmup_steps))
             )
-    
+        
     def train_step(self, batch):
         """Unified training step with model-specific masking"""
         if self.model_type == 'mdlm':

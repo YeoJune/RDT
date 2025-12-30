@@ -106,11 +106,13 @@ class RDTTrainer:
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""
-        # Calculate total steps based on training mode
         if self.training_mode == 'epoch':
-            total_steps = len(self.train_loader) * self.num_epochs
-        else:  # step mode
-            total_steps = self.max_training_steps
+            total_batches = len(self.train_loader) * self.num_epochs
+        else:
+            total_batches = self.max_training_steps
+        
+        # 실제 optimizer update 횟수
+        total_steps = total_batches // self.gradient_accumulation_steps
         
         if self.config['training']['scheduler'] == 'cosine':
             scheduler = optim.lr_scheduler.OneCycleLR(
@@ -122,10 +124,11 @@ class RDTTrainer:
                 final_div_factor=100
             )
         elif self.config['training']['scheduler'] == 'linear':
+            warmup_iters = int(total_steps * self.config['training']['warmup_ratio'])
             scheduler = optim.lr_scheduler.LinearLR(
                 self.optimizer,
                 start_factor=0.1,
-                total_iters=int(total_steps * self.config['training']['warmup_ratio'])
+                total_iters=warmup_iters
             )
         else:
             scheduler = None
