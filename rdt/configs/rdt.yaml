@@ -12,8 +12,8 @@ model:
   dropout: 0.1
 
   # MLP I/O Processors
-  input_mlp_hidden: [512] # Input MLP hidden layers
-  output_mlp_hidden: [512] # Output MLP hidden layers
+  input_mlp_hidden: [2048] # Input MLP hidden layers
+  output_mlp_hidden: [2048] # Output MLP hidden layers
 
   # RoPE Configuration
   rope_base: 10000.0 # RoPE frequency base
@@ -54,7 +54,7 @@ training:
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
   loss_weight_gate: 0.5 # Gate prediction loss weight
-  loss_weight_aux: 0.3
+  loss_weight_aux: 0.1
   aux_ratio: 1.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
 
   # Optimization
