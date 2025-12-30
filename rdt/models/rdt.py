@@ -170,7 +170,8 @@ class MLPProcessor(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-            last_linear = self.mlp[-1]
+                    
+        last_linear = self.mlp[-1]
         
         if isinstance(last_linear, nn.Linear):
             # Zero Init
