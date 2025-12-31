@@ -186,7 +186,7 @@ class RDTTrainer:
             accumulated_loss = self.loss_weight_gate * gate_loss_0
             total_recon_loss = 0.0
             total_gate_loss = gate_loss_0.item()
-            total_aux_ce_loss = torch.tensor(0.0, device=self.device)
+            total_aux_loss = torch.tensor(0.0, device=self.device)
             
             num_valid_steps = 1
             num_aux_steps = 0
@@ -225,23 +225,33 @@ class RDTTrainer:
                 else:
                     recon_loss = torch.tensor(0.0, device=self.device)
                 
-                # [B] Semantic Trust Region Aux Loss (인코더-디코더 위상 정렬)
-                # D(h_i)가 D(E(GT))를 추종하도록 직접 제약
+                # train_step 내부 Aux Loss 수정
                 if self.loss_weight_aux > 0:
+                    aux_batch_size = max(1, int(batch_size * self.aux_ratio))
                     aux_mask = step_loss_mask[:aux_batch_size]
+                    
                     if aux_mask.sum() > 0:
-                        # Teacher: 정답을 인코더와 디코더에 통과시켜 얻은 '시스템의 표준 해석'
+                        # 1. Teacher: 이상적 분포 (Gradient 차단)
                         with torch.no_grad():
                             h_GT = self.model.encode_tokens(step_targets[:aux_batch_size])
                             logits_GT = self.model.decode(h_GT, attention_mask[:aux_batch_size])
-                            target_dist = torch.softmax(logits_GT, dim=-1) # 분포 획득
+                            # 타겟은 확률 분포 (Probability)
+                            target_dist = torch.softmax(logits_GT, dim=-1)
                         
-                        # Student: 현재 재귀 중인 h_i의 해석 분포
+                        # 2. Student: 현재 예측 상태의 로그 확률 (Log-Softmax)
+                        # D(h_i) -> Log Probs
                         log_probs_pred = torch.log_softmax(logits_pred[:aux_batch_size], dim=-1)
                         
-                        # 직접적 Cross-Entropy 제약 (분포 간 동기화)
-                        aux_ce = -(target_dist[aux_mask] * log_probs_pred[aux_mask]).sum(dim=-1).mean()
-                        total_aux_ce_loss += aux_ce
+                        # 3. PyTorch 내장 KLDivLoss 사용 (직접 계산보다 수치적 안정성 높음)
+                        # reduction='batchmean'은 KL Divergence의 수학적 정의에 가장 부합함
+                        kl_criterion = nn.KLDivLoss(reduction='none')
+                        kl_loss_all = kl_criterion(log_probs_pred, target_dist) # [B_aux, L, Vocab]
+                        
+                        # 마스크 적용 및 평균 계산
+                        # sum over vocab(dim=-1), then mean over valid tokens
+                        aux_kl = kl_loss_all[aux_mask].sum(dim=-1).mean()
+                        
+                        total_aux_loss += aux_kl
                         num_aux_steps += 1
 
                 # [C] Gate Loss
@@ -258,7 +268,7 @@ class RDTTrainer:
             # --- 최종 손실 산출 ---
             main_loss = accumulated_loss / num_valid_steps
             if num_aux_steps > 0:
-                avg_aux_ce = total_aux_ce_loss / num_aux_steps
+                avg_aux_ce = total_aux_loss / num_aux_steps
                 final_loss = main_loss + self.loss_weight_aux * avg_aux_ce # aux_weight=0.01
             else:
                 avg_aux_ce = torch.tensor(0.0, device=self.device)
