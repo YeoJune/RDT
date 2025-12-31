@@ -264,16 +264,15 @@ class RDTTrainer:
                 
                 total_recon_loss += recon_loss.item()
                 total_gate_loss += gate_loss.item()
-                total_aux_loss *= (self.aux_temp ** 2)
                 num_valid_steps += 1
             
             # --- 최종 손실 산출 ---
             main_loss = accumulated_loss / num_valid_steps
             if num_aux_steps > 0:
-                avg_aux_ce = total_aux_loss / num_aux_steps
-                final_loss = main_loss + self.loss_weight_aux * avg_aux_ce # aux_weight=0.01
+                avg_aux = total_aux_loss / num_aux_steps * (self.aux_temp ** 2)
+                final_loss = main_loss + self.loss_weight_aux * avg_aux
             else:
-                avg_aux_ce = torch.tensor(0.0, device=self.device)
+                avg_aux = torch.tensor(0.0, device=self.device)
                 final_loss = main_loss
         
         # 역전파 및 가중치 업데이트
@@ -303,7 +302,7 @@ class RDTTrainer:
             original_final_loss,
             total_recon_loss / num_valid_steps,
             total_gate_loss / num_valid_steps,
-            avg_aux_ce.item()
+            avg_aux.item()
         )
     
     def validate(self) -> Tuple[float, float, float]:
