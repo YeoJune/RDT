@@ -56,6 +56,7 @@ training:
   loss_weight_gate: 0.5 # Gate prediction loss weight
   loss_weight_aux: 0.1
   aux_ratio: 1.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
+  aux_temp: 0.5
 
   # Optimization
   batch_size: 8

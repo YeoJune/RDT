@@ -42,6 +42,7 @@ class RDTTrainer:
         self.loss_weight_gate = config['training']['loss_weight_gate']
         self.loss_weight_aux = config['training'].get('loss_weight_aux', 0.1)
         self.aux_ratio = config['training'].get('aux_ratio', 0.25)
+        self.aux_temp = config['training'].get('aux_temp', 0.5)
         print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
         
         # Optimizer
@@ -236,11 +237,11 @@ class RDTTrainer:
                             h_GT = self.model.encode_tokens(step_targets[:aux_batch_size])
                             logits_GT = self.model.decode(h_GT, attention_mask[:aux_batch_size])
                             # 타겟은 확률 분포 (Probability)
-                            target_dist = torch.softmax(logits_GT, dim=-1)
+                            target_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
                         
                         # 2. Student: 현재 예측 상태의 로그 확률 (Log-Softmax)
                         # D(h_i) -> Log Probs
-                        log_probs_pred = torch.log_softmax(logits_pred[:aux_batch_size], dim=-1)
+                        log_probs_pred = torch.log_softmax(logits_pred[:aux_batch_size] / self.aux_temp, dim=-1)
                         
                         # 3. PyTorch 내장 KLDivLoss 사용 (직접 계산보다 수치적 안정성 높음)
                         # reduction='batchmean'은 KL Divergence의 수학적 정의에 가장 부합함
