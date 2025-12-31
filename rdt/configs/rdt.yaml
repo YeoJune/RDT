@@ -12,8 +12,8 @@ model:
   dropout: 0.1
 
   # MLP I/O Processors
-  input_processor_layers: 2
-  output_processor_layers: 2
+  input_processor_layers: 1
+  output_processor_layers: 1
 
   # RoPE Configuration
   rope_base: 10000.0 # RoPE frequency base
@@ -55,7 +55,7 @@ training:
   loss_weight_recon: 1.0 # Reconstruction loss weight
   loss_weight_gate: 0.5 # Gate prediction loss weight
   loss_weight_aux: 0.005
-  aux_ratio: 1.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
+  aux_ratio: 0.25 # Auxiliary loss micro-batch ratio (0.0-1.0)
 
   # Optimization
   batch_size: 8
