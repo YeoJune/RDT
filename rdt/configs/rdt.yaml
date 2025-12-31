@@ -58,8 +58,8 @@ training:
   aux_ratio: 1.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
 
   # Optimization
-  batch_size: 16
-  gradient_accumulation_steps: 16 # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 8
+  gradient_accumulation_steps: 32 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 3 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
