@@ -264,6 +264,7 @@ class RDTTrainer:
                 
                 total_recon_loss += recon_loss.item()
                 total_gate_loss += gate_loss.item()
+                total_aux_loss *= (self.aux_temp ** 2)
                 num_valid_steps += 1
             
             # --- 최종 손실 산출 ---
