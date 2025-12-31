@@ -160,13 +160,13 @@ class RDTTrainer:
     def train_step(self, batch: Dict) -> Tuple[float, float, float, float]:
         """
         - Recon Loss: h_i -> Target Index (미래 추론)
-        - Aux Loss: D(h_i) -> D(E(GT)) (현재 위상 보존 및 인코더-디코더 동기화)
+        - Aux Loss: D(h_i) -> D(E(GT)) (현재 위상 보존)
         """
         self.model.train()
         
-        # 1. 데이터 준비 및 장치 이동
+        # 데이터 준비
         input_tokens = batch['input'].to(self.device)
-        targets = batch['targets'].to(self.device)      # [B, T, L]
+        targets = batch['targets'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)
         loss_masks = batch['loss_masks'].to(self.device)
         gate_targets = batch['gate_targets'].to(self.device)
@@ -176,36 +176,34 @@ class RDTTrainer:
         actual_max_length = chain_lengths.max().item()
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
         
+        # Aux batch 샘플링
+        aux_batch_size = max(1, int(batch_size * self.aux_ratio))
+        
         with torch.amp.autocast('cuda', enabled=self.use_amp):
-            # --- Step 0: 초기 상태 (s_0 -> h_0) ---
+            # --- Step 0: 초기 상태 ---
             h_0 = self.model.encode_tokens(input_tokens)
             gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask)
-            
-            # 초기 게이트 손실
             gate_loss_0 = self.gate_criterion(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
             
             accumulated_loss = self.loss_weight_gate * gate_loss_0
             total_recon_loss = 0.0
             total_gate_loss = gate_loss_0.item()
-            total_aux_loss = torch.tensor(0.0, device=self.device)
+            total_aux_loss = 0.0
             
             num_valid_steps = 1
             num_aux_steps = 0
-            
-            # 직접적 제약을 위한 배치 샘플링 (사용자 의도: 25%)
-            aux_batch_size = max(1, int(batch_size * self.aux_ratio))
             
             hidden = h_0
             gate_pred = gate_pred_0
             pooled = pooled_0
             
-            # --- Recursive Steps (h_i -> h_{i+1}) ---
+            # --- Recursive Steps ---
             for step_idx in range(actual_max_length):
                 valid_mask = chain_lengths > step_idx
                 if valid_mask.sum() == 0:
                     break
                 
-                # 재귀 전진
+                # Forward step
                 step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
                 hidden, gate_pred, pooled = self.model.forward_step(
                     hidden,
@@ -216,66 +214,86 @@ class RDTTrainer:
                     sampling_prob=sampling_prob
                 )
                 
+                # 현재 step 타겟과 마스크
                 step_targets = targets[:, step_idx, :]
                 step_loss_mask = loss_masks[:, step_idx, :]
                 
-                # [A] Main Reconstruction Loss (미래 타겟 예측)
+                # [A] Main Reconstruction Loss
                 logits_pred = self.model.decode(hidden, attention_mask)
+                
                 if step_loss_mask.sum() > 0:
-                    recon_loss = self.recon_criterion(logits_pred[step_loss_mask], step_targets[step_loss_mask])
+                    recon_loss = self.recon_criterion(
+                        logits_pred[step_loss_mask],
+                        step_targets[step_loss_mask]
+                    )
                 else:
                     recon_loss = torch.tensor(0.0, device=self.device)
                 
-                # train_step 내부 Aux Loss 수정
+                # [B] Aux Loss: KL Divergence
+                aux_kl = torch.tensor(0.0, device=self.device)
+                
                 if self.loss_weight_aux > 0:
-                    aux_batch_size = max(1, int(batch_size * self.aux_ratio))
                     aux_mask = step_loss_mask[:aux_batch_size]
                     
                     if aux_mask.sum() > 0:
-                        # 1. Teacher: 이상적 분포 (Gradient 차단)
+                        # Teacher: D(E(GT))
                         with torch.no_grad():
                             h_GT = self.model.encode_tokens(step_targets[:aux_batch_size])
                             logits_GT = self.model.decode(h_GT, attention_mask[:aux_batch_size])
-                            # 타겟은 확률 분포 (Probability)
+                            # Target distribution (with temperature)
+                            # Note: Temperature > 1 makes distribution softer
+                            # Temperature < 1 makes distribution sharper
+                            # For semantic consistency, τ=1.0 is reasonable
                             target_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
                         
-                        # 2. Student: 현재 예측 상태의 로그 확률 (Log-Softmax)
-                        # D(h_i) -> Log Probs
-                        log_probs_pred = torch.log_softmax(logits_pred[:aux_batch_size] / self.aux_temp, dim=-1)
+                        # Student: D(h_recursive)
+                        log_probs_pred = torch.log_softmax(
+                            logits_pred[:aux_batch_size] / self.aux_temp,
+                            dim=-1
+                        )
                         
-                        # 3. PyTorch 내장 KLDivLoss 사용 (직접 계산보다 수치적 안정성 높음)
-                        # reduction='batchmean'은 KL Divergence의 수학적 정의에 가장 부합함
+                        # KL Divergence: KL(P_target || P_pred)
+                        # PyTorch KLDivLoss expects (log_pred, target)
                         kl_criterion = nn.KLDivLoss(reduction='none')
-                        kl_loss_all = kl_criterion(log_probs_pred, target_dist) # [B_aux, L, Vocab]
+                        kl_loss_all = kl_criterion(log_probs_pred, target_dist)
                         
-                        # 마스크 적용 및 평균 계산
-                        # sum over vocab(dim=-1), then mean over valid tokens
-                        aux_kl = kl_loss_all[aux_mask].sum(dim=-1).mean()
+                        # Apply mask and average
+                        # kl_loss_all: [B_aux, L, V]
+                        # aux_mask: [B_aux, L]
+                        aux_kl = kl_loss_all.sum(dim=-1)[aux_mask].mean()
                         
-                        total_aux_loss += aux_kl
+                        # Temperature scaling correction
+                        # When using temperature τ, gradient is scaled by 1/τ²
+                        # So we multiply loss by τ² to compensate
+                        aux_kl = aux_kl * (self.aux_temp ** 2)
+                        
+                        total_aux_loss += aux_kl.item()
                         num_aux_steps += 1
-
+                
                 # [C] Gate Loss
                 step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
-                gate_loss = self.gate_criterion(gate_pred[valid_mask], step_gate_target[valid_mask])
+                gate_loss = self.gate_criterion(
+                    gate_pred[valid_mask],
+                    step_gate_target[valid_mask]
+                )
                 
-                # 스텝 손실 합산
-                accumulated_loss += (self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss)
+                # Step loss 누적
+                step_loss = (
+                    self.loss_weight_recon * recon_loss +
+                    self.loss_weight_gate * gate_loss +
+                    self.loss_weight_aux * aux_kl
+                )
+                
+                accumulated_loss += step_loss
                 
                 total_recon_loss += recon_loss.item()
                 total_gate_loss += gate_loss.item()
                 num_valid_steps += 1
             
-            # --- 최종 손실 산출 ---
-            main_loss = accumulated_loss / num_valid_steps
-            if num_aux_steps > 0:
-                avg_aux = total_aux_loss / num_aux_steps * (self.aux_temp ** 2)
-                final_loss = main_loss + self.loss_weight_aux * avg_aux
-            else:
-                avg_aux = torch.tensor(0.0, device=self.device)
-                final_loss = main_loss
+            # 최종 손실
+            final_loss = accumulated_loss / num_valid_steps
         
-        # 역전파 및 가중치 업데이트
+        # 역전파
         original_final_loss = final_loss.item()
         final_loss = final_loss / self.gradient_accumulation_steps
         
@@ -298,11 +316,14 @@ class RDTTrainer:
             if self.scheduler:
                 self.scheduler.step()
         
+        # 평균 계산 (로깅용)
+        avg_aux = total_aux_loss / num_aux_steps if num_aux_steps > 0 else 0.0
+        
         return (
             original_final_loss,
             total_recon_loss / num_valid_steps,
             total_gate_loss / num_valid_steps,
-            avg_aux.item()
+            avg_aux
         )
     
     def validate(self) -> Tuple[float, float, float]:
