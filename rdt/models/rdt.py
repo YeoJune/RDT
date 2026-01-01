@@ -1061,3 +1061,125 @@ class RDT(nn.Module):
         else:
             # Return mean steps for backward compatibility
             return output_tokens, steps_taken.mean().item()
+
+    def compute_loss(self, input_tokens, targets, attention_mask, loss_masks, gate_targets, chain_lengths,
+                     recon_criterion, gate_criterion, loss_weight_recon, loss_weight_gate, 
+                     loss_weight_aux, aux_ratio, aux_temp, sampling_prob=0.0):
+        """
+        학습 루프 전체를 모델 내부로 가져옴 -> torch.compile이 전체 그래프를 최적화 가능하게 함
+        """
+        # .item() 제거: GPU 텐서 그대로 사용하거나, 컴파일러가 처리하도록 고정 길이 루프 사용
+        # 여기서는 동적 루프를 사용하되, torch.compile이 최적화하도록 유도
+        
+        batch_size = input_tokens.shape[0]
+        max_chain_len = targets.shape[1] # [B, MaxChain, L]
+        
+        # --- Step 0 ---
+        h_0 = self.encode_tokens(input_tokens, attention_mask)
+        gate_pred, pooled = self.gate(h_0, attention_mask)
+        
+        # Gate Loss 0
+        gate_loss_0 = gate_criterion(gate_pred, gate_targets[:, 0].unsqueeze(1))
+        
+        total_loss = loss_weight_gate * gate_loss_0
+        
+        # Logging용 누적 변수 (Graph Break 방지를 위해 Tensor로 관리하거나 나중에 계산)
+        log_recon = torch.tensor(0.0, device=input_tokens.device)
+        log_gate = gate_loss_0.detach()
+        log_aux = torch.tensor(0.0, device=input_tokens.device)
+        
+        hidden = h_0
+        
+        # --- Recursive Loop ---
+        # Python Loop지만, 전체가 compile 되면 하나의 그래프로 융합됨
+        for step_idx in range(max_chain_len):
+            # 현재 스텝이 유효한 샘플 마스크
+            # (chain_lengths는 Tensor이므로 비교 연산도 GPU에서 수행)
+            valid_mask = chain_lengths > step_idx
+            
+            # 유효한 샘플이 하나도 없으면 루프는 돌되 Loss에 반영 안됨 (Graph Capture를 위해 break 지양)
+            # 만약 dynamic shape이 지원된다면 break 해도 됨. 여기서는 안전하게 마스킹 처리.
+            
+            step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
+            
+            # Forward Step
+            hidden, gate_pred, pooled = self.forward_step(
+                hidden,
+                attention_mask=attention_mask,
+                last_gate_score=gate_pred,
+                last_pooled=pooled,
+                gt_timestep=step_gt_gate,
+                sampling_prob=sampling_prob
+            )
+            
+            # --- Loss Calculation ---
+            step_targets = targets[:, step_idx, :]
+            step_loss_mask = loss_masks[:, step_idx, :]
+            
+            # Valid mask 적용
+            step_loss_mask = step_loss_mask & valid_mask.unsqueeze(1)
+            
+            # 1. Recon Loss
+            logits_pred = self.decode(hidden, attention_mask)
+            
+            # 전체 토큰에 대해 CrossEntropy 계산하되, 마스크로 필터링
+            # (Loop 안에서 마스킹 인덱싱은 느릴 수 있으므로, reduction='none' 후 마스킹 권장)
+            # 하지만 메모리 절약을 위해 기존 방식 유지하되, 컴파일러에 맡김
+            
+            # Loss 계산을 위한 Flatten
+            active_loss = step_loss_mask.view(-1)
+            if active_loss.any():
+                active_logits = logits_pred.view(-1, self.output_projection.out_features)[active_loss]
+                active_labels = step_targets.view(-1)[active_loss]
+                recon_loss = recon_criterion(active_logits, active_labels)
+            else:
+                recon_loss = torch.tensor(0.0, device=input_tokens.device)
+                
+            # 2. Gate Loss
+            step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
+            # MSE Loss (Valid한 것만)
+            if valid_mask.any():
+                gate_loss = gate_criterion(gate_pred[valid_mask], step_gate_target[valid_mask])
+            else:
+                gate_loss = torch.tensor(0.0, device=input_tokens.device)
+
+            # 3. Aux Loss
+            aux_kl = torch.tensor(0.0, device=input_tokens.device)
+            if loss_weight_aux > 0:
+                # Aux는 앞쪽 일부 배치만 수행
+                aux_bs = int(batch_size * aux_ratio)
+                if aux_bs > 0 and valid_mask[:aux_bs].any():
+                    # Teacher Forward (No Grad)
+                    with torch.no_grad():
+                        h_GT = self.encode_tokens(step_targets[:aux_bs], attention_mask[:aux_bs])
+                        logits_GT = self.decode(h_GT, attention_mask[:aux_bs])
+                        target_dist = torch.softmax(logits_GT / aux_temp, dim=-1)
+                    
+                    log_probs_pred = torch.log_softmax(logits_pred[:aux_bs] / aux_temp, dim=-1)
+                    
+                    # KL Div
+                    kl_crit = torch.nn.KLDivLoss(reduction='none')
+                    kl_loss = kl_crit(log_probs_pred, target_dist).sum(dim=-1) # [B, L]
+                    
+                    # 마스크 적용
+                    aux_mask_step = step_loss_mask[:aux_bs]
+                    if aux_mask_step.any():
+                        aux_kl = (kl_loss * aux_mask_step).sum() / (aux_mask_step.sum() + 1e-6)
+                        aux_kl = aux_kl * (aux_temp ** 2)
+
+            # Sum Step Loss
+            step_total = (loss_weight_recon * recon_loss) + \
+                         (loss_weight_gate * gate_loss) + \
+                         (loss_weight_aux * aux_kl)
+            
+            total_loss = total_loss + step_total
+            
+            # Logging (Detach to avoid graph history)
+            log_recon = log_recon + recon_loss.detach()
+            log_gate = log_gate + gate_loss.detach()
+            log_aux = log_aux + aux_kl.detach()
+            
+        # Normalize logs by steps (approximate)
+        avg_steps = max(1, chain_lengths.float().mean())
+        
+        return total_loss, log_recon / avg_steps, log_gate / avg_steps, log_aux / avg_steps
