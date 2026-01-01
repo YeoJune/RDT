@@ -101,7 +101,7 @@ output:
   log_dir: "runs"
   log_every_n_steps: 100
   eval_every_n_epochs: 1 # Used when training_mode is 'epoch'
-  eval_every_n_steps: 10000 # Used when training_mode is 'step'
+  eval_every_n_steps: 1000 # Used when training_mode is 'step'
 
 # Hardware
 device: "cuda" # 'cuda' or 'cpu'
