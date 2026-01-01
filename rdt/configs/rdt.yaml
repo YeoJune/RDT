@@ -59,10 +59,10 @@ training:
   aux_temp: 0.5
 
   # Optimization
-  batch_size: 8
-  gradient_accumulation_steps: 32 # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 16
+  gradient_accumulation_steps: 16 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
-  num_epochs: 3 # Used when training_mode is 'epoch'
+  num_epochs: 15 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
@@ -83,7 +83,7 @@ training:
 data:
   dataset_name: "wikitext-103" # 'wikitext-2' or 'wikitext-103'
   streaming: false # true: buffer-based on-the-fly loading, false: download all at once
-  max_seq_length: 512 # Maximum sequence length
+  max_seq_length: 256 # Maximum sequence length
   mask_token: "[MASK]"
   samples_per_text: 1 # Number of random samples to generate per text
 
