@@ -342,9 +342,14 @@ class RDTTrainer:
                 self.loss_weight_aux * avg_aux_loss
             )
 
+        # Gradient Accumulation 적용
+        scaled_loss = total_loss / self.gradient_accumulation_steps
+
         # Backward & Optimizer Step
-        # (기존 코드와 동일)
-        self.scaler.scale(total_loss / self.gradient_accumulation_steps).backward()
+        if self.use_amp:
+            self.scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
         
         if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
             self.scaler.unscale_(self.optimizer)
