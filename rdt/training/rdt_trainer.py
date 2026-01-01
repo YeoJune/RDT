@@ -167,22 +167,17 @@ class RDTTrainer:
         return sampling_prob
     
     def train_step(self, raw_batch: Dict) -> Tuple[float, float, float, float]:
-        """
-        - Recon Loss: h_i -> Target Index (미래 추론)
-        - Aux Loss: D(h_i) -> D(E(GT)) (현재 위상 보존)
-        """
         self.model.train()
-
         raw_input_ids = raw_batch['input_ids'].to(self.device)
 
+        # 1. Preprocessing
         with torch.no_grad():
             batch = self.preprocessor(raw_input_ids)
         
-        # 데이터 준비
         input_tokens = batch['input'].to(self.device)
-        targets = batch['targets'].to(self.device)
-        attention_mask = batch['attention_mask'].to(self.device)
-        loss_masks = batch['loss_masks'].to(self.device)
+        targets = batch['targets'].to(self.device)                 # [B, MaxChain, L]
+        attention_mask = batch['attention_mask'].to(self.device)   # [B, L]
+        loss_masks = batch['loss_masks'].to(self.device)           # [B, MaxChain, L]
         gate_targets = batch['gate_targets'].to(self.device)
         chain_lengths = batch['chain_lengths']
         
@@ -190,35 +185,65 @@ class RDTTrainer:
         actual_max_length = chain_lengths.max().item()
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
         
-        # Aux batch 샘플링
+        # Aux batch size
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
-        
+
         with torch.amp.autocast('cuda', enabled=self.use_amp):
-            # --- Step 0: 초기 상태 ---
-            h_0 = self.model.encode_tokens(input_tokens)
+            # =================================================================
+            # [Phase 1] Teacher (Aux) Pre-computation (Batch Processing)
+            # 루프 밖에서 미리 계산하여 GPU 병렬성 극대화
+            # =================================================================
+            teacher_dist_all = None
+            if self.loss_weight_aux > 0:
+                with torch.no_grad():
+                    # Aux용 Target만 추출: [B_aux, MaxChain, L]
+                    aux_targets = targets[:aux_batch_size, :actual_max_length, :]
+                    
+                    # Flatten: [B_aux * Steps, L]
+                    flat_aux_targets = aux_targets.reshape(-1, aux_targets.size(-1))
+                    
+                    # Attention Mask 확장 (Broadcasting)
+                    # [B_aux, L] -> [B_aux, Steps, L] -> [B_aux * Steps, L]
+                    aux_att_mask = attention_mask[:aux_batch_size].unsqueeze(1)\
+                        .expand(-1, actual_max_length, -1).reshape(-1, attention_mask.size(-1))
+                    
+                    # 한 번에 인코딩 + 디코딩 (Teacher Forcing)
+                    h_GT = self.model.encode_tokens(flat_aux_targets, attention_mask=aux_att_mask)
+                    logits_GT = self.model.decode(h_GT, attention_mask=aux_att_mask)
+                    
+                    # Softmax & Reshape back to [B_aux, Steps, L, V]
+                    flat_teacher_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
+                    teacher_dist_all = flat_teacher_dist.view(aux_batch_size, actual_max_length, -1, flat_teacher_dist.size(-1))
+
+            # =================================================================
+            # [Phase 2] Recursive Loop (Light-weight)
+            # 디코딩 없이 Hidden State 전이만 수행
+            # =================================================================
+            # Step 0
+            h_0 = self.model.encode_tokens(input_tokens, attention_mask)
             gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask)
+            
+            # Gate Loss 0
             gate_loss_0 = self.gate_criterion(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
+            total_gate_loss = gate_loss_0
             
-            accumulated_loss = self.loss_weight_gate * gate_loss_0
-            total_recon_loss = 0.0
-            total_gate_loss = gate_loss_0.item()
-            total_aux_loss = 0.0
-            
-            num_valid_steps = 1
-            num_aux_steps = 0
+            # State Collectors
+            collected_hidden = []      # h_1 ... h_L 저장
+            collected_gate_preds = []  # g_1 ... g_L 저장
             
             hidden = h_0
             gate_pred = gate_pred_0
             pooled = pooled_0
             
-            # --- Recursive Steps ---
+            # Loop runs fast because heavy decoding is removed
             for step_idx in range(actual_max_length):
                 valid_mask = chain_lengths > step_idx
                 if valid_mask.sum() == 0:
                     break
                 
-                # Forward step
                 step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
+                
+                # Forward Step (Only recursive logic)
                 hidden, gate_pred, pooled = self.model.forward_step(
                     hidden,
                     attention_mask=attention_mask,
@@ -228,116 +253,112 @@ class RDTTrainer:
                     sampling_prob=sampling_prob
                 )
                 
-                # 현재 step 타겟과 마스크
-                step_targets = targets[:, step_idx, :]
-                step_loss_mask = loss_masks[:, step_idx, :]
-                
-                # [A] Main Reconstruction Loss
-                logits_pred = self.model.decode(hidden, attention_mask)
-                
-                if step_loss_mask.sum() > 0:
-                    recon_loss = self.recon_criterion(
-                        logits_pred[step_loss_mask],
-                        step_targets[step_loss_mask]
-                    )
-                else:
-                    recon_loss = torch.tensor(0.0, device=self.device)
-                
-                # [B] Aux Loss: KL Divergence
-                aux_kl = torch.tensor(0.0, device=self.device)
-                
-                if self.loss_weight_aux > 0:
-                    aux_mask = step_loss_mask[:aux_batch_size]
-                    
-                    if aux_mask.sum() > 0:
-                        # Teacher: D(E(GT))
-                        with torch.no_grad():
-                            h_GT = self.model.encode_tokens(step_targets[:aux_batch_size])
-                            logits_GT = self.model.decode(h_GT, attention_mask[:aux_batch_size])
-                            # Target distribution (with temperature)
-                            # Note: Temperature > 1 makes distribution softer
-                            # Temperature < 1 makes distribution sharper
-                            # For semantic consistency, τ=1.0 is reasonable
-                            target_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
-                        
-                        # Student: D(h_recursive)
-                        log_probs_pred = torch.log_softmax(
-                            logits_pred[:aux_batch_size] / self.aux_temp,
-                            dim=-1
-                        )
-                        
-                        # KL Divergence: KL(P_target || P_pred)
-                        # PyTorch KLDivLoss expects (log_pred, target)
-                        kl_criterion = nn.KLDivLoss(reduction='none')
-                        kl_loss_all = kl_criterion(log_probs_pred, target_dist)
-                        
-                        # Apply mask and average
-                        # kl_loss_all: [B_aux, L, V]
-                        # aux_mask: [B_aux, L]
-                        aux_kl = kl_loss_all.sum(dim=-1)[aux_mask].mean()
-                        
-                        # Temperature scaling correction
-                        # When using temperature τ, gradient is scaled by 1/τ²
-                        # So we multiply loss by τ² to compensate
-                        aux_kl = aux_kl * (self.aux_temp ** 2)
-                        
-                        total_aux_loss += aux_kl.item()
-                        num_aux_steps += 1
-                
-                # [C] Gate Loss
-                step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
-                gate_loss = self.gate_criterion(
-                    gate_pred[valid_mask],
-                    step_gate_target[valid_mask]
-                )
-                
-                # Step loss 누적
-                step_loss = (
-                    self.loss_weight_recon * recon_loss +
-                    self.loss_weight_gate * gate_loss +
-                    self.loss_weight_aux * aux_kl
-                )
-                
-                accumulated_loss += step_loss
-                
-                total_recon_loss += recon_loss.item()
-                total_gate_loss += gate_loss.item()
-                num_valid_steps += 1
+                collected_hidden.append(hidden)
+                collected_gate_preds.append(gate_pred)
+
+            # =================================================================
+            # [Phase 3] Batch Decoding (Student)
+            # 모아둔 Hidden State를 한 번에 디코딩
+            # =================================================================
+            # Stack Hiddens: [Steps, B, L, D] -> [B, Steps, L, D]
+            # (Stacking이 메모리를 쓰지만 BPTT를 위해 어차피 필요함)
+            all_hidden_states = torch.stack(collected_hidden, dim=1) 
             
-            # 최종 손실
-            final_loss = accumulated_loss / num_valid_steps
-        
-        # 역전파
-        original_final_loss = final_loss.item()
-        final_loss = final_loss / self.gradient_accumulation_steps
-        
-        if self.use_amp:
-            self.scaler.scale(final_loss).backward()
-        else:
-            final_loss.backward()
+            # Flatten for Batch Decode: [B * Steps, L, D]
+            flat_hidden = all_hidden_states.reshape(-1, *all_hidden_states.shape[2:])
+            
+            # Mask 확장 (For Student Decode)
+            flat_att_mask = attention_mask.unsqueeze(1)\
+                .expand(-1, actual_max_length, -1).reshape(-1, attention_mask.size(-1))
+            
+            # One-Shot Decoding
+            flat_logits = self.model.decode(flat_hidden, attention_mask=flat_att_mask)
+            
+            # Reshape back: [B, Steps, L, V]
+            all_logits = flat_logits.view(batch_size, actual_max_length, -1, flat_logits.size(-1))
+
+            # =================================================================
+            # [Phase 4] Vectorized Loss Calculation
+            # =================================================================
+            # 1. Recon Loss (Masking 활용하여 루프 없이 계산 가능하지만, 메모리 아끼기 위해 flatten 사용)
+            # targets: [B, Steps, L]
+            # loss_masks: [B, Steps, L]
+            
+            # Valid Mask (Chain Length에 따른 마스크): [B, Steps]
+            step_indices = torch.arange(actual_max_length, device=self.device).unsqueeze(0) # [1, Steps]
+            chain_len_mask = step_indices < chain_lengths.unsqueeze(1) # [B, Steps]
+            
+            # Final Loss Mask = Chain Valid & Random Mask
+            # [B, Steps, L]
+            final_loss_mask = loss_masks & chain_len_mask.unsqueeze(-1)
+            
+            # Flatten for CrossEntropy
+            active_logits = all_logits[final_loss_mask] # [N_active, V]
+            active_targets = targets[:batch_size, :actual_max_length, :][final_loss_mask] # [N_active]
+            
+            if len(active_targets) > 0:
+                recon_loss = self.recon_criterion(active_logits, active_targets)
+            else:
+                recon_loss = torch.tensor(0.0, device=self.device)
+
+            # 2. Gate Loss
+            # collected_gate_preds: List of [B, 1] -> [B, Steps]
+            all_gate_preds = torch.cat(collected_gate_preds, dim=1) 
+            target_gates = gate_targets[:, 1:actual_max_length+1] # [B, Steps]
+            
+            # Valid한 부분만 MSE
+            if chain_len_mask.any():
+                gate_loss_steps = self.gate_criterion(
+                    all_gate_preds[chain_len_mask], 
+                    target_gates[chain_len_mask]
+                )
+                total_gate_loss += gate_loss_steps
+
+            # 3. Aux Loss (KL)
+            avg_aux_loss = 0.0
+            if self.loss_weight_aux > 0 and teacher_dist_all is not None:
+                # Student Logits: [B_aux, Steps, L, V]
+                aux_student_logits = all_logits[:aux_batch_size]
+                
+                # Log Softmax
+                log_probs_student = torch.log_softmax(aux_student_logits / self.aux_temp, dim=-1)
+                
+                # KL Calculation (Element-wise first)
+                kl_crit = nn.KLDivLoss(reduction='none')
+                # [B_aux, Steps, L]
+                kl_div = kl_crit(log_probs_student, teacher_dist_all).sum(dim=-1)
+                
+                # Masking
+                aux_valid_mask = final_loss_mask[:aux_batch_size] # [B_aux, Steps, L]
+                
+                if aux_valid_mask.sum() > 0:
+                    aux_loss_val = kl_div[aux_valid_mask].mean()
+                    avg_aux_loss = aux_loss_val * (self.aux_temp ** 2)
+
+            # Total Loss
+            total_loss = (
+                self.loss_weight_recon * recon_loss +
+                self.loss_weight_gate * total_gate_loss +
+                self.loss_weight_aux * avg_aux_loss
+            )
+
+        # Backward & Optimizer Step
+        # (기존 코드와 동일)
+        self.scaler.scale(total_loss / self.gradient_accumulation_steps).backward()
         
         if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-            
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.optimizer.zero_grad()
-            if self.scheduler:
-                self.scheduler.step()
-        
-        # 평균 계산 (로깅용)
-        avg_aux = total_aux_loss / num_aux_steps if num_aux_steps > 0 else 0.0
-        
+            if self.scheduler: self.scheduler.step()
+
         return (
-            original_final_loss,
-            total_recon_loss / num_valid_steps,
-            total_gate_loss / num_valid_steps,
-            avg_aux
+            total_loss.item(),
+            recon_loss.item(),
+            total_gate_loss.item(),
+            avg_aux_loss.item() if isinstance(avg_aux_loss, torch.Tensor) else avg_aux_loss
         )
     
     def validate(self) -> Tuple[float, float, float]:
