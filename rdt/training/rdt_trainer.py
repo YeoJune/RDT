@@ -6,6 +6,7 @@ import torch.optim as optim
 import wandb
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
+from transformers import AutoTokenizer
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -13,6 +14,7 @@ import math
 
 from ..models.rdt import RDT
 from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters, count_parameters_without_context, CSVLogger
+from ..data.rdt_preprocessor import RDTPreprocessor
 
 
 class RDTTrainer:
@@ -54,6 +56,10 @@ class RDTTrainer:
         
         # Scheduler
         self.scheduler = self._create_scheduler()
+        
+        tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
+
+        self.preprocessor = RDTPreprocessor(tokenizer, config).to(device)
         
         # Loss functions
         self.recon_criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding
@@ -157,12 +163,17 @@ class RDTTrainer:
         
         return sampling_prob
     
-    def train_step(self, batch: Dict) -> Tuple[float, float, float, float]:
+    def train_step(self, raw_batch: Dict) -> Tuple[float, float, float, float]:
         """
         - Recon Loss: h_i -> Target Index (미래 추론)
         - Aux Loss: D(h_i) -> D(E(GT)) (현재 위상 보존)
         """
         self.model.train()
+
+        raw_input_ids = raw_batch['input_ids'].to(self.device)
+
+        with torch.no_grad():
+            batch = self.preprocessor(raw_input_ids)
         
         # 데이터 준비
         input_tokens = batch['input'].to(self.device)

@@ -9,6 +9,7 @@ from .datasets import (
     create_mdlm_dataloaders
 )
 from .collators import RDTCollator, MLMCollator
+from .rdt_preprocessor import RDTPreprocessor
 
 __all__ = [
     'StreamingTextDataset',
@@ -18,5 +19,6 @@ __all__ = [
     'create_cmlm_dataloaders',
     'create_mdlm_dataloaders',
     'RDTCollator',
-    'MLMCollator'
+    'MLMCollator',
+    'RDTPreprocessor',
 ]
