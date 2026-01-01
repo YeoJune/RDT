@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from typing import List, Optional
 
@@ -302,11 +303,10 @@ class AdaptiveLayerNorm(nn.Module):
         
         return self.norm(x) * (1 + gamma) + beta
 
-
 class RoPESelfAttention(nn.Module):
     """
     Self-Attention with RoPE applied only to Q and K (NOT to V)
-    This is the correct implementation as per RoFormer paper and all standard LLMs
+    Optimized with F.scaled_dot_product_attention
     """
     def __init__(self, d_model: int, n_heads: int, rope_layer: nn.Module, dropout: float = 0.1):
         super().__init__()
@@ -320,63 +320,58 @@ class RoPESelfAttention(nn.Module):
         # QKV projections
         self.qkv_proj = nn.Linear(d_model, d_model * 3, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.attn_dropout = nn.Dropout(dropout)
+        
+        # Dropout for SDPA
+        self.dropout_p = dropout
+        self.out_dropout = nn.Dropout(dropout)
         
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None):
         """
         Args:
             x: [B, L, D]
             key_padding_mask: [B, L] where True means ignore (padding)
-        
-        Returns:
-            [B, L, D]
         """
         B, L, D = x.shape
         
         # 1. Project to Q, K, V
-        qkv = self.qkv_proj(x)  # [B, L, 3*D]
-        q, k, v = qkv.chunk(3, dim=-1)  # Each: [B, L, D]
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
         
-        # 2. Split heads: [B, L, D] -> [B, L, n_heads, head_dim]
+        # 2. Split heads: [B, L, n_heads, head_dim]
         q = q.view(B, L, self.n_heads, self.head_dim)
         k = k.view(B, L, self.n_heads, self.head_dim)
         v = v.view(B, L, self.n_heads, self.head_dim)
         
-        # 3. Apply RoPE to Q and K ONLY (not V!)
-        # RoPE's forward expects [..., seq_len, ..., dim]
-        # Our shape is [B, L, n_heads, head_dim], seq_dim=1
+        # 3. Apply RoPE to Q and K ONLY
         q = self.rope(q, seq_dim=1)
         k = self.rope(k, seq_dim=1)
-        # V is NOT rotated
         
         # 4. Transpose for attention: [B, n_heads, L, head_dim]
+        # F.scaled_dot_product_attention expects [B, H, L, D]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # 5. Scaled dot-product attention
-        # scores: [B, n_heads, L, L]
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
-        # Apply mask if provided
+        # 5. Scaled Dot Product Attention (Flash Attention applied automatically if available)
+        attn_mask = None
         if key_padding_mask is not None:
             # key_padding_mask: [B, L] -> [B, 1, 1, L] for broadcasting
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(mask, float('-inf'))
+            # SDPA supports boolean mask where True = masked out (ignore)
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
         
-        # 6. Attention weights and output
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-        
-        attn_output = torch.matmul(attn_weights, v)  # [B, n_heads, L, head_dim]
-        
-        # 7. Concatenate heads: [B, L, D]
+        # 6. Concatenate heads: [B, L, D]
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, D)
         
-        # 8. Output projection
+        # 7. Output projection
         output = self.out_proj(attn_output)
-        output = self.dropout(output)
+        output = self.out_dropout(output)
         
         return output
 
@@ -384,6 +379,7 @@ class RoPESelfAttention(nn.Module):
 class RoPECrossAttention(nn.Module):
     """
     Cross-Attention with RoPE applied only to Q and K
+    Optimized with F.scaled_dot_product_attention
     """
     def __init__(self, d_model: int, n_heads: int, rope_layer: nn.Module, dropout: float = 0.1):
         super().__init__()
@@ -394,13 +390,15 @@ class RoPECrossAttention(nn.Module):
         self.head_dim = d_model // n_heads
         self.rope = rope_layer
         
-        # Separate Q, K, V projections for cross-attention
+        # Separate Q, K, V projections
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.attn_dropout = nn.Dropout(dropout)
+        
+        # Dropout for SDPA
+        self.dropout_p = dropout
+        self.out_dropout = nn.Dropout(dropout)
         
     def forward(
         self, 
@@ -415,9 +413,6 @@ class RoPECrossAttention(nn.Module):
             key: [B, L_kv, D]
             value: [B, L_kv, D]
             key_padding_mask: [B, L_kv]
-        
-        Returns:
-            [B, L_q, D]
         """
         B, L_q, D = query.shape
         L_kv = key.shape[1]
@@ -436,29 +431,30 @@ class RoPECrossAttention(nn.Module):
         q = self.rope(q, seq_dim=1)
         k = self.rope(k, seq_dim=1)
         
-        # 4. Transpose for attention
+        # 4. Transpose for attention: [B, n_heads, L, head_dim]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # 5. Attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
+        # 5. Scaled Dot Product Attention
+        attn_mask = None
         if key_padding_mask is not None:
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(mask, float('-inf'))
+            # key_padding_mask: [B, L_kv] -> [B, 1, 1, L_kv]
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
         
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-        
-        attn_output = torch.matmul(attn_weights, v)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
         
         # 6. Concatenate heads
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L_q, D)
         
         # 7. Output projection
         output = self.out_proj(attn_output)
-        output = self.dropout(output)
+        output = self.out_dropout(output)
         
         return output
 
