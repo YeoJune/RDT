@@ -31,7 +31,7 @@ class RDTTrainer:
         self.model = model.to(device)
         if hasattr(torch, 'compile') and device.type == 'cuda':
             print("Compiling model with torch.compile...")
-            self.model = torch.compile(self.model, mode='reduce-overhead')
+            self.model = torch.compile(self.model)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
