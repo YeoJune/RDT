@@ -1,11 +1,10 @@
-"""Baseline trainer for standard MLM models (BERT, RoBERTa, etc.)"""
+"""Baseline trainer for standard MLM models (BERT, RoBERTa, etc.) with Accelerate"""
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
 from torch.utils.data import DataLoader
-from torch.amp import autocast, GradScaler
+from accelerate import Accelerator
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Optional
@@ -27,17 +26,16 @@ class MLMTrainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         config: Dict,
-        device: torch.device
+        accelerator: Accelerator
     ):
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.accelerator = accelerator
         self.config = config
-        self.device = device
+        self.resume_checkpoint = None
         
         # Detect model type
         self.model_type = self._detect_model_type(model)
-        print(f"Detected model type: {self.model_type.upper()}")
+        if self.accelerator.is_main_process:
+            print(f"Detected model type: {self.model_type.upper()}")
         
         # Training config
         self.training_mode = config['training'].get('training_mode', 'epoch')
@@ -57,28 +55,26 @@ class MLMTrainer:
         # Scheduler
         self.scheduler = self._create_scheduler()
         
-        # Logging with W&B
-        self.use_wandb = config.get('use_wandb', True)
-        if self.use_wandb:
-            wandb.init(
-                project=config.get('wandb_project', 'rdt-baselines'),
-                name=config.get('wandb_run_name', None),
-                config=config,
-                resume='allow'
+        # Accelerate Prepare
+        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = \
+            self.accelerator.prepare(
+                model, self.optimizer, train_loader, val_loader, self.scheduler
             )
-            wandb.watch(model, log='all', log_freq=config['output'].get('log_every_n_steps', 100))
         
-        # CSV Logger
-        log_dir = Path(config['output'].get('log_dir', 'outputs/logs'))
-        self.csv_logger = CSVLogger(str(log_dir))
+        # Logging with W&B (Main Process Only)
+        self.use_wandb = config.get('use_wandb', True)
+        if self.use_wandb and self.accelerator.is_main_process:
+            # Accelerator가 tracker 초기화를 처리
+            pass
+        
+        # CSV Logger (Main Process Only)
+        if self.accelerator.is_main_process:
+            log_dir = Path(config['output'].get('log_dir', 'outputs/logs'))
+            self.csv_logger = CSVLogger(str(log_dir))
         
         self.log_every_n_steps = config['output']['log_every_n_steps']
         self.eval_every_n_epochs = config['output'].get('eval_every_n_epochs', 1)
         self.eval_every_n_steps = config['output'].get('eval_every_n_steps', 5000)
-        
-        # AMP
-        self.use_amp = config.get('mixed_precision', False)
-        self.scaler = GradScaler() if self.use_amp else None
         
         # Checkpointing
         self.checkpoint_dir = Path(config['output']['checkpoint_dir'])
@@ -96,9 +92,11 @@ class MLMTrainer:
         self.current_epoch = 0
         self.best_val_loss = float('inf')
         
-        # Print info
-        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Model parameters: {num_params:,}")
+        # Print info (Main Process Only)
+        if self.accelerator.is_main_process:
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            num_params = sum(p.numel() for p in unwrapped_model.parameters() if p.requires_grad)
+            print(f"Model parameters: {num_params:,}")
     
     def _detect_model_type(self, model):
         """Detect model type from class name"""
@@ -151,41 +149,28 @@ class MLMTrainer:
         self.model.train()
         
         # Move batch to device
-        input_ids = batch['input_ids'].to(self.device)
+        input_ids = batch['input_ids'].to(self.accelerator.device)
         attention_mask = batch.get('attention_mask')
         if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-        labels = batch['labels'].to(self.device)
+            attention_mask = attention_mask.to(self.accelerator.device)
+        labels = batch['labels'].to(self.accelerator.device)
         
-        # Forward pass with AMP
-        if self.use_amp:
-            with autocast('cuda'):
-                loss, logits = self.model(input_ids, attention_mask, labels)
-        else:
-            loss, logits = self.model(input_ids, attention_mask, labels)
+        # Forward pass (Accelerate handles mixed precision)
+        loss, logits = self.model(input_ids, attention_mask, labels)
         
         # Store original loss for logging
         original_loss = loss.item()
         
-        # Backward pass with gradient accumulation
-        loss = loss / self.gradient_accumulation_steps  # Scale loss
-        
-        if self.use_amp:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        
-        # Only update weights every gradient_accumulation_steps
-        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+        # Accelerate의 accumulate context 사용
+        with self.accelerator.accumulate(self.model):
+            # Backward
+            self.accelerator.backward(loss)
             
+            # Gradient Clipping
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            
+            self.optimizer.step()
             self.optimizer.zero_grad()
             self.scheduler.step()
         
@@ -209,45 +194,32 @@ class MLMTrainer:
         self.model.train()
         
         # Move batch to device
-        input_ids = batch['input_ids'].to(self.device)  # Original tokens
+        input_ids = batch['input_ids'].to(self.accelerator.device)  # Original tokens
         attention_mask = batch.get('attention_mask')
         if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
+            attention_mask = attention_mask.to(self.accelerator.device)
         
         # Apply uniform masking on-the-fly
         masked_input_ids, labels, mask_ratio = self.model.uniform_masking(
             input_ids, attention_mask
         )
         
-        # Forward pass with AMP
-        if self.use_amp:
-            with autocast('cuda'):
-                loss, logits = self.model(masked_input_ids, attention_mask, labels)
-        else:
-            loss, logits = self.model(masked_input_ids, attention_mask, labels)
+        # Forward pass (Accelerate handles mixed precision)
+        loss, logits = self.model(masked_input_ids, attention_mask, labels)
         
         # Store original loss for logging
         original_loss = loss.item()
         
-        # Backward pass with gradient accumulation
-        loss = loss / self.gradient_accumulation_steps  # Scale loss
-        
-        if self.use_amp:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        
-        # Only update weights every gradient_accumulation_steps
-        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+        # Accelerate의 accumulate context 사용
+        with self.accelerator.accumulate(self.model):
+            # Backward
+            self.accelerator.backward(loss)
             
+            # Gradient Clipping
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            
+            self.optimizer.step()
             self.optimizer.zero_grad()
             self.scheduler.step()
         
@@ -272,10 +244,10 @@ class MLMTrainer:
         self.model.train()
         
         # Move batch to device
-        input_ids = batch['input_ids'].to(self.device)  # Original tokens
+        input_ids = batch['input_ids'].to(self.accelerator.device)  # Original tokens
         attention_mask = batch.get('attention_mask')
         if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
+            attention_mask = attention_mask.to(self.accelerator.device)
         
         # Apply continuous-time masking on-the-fly
         masked_input_ids, labels, t, loss_weight = self.model.continuous_time_masking(
@@ -284,38 +256,26 @@ class MLMTrainer:
             low_discrepancy_sampling=True
         )
         
-        # Forward pass with time-weighted loss
-        if self.use_amp:
-            with autocast('cuda'):
-                loss, logits = self.model.forward_with_time_weighting(
-                    masked_input_ids, attention_mask, labels, loss_weight
-                )
-        else:
-            loss, logits = self.model.forward_with_time_weighting(
-                masked_input_ids, attention_mask, labels, loss_weight
-            )
+        # Forward pass with time-weighted loss (Accelerate handles mixed precision)
+        loss, logits = self.model.forward_with_time_weighting(
+            masked_input_ids, attention_mask, labels, loss_weight
+        )
         
         # Store original loss for logging
         original_loss = loss.item()
         
-        # Backward pass with gradient accumulation
-        loss = loss / self.gradient_accumulation_steps  # Scale loss
-        
-        if self.use_amp:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        
-        # Only update weights every gradient_accumulation_steps
-        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+        # Accelerate의 accumulate context 사용
+        with self.accelerator.accumulate(self.model):
+            # Backward
+            self.accelerator.backward(loss)
+            
+            # Gradient Clipping
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.scheduler.step()
             
             self.optimizer.zero_grad()
             self.scheduler.step()
@@ -359,18 +319,15 @@ class MLMTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False):
-                input_ids = batch['input_ids'].to(self.device)
+            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process):
+                input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
-                labels = batch['labels'].to(self.device)
+                    attention_mask = attention_mask.to(self.accelerator.device)
+                labels = batch['labels'].to(self.accelerator.device)
                 
-                if self.use_amp:
-                    with autocast():
-                        loss, logits = self.model(input_ids, attention_mask, labels)
-                else:
-                    loss, logits = self.model(input_ids, attention_mask, labels)
+                # Accelerate handles mixed precision automatically
+                loss, logits = self.model(input_ids, attention_mask, labels)
                 
                 # Calculate accuracy
                 mask = labels != -100
@@ -401,22 +358,19 @@ class MLMTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False):
-                input_ids = batch['input_ids'].to(self.device)
+            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process):
+                input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
+                    attention_mask = attention_mask.to(self.accelerator.device)
                 
                 # Apply uniform masking for CMLM
                 masked_input_ids, labels, _ = self.model.uniform_masking(
                     input_ids, attention_mask
                 )
                 
-                if self.use_amp:
-                    with autocast():
-                        loss, logits = self.model(masked_input_ids, attention_mask, labels)
-                else:
-                    loss, logits = self.model(masked_input_ids, attention_mask, labels)
+                # Accelerate handles mixed precision automatically
+                loss, logits = self.model(masked_input_ids, attention_mask, labels)
                 
                 # Calculate accuracy
                 mask = labels != -100
@@ -455,11 +409,11 @@ class MLMTrainer:
         num_mc_samples = self.config.get('mdlm', {}).get('mc_samples', 10)
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating MDLM", leave=False):
-                input_ids = batch['input_ids'].to(self.device)
+            for batch in tqdm(self.val_loader, desc="Evaluating MDLM", leave=False, disable=not self.accelerator.is_local_main_process):
+                input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
+                    attention_mask = attention_mask.to(self.accelerator.device)
                 
                 # Valid token count
                 if attention_mask is not None:
@@ -476,16 +430,11 @@ class MLMTrainer:
                         input_ids, attention_mask, low_discrepancy_sampling=True
                     )
                     
-                    if self.use_amp:
-                        with autocast('cuda'):
-                            # Loss (Weighted)
-                            loss, logits = self.model.forward_with_time_weighting(
-                                masked_ids, attention_mask, labels, loss_weight
-                            )
-                    else:
-                        loss, logits = self.model.forward_with_time_weighting(
-                            masked_ids, attention_mask, labels, loss_weight
-                        )
+                    # Accelerate handles mixed precision automatically
+                    # Loss (Weighted)
+                    loss, logits = self.model.forward_with_time_weighting(
+                        masked_ids, attention_mask, labels, loss_weight
+                    )
                     
                     # 1. Loss Accumulation (Weighted Sum)
                     batch_elbo_sum += loss.item() * num_valid_tokens
@@ -524,7 +473,18 @@ class MLMTrainer:
         }
 
     def save_checkpoint(self, filename=None):
-        """Save checkpoint"""
+        """Save checkpoint (Multi-GPU Safe)
+        
+        1. Wait for all processes to sync
+        2. Only Main Process saves
+        3. Unwrap model to remove DDP 'module.' prefix
+        """
+        # Wait for all GPUs to reach this point
+        self.accelerator.wait_for_everyone()
+        
+        if not self.accelerator.is_main_process:
+            return None
+        
         if filename is None:
             if self.training_mode == 'epoch':
                 filename = f"checkpoint_epoch_{self.current_epoch}_step_{self.global_step}.pt"
@@ -533,10 +493,13 @@ class MLMTrainer:
         
         checkpoint_path = self.checkpoint_dir / filename
         
+        # Unwrap model to remove DDP wrapper
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        
         torch.save({
             'epoch': self.current_epoch,
             'step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': unwrapped_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'config': self.config,
@@ -545,7 +508,7 @@ class MLMTrainer:
         
         print(f"Checkpoint saved: {checkpoint_path}")
         
-        # Cleanup old checkpoints
+        # Cleanup old checkpoints (Main Process only)
         self._cleanup_checkpoints()
         
         return checkpoint_path
@@ -563,68 +526,99 @@ class MLMTrainer:
     
     def train(self):
         """Main training loop"""
-        print("\n" + "="*60)
-        print(f"Starting {self.model_type.upper()} Training")
-        print("="*60)
-        print(f"Training mode: {self.training_mode}")
-        if self.training_mode == 'epoch':
-            print(f"Epochs: {self.num_epochs}")
-        else:
-            print(f"Max steps: {self.max_training_steps}")
-        print("="*60 + "\n")
+        if self.accelerator.is_main_process:
+            print("\n" + "="*60)
+            print(f"Starting {self.model_type.upper()} Training")
+            print("="*60)
+            print(f"Training mode: {self.training_mode}")
+            if self.training_mode == 'epoch':
+                print(f"Epochs: {self.num_epochs}")
+            else:
+                print(f"Max steps: {self.max_training_steps}")
+            print("="*60 + "\n")
+        
+        # Resume checkpoint if specified
+        if self.resume_checkpoint:
+            if self.accelerator.is_main_process:
+                print(f"Loading checkpoint from {self.resume_checkpoint}")
+            self.accelerator.load_state(self.resume_checkpoint)
+            # TODO: 저장된 epoch/step 정보 복원 로직 추가
         
         if self.training_mode == 'epoch':
             self._train_by_epoch()
         else:
             self._train_by_step()
         
-        print("\n" + "="*60)
-        print("Training completed!")
-        print("="*60)
+        if self.accelerator.is_main_process:
+            print("\n" + "="*60)
+            print("Training completed!")
+            print("="*60)
     
     def _train_by_epoch(self):
         """Train by epochs"""
         for epoch in range(self.current_epoch, self.num_epochs):
             self.current_epoch = epoch
-            print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
+            if self.accelerator.is_main_process:
+                print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
             
             # Training loop
-            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}")
+            pbar = tqdm(
+                self.train_loader, 
+                desc=f"Epoch {epoch + 1}",
+                disable=not self.accelerator.is_local_main_process
+            )
             for batch in pbar:
                 metrics = self.train_step(batch)
                 self.global_step += 1
                 
-                # Logging
-                if self.global_step % self.log_every_n_steps == 0:
+                # Logging (Main Process Only)
+                if self.global_step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
                     log_data = {'epoch': epoch, 'step': self.global_step, **metrics}
                     self.csv_logger.log(log_data)
                     
                     if self.use_wandb:
-                        wandb.log({'train/' + k if k not in ['epoch', 'step'] else k: v 
-                                  for k, v in log_data.items()})
+                        self.accelerator.log({'train/' + k if k not in ['epoch', 'step'] else k: v 
+                                  for k, v in log_data.items()}, step=self.global_step)
                     pbar.set_postfix(loss=f"{metrics['loss']:.4f}", 
                                     acc=f"{metrics['accuracy']:.4f}")
             
             # Evaluation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_metrics = self.evaluate()
-                val_data = {'epoch': epoch, 'step': self.global_step, **val_metrics}
-                self.csv_logger.log(val_data)
                 
-                if self.use_wandb:
-                    wandb.log({
-                        'val/loss': val_metrics['val_loss'],
-                        'val/accuracy': val_metrics['val_accuracy'],
-                        'epoch': epoch
-                    })
+                if self.accelerator.is_main_process:
+                    val_data = {'epoch': epoch, 'step': self.global_step, **val_metrics}
+                    self.csv_logger.log(val_data)
+                    
+                    if self.use_wandb:
+                        self.accelerator.log({
+                            'val/loss': val_metrics['val_loss'],
+                            'val/accuracy': val_metrics['val_accuracy'],
+                            'epoch': epoch
+                        }, step=self.global_step)
+                    
+                    print(f"\nValidation - Loss: {val_metrics['val_loss']:.4f}, "
+                          f"Accuracy: {val_metrics['val_accuracy']:.4f}, ")
                 
-                print(f"\nValidation - Loss: {val_metrics['val_loss']:.4f}, "
-                      f"Accuracy: {val_metrics['val_accuracy']:.4f}, ")
-                
-                # Save best model
-                if val_metrics['val_loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['val_loss']
-                    self.save_checkpoint('best_model.pt')
+                # Save best model (Deadlock Prevention)
+                # All processes must reach wait_for_everyone
+                self.accelerator.wait_for_everyone()
+                if self.accelerator.is_main_process:
+                    if val_metrics['val_loss'] < self.best_val_loss:
+                        self.best_val_loss = val_metrics['val_loss']
+                        # Direct save without internal wait (already waited above)
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        checkpoint_path = self.checkpoint_dir / 'best_model.pt'
+                        torch.save({
+                            'epoch': epoch,
+                            'step': self.global_step,
+                            'model_state_dict': unwrapped_model.state_dict(),
+                            'optimizer_state_dict': self.optimizer.state_dict(),
+                            'scheduler_state_dict': self.scheduler.state_dict(),
+                            'config': self.config,
+                            'best_val_loss': self.best_val_loss
+                        }, checkpoint_path)
+                        print(f"Best model saved: {checkpoint_path}")
             
             # Save checkpoint
             if (epoch + 1) % self.save_every_n_epochs == 0:
@@ -632,7 +626,11 @@ class MLMTrainer:
     
     def _train_by_step(self):
         """Train by steps"""
-        pbar = tqdm(total=self.max_training_steps, desc="Training")
+        pbar = tqdm(
+            total=self.max_training_steps, 
+            desc="Training",
+            disable=not self.accelerator.is_local_main_process
+        )
         pbar.update(self.global_step)
         
         epoch = 0
@@ -645,37 +643,54 @@ class MLMTrainer:
                 self.global_step += 1
                 pbar.update(1)
                 
-                # Logging
-                if self.global_step % self.log_every_n_steps == 0:
+                # Logging (Main Process Only)
+                if self.global_step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
                     log_data = {'epoch': epoch, 'step': self.global_step, **metrics}
                     self.csv_logger.log(log_data)
                     
                     if self.use_wandb:
-                        wandb.log({'train/' + k if k not in ['epoch', 'step'] else k: v 
-                                  for k, v in log_data.items()})
+                        self.accelerator.log({'train/' + k if k not in ['epoch', 'step'] else k: v 
+                                  for k, v in log_data.items()}, step=self.global_step)
                     pbar.set_postfix(loss=f"{metrics['loss']:.4f}",
                                     acc=f"{metrics['accuracy']:.4f}")
                 
                 # Evaluation
                 if self.global_step % self.eval_every_n_steps == 0:
                     val_metrics = self.evaluate()
-                    val_data = {'epoch': epoch, 'step': self.global_step, **val_metrics}
-                    self.csv_logger.log(val_data)
                     
-                    if self.use_wandb:
-                        wandb.log({
-                            'val/loss': val_metrics['val_loss'],
-                            'val/accuracy': val_metrics['val_accuracy'],
-                            'step': self.global_step
-                        })
+                    if self.accelerator.is_main_process:
+                        val_data = {'epoch': epoch, 'step': self.global_step, **val_metrics}
+                        self.csv_logger.log(val_data)
+                        
+                        if self.use_wandb:
+                            self.accelerator.log({
+                                'val/loss': val_metrics['val_loss'],
+                                'val/accuracy': val_metrics['val_accuracy'],
+                                'step': self.global_step
+                            }, step=self.global_step)
+                        
+                        print(f"\nStep {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}, "
+                              f"Accuracy: {val_metrics['val_accuracy']:.4f}, ")
                     
-                    print(f"\nStep {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}, "
-                          f"Accuracy: {val_metrics['val_accuracy']:.4f}, ")
-                    
-                    # Save best model
-                    if val_metrics['val_loss'] < self.best_val_loss:
-                        self.best_val_loss = val_metrics['val_loss']
-                        self.save_checkpoint('best_model.pt')
+                    # Save best model (Deadlock Prevention)
+                    # All processes must reach wait_for_everyone
+                    self.accelerator.wait_for_everyone()
+                    if self.accelerator.is_main_process:
+                        if val_metrics['val_loss'] < self.best_val_loss:
+                            self.best_val_loss = val_metrics['val_loss']
+                            # Direct save without internal wait (already waited above)
+                            unwrapped_model = self.accelerator.unwrap_model(self.model)
+                            checkpoint_path = self.checkpoint_dir / 'best_model.pt'
+                            torch.save({
+                                'epoch': epoch,
+                                'step': self.global_step,
+                                'model_state_dict': unwrapped_model.state_dict(),
+                                'optimizer_state_dict': self.optimizer.state_dict(),
+                                'scheduler_state_dict': self.scheduler.state_dict(),
+                                'config': self.config,
+                                'best_val_loss': self.best_val_loss
+                            }, checkpoint_path)
+                            print(f"Best model saved: {checkpoint_path}")
                 
                 # Save checkpoint
                 if self.global_step % self.save_every_n_steps == 0:

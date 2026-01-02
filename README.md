@@ -164,6 +164,8 @@ pip install -e ".[dev]"
 
 Train RDT, MLM, or CMLM models using the unified training script. The RDT trainer supports **Scheduled Sampling**, transitioning from Ground-Truth gate scores to Predicted gate scores to reduce exposure bias.
 
+#### Single GPU Training
+
 ```bash
 # Train RDT (Recursive Denoising Transformer)
 rdt-train --config rdt/configs/rdt.yaml
@@ -183,6 +185,42 @@ rdt-train --config rdt/configs/rdt.yaml --checkpoint ./checkpoints/rdt/checkpoin
 # Load pretrained weights only (start training from scratch)
 rdt-train --config rdt/configs/mlm.yaml --pretrained ./checkpoints/mlm/best_model.pt
 ```
+
+#### Multi-GPU Training (Accelerate)
+
+RDT supports distributed training via **Hugging Face Accelerate** for efficient multi-GPU scaling.
+
+```bash
+# Configure Accelerate (one-time setup)
+accelerate config
+
+# Multi-GPU training with Accelerate
+accelerate launch rdt/scripts/train.py --config rdt/configs/rdt.yaml
+
+# Or specify launch parameters directly (e.g., 2 GPUs with BFloat16)
+accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 \
+    rdt/scripts/train.py --config rdt/configs/rdt.yaml
+
+# For A100 GPUs, BFloat16 is recommended for optimal performance
+accelerate launch --multi_gpu --num_processes=4 --mixed_precision=bf16 \
+    rdt/scripts/train.py --config rdt/configs/rdt.yaml
+```
+
+**Mixed Precision Training:**
+
+Set `mixed_precision` in your config file for automatic mixed precision training:
+
+```yaml
+# In rdt/configs/rdt.yaml
+mixed_precision: "bf16" # Options: 'no', 'fp16', 'bf16' (recommended for A100)
+```
+
+**Benefits of Multi-GPU Training:**
+
+- Linear scaling across GPUs
+- Automatic gradient synchronization
+- Memory-efficient training with gradient accumulation
+- BFloat16 support for A100 GPUs (better numerical stability than FP16)
 
 ### 2. Inference
 

@@ -20,7 +20,7 @@ import nltk
 from rdt.models import RDT, MLM
 from rdt.models.cmlm import CMLM
 from rdt.models.mdlm import MDLM
-from rdt.utils import load_config, get_device
+from rdt.utils import load_config
 
 
 # Download NLTK data if needed

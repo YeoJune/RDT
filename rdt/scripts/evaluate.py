@@ -10,7 +10,7 @@ from rdt.models.cmlm import CMLM
 from rdt.models.mdlm import MDLM
 from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders, create_mdlm_dataloaders
 from rdt.evaluation import Evaluator
-from rdt.utils import load_config, load_checkpoint, get_device, create_model_from_config
+from rdt.utils import load_config, load_checkpoint, create_model_from_config
 
 
 def main():
@@ -47,12 +47,17 @@ def main():
     print(f"Loading config from {args.config}")
     config = load_config(args.config)
     
-    # Override device if specified
+    # Determine device
     if args.device:
-        config['device'] = args.device
+        device_name = args.device
+    else:
+        device_name = config.get('device', 'cuda')
     
-    # Get device
-    device = get_device(config['device'])
+    if device_name == 'cuda' and torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    
     print(f"Using device: {device}")
     
     # Determine model type

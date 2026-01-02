@@ -1,4 +1,4 @@
-"""Utility functions for RDT"""
+"""Utility functions for RDT (Accelerate Compatible)"""
 
 import yaml
 import torch
@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 import os
+try:
+    from accelerate.utils import set_seed as accelerate_set_seed
+except ImportError:
+    accelerate_set_seed = None
 
 
 class CSVLogger:
@@ -94,14 +98,21 @@ def merge_configs(base_config: Dict, override_config: Dict) -> Dict:
 
 
 def set_seed(seed: int):
-    """Set random seed for reproducibility"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    """Set random seed for reproducibility (Accelerate-compatible)"""
+    if accelerate_set_seed is not None:
+        # Use Accelerate's set_seed which handles distributed training
+        accelerate_set_seed(seed)
+    else:
+        # Fallback to manual seed setting
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    
+    # Additional determinism
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def save_checkpoint(
@@ -115,7 +126,11 @@ def save_checkpoint(
     checkpoint_dir: str,
     filename: str = None
 ):
-    """Save training checkpoint"""
+    """Save training checkpoint
+    
+    Note: 'model' should be already unwrapped by accelerator.unwrap_model()
+    to avoid DDP 'module.' prefix in state dict keys.
+    """
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
@@ -144,16 +159,33 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer = None,
     scheduler: Any = None
 ) -> Dict:
-    """Load training checkpoint"""
+    """Load training checkpoint with DDP support
+    
+    Automatically handles 'module.' prefix from DDP-saved models.
+    """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Handle DDP 'module.' prefix if present
+    state_dict = checkpoint['model_state_dict']
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # Remove 'module.' prefix if exists
+        name = k[7:] if k.startswith('module.') else k
+        new_state_dict[name] = v
+    
+    model.load_state_dict(new_state_dict)
     
     if optimizer and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except (ValueError, KeyError) as e:
+            print(f"Warning: Could not load optimizer state (skipping): {e}")
     
     if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        except (ValueError, KeyError) as e:
+            print(f"Warning: Could not load scheduler state (skipping): {e}")
     
     print(f"Checkpoint loaded: {checkpoint_path}")
     return checkpoint
@@ -163,10 +195,21 @@ def load_pretrained_weights(
     checkpoint_path: str,
     model: torch.nn.Module
 ) -> None:
-    """Load only model weights from checkpoint without optimizer/scheduler state"""
+    """Load only model weights from checkpoint without optimizer/scheduler state
+    
+    Automatically handles 'module.' prefix from DDP-saved models.
+    """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Handle DDP 'module.' prefix if present
+    state_dict = checkpoint['model_state_dict']
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # Remove 'module.' prefix if exists
+        name = k[7:] if k.startswith('module.') else k
+        new_state_dict[name] = v
+    
+    model.load_state_dict(new_state_dict)
     
     print(f"Pretrained weights loaded from: {checkpoint_path}")
     print("Training will start from step 0 (optimizer and scheduler states not loaded)")
@@ -206,12 +249,8 @@ def count_parameters_without_context(model: torch.nn.Module) -> int:
     return total
 
 
-def get_device(device_name: str = 'cuda') -> torch.device:
-    """Get torch device"""
-    if device_name == 'cuda' and torch.cuda.is_available():
-        return torch.device('cuda')
-    return torch.device('cpu')
-
+# Note: get_device() removed - Accelerate handles device management
+# Use accelerator.device instead
 
 def create_model_from_config(config: Dict, vocab_size: int):
     """

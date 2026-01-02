@@ -1,12 +1,11 @@
-"""Training logic for RDT"""
+"""Training logic for RDT with Accelerate"""
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
 from torch.utils.data import DataLoader
-from torch.amp import autocast, GradScaler
 from transformers import AutoTokenizer
+from accelerate import Accelerator
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -26,16 +25,11 @@ class RDTTrainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         config: Dict,
-        device: torch.device
+        accelerator: Accelerator
     ):
-        self.model = model.to(device)
-        if hasattr(torch, 'compile') and device.type == 'cuda':
-            print("Compiling model with torch.compile...")
-            self.model = torch.compile(self.model)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.accelerator = accelerator
         self.config = config
-        self.device = device
+        self.resume_checkpoint = None  # main에서 설정 가능하도록
         
         # Training config
         self.training_mode = config['training'].get('training_mode', 'epoch')
@@ -60,39 +54,41 @@ class RDTTrainer:
         # Scheduler
         self.scheduler = self._create_scheduler()
         
+        # Accelerate Prepare: 모델, 옵티마이저, 데이터로더를 래핑하여 장치 분산 및 정밀도 관리 자동화
+        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = \
+            self.accelerator.prepare(
+                model, self.optimizer, train_loader, val_loader, self.scheduler
+            )
+        
+        # torch.compile (optional, 선택적으로 적용)
+        # if hasattr(torch, 'compile') and self.accelerator.device.type == 'cuda':
+        #     if self.accelerator.is_main_process:
+        #         print("Compiling model with torch.compile...")
+        #     self.model = torch.compile(self.model)
+        
+        # Preprocessor
         tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
-
-        self.preprocessor = RDTPreprocessor(tokenizer, config).to(device)
+        self.preprocessor = RDTPreprocessor(tokenizer, config).to(self.accelerator.device)
         
         # Loss functions
         self.recon_criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding
         self.gate_criterion = nn.MSELoss()
         
-        # Logging with W&B
+        # Logging with W&B (Main Process Only)
         self.use_wandb = config.get('use_wandb', True)
-        if self.use_wandb:
-            wandb.init(
-                project=config.get('wandb_project', 'rdt'),
-                name=config.get('wandb_run_name', None),
-                config=config,
-                resume='allow'
-            )
-            wandb.watch(model, log='all', log_freq=config['output'].get('log_every_n_steps', 100))
+        if self.use_wandb and self.accelerator.is_main_process:
+            # Accelerator가 tracker 초기화를 처리하므로 여기서는 생략 가능
+            # self.accelerator.init_trackers()는 train.py에서 호출됨
+            pass
         
-        # CSV Logger
-        log_dir = Path(config['output'].get('log_dir', 'outputs/logs'))
-        self.csv_logger = CSVLogger(str(log_dir))
+        # CSV Logger (Main Process Only)
+        if self.accelerator.is_main_process:
+            log_dir = Path(config['output'].get('log_dir', 'outputs/logs'))
+            self.csv_logger = CSVLogger(str(log_dir))
         
         self.log_every_n_steps = config['output']['log_every_n_steps']
         self.eval_every_n_epochs = config['output'].get('eval_every_n_epochs', 1)
         self.eval_every_n_steps = config['output'].get('eval_every_n_steps', 5000)
-
-        # AMP
-        self.use_amp = config.get('mixed_precision', False)
-        self.scaler = GradScaler() if self.use_amp else None
-        
-        if self.use_amp:
-            print("Using Automatic Mixed Precision (AMP)")
         
         # Checkpointing
         self.checkpoint_dir = config['output']['checkpoint_dir']
@@ -108,11 +104,14 @@ class RDTTrainer:
         self.global_step = 0
         self.current_epoch = 0
         
-        # Print model info
-        num_params = count_parameters(model)
-        num_params_no_context = count_parameters_without_context(model)
-        print(f"Model parameters: {num_params:,}")
-        print(f"Model parameters (without context): {num_params_no_context:,}")
+        # Print model info (Main Process Only)
+        if self.accelerator.is_main_process:
+            # unwrap해서 파라미터 계산
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            num_params = count_parameters(unwrapped_model)
+            num_params_no_context = count_parameters_without_context(unwrapped_model)
+            print(f"Model parameters: {num_params:,}")
+            print(f"Model parameters (without context): {num_params_no_context:,}")
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""
@@ -173,17 +172,18 @@ class RDTTrainer:
         """
         self.model.train()
 
-        raw_input_ids = raw_batch['input_ids'].to(self.device)
+        # Accelerate DataLoader가 자동으로 device로 옮겨줌
+        raw_input_ids = raw_batch['input_ids'].to(self.accelerator.device)
 
         with torch.no_grad():
             batch = self.preprocessor(raw_input_ids)
         
         # 데이터 준비
-        input_tokens = batch['input'].to(self.device)
-        targets = batch['targets'].to(self.device)
-        attention_mask = batch['attention_mask'].to(self.device)
-        loss_masks = batch['loss_masks'].to(self.device)
-        gate_targets = batch['gate_targets'].to(self.device)
+        input_tokens = batch['input'].to(self.accelerator.device)
+        targets = batch['targets'].to(self.accelerator.device)
+        attention_mask = batch['attention_mask'].to(self.accelerator.device)
+        loss_masks = batch['loss_masks'].to(self.accelerator.device)
+        gate_targets = batch['gate_targets'].to(self.accelerator.device)
         chain_lengths = batch['chain_lengths']
         
         batch_size = input_tokens.shape[0]
@@ -193,139 +193,131 @@ class RDTTrainer:
         # Aux batch 샘플링
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
         
-        with torch.amp.autocast('cuda', enabled=self.use_amp):
-            # --- Step 0: 초기 상태 ---
-            h_0 = self.model.encode_tokens(input_tokens)
-            gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask)
-            gate_loss_0 = self.gate_criterion(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
-            
-            accumulated_loss = self.loss_weight_gate * gate_loss_0
-            total_recon_loss = 0.0
-            total_gate_loss = gate_loss_0.item()
-            total_aux_loss = 0.0
-            
-            num_valid_steps = 1
-            num_aux_steps = 0
-            
-            hidden = h_0
-            gate_pred = gate_pred_0
-            pooled = pooled_0
-            
-            # --- Recursive Steps ---
-            for step_idx in range(actual_max_length):
-                valid_mask = chain_lengths > step_idx
-                if valid_mask.sum() == 0:
-                    break
-                
-                # Forward step
-                step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
-                hidden, gate_pred, pooled = self.model.forward_step(
-                    hidden,
-                    attention_mask=attention_mask,
-                    last_gate_score=gate_pred,
-                    last_pooled=pooled,
-                    gt_timestep=step_gt_gate,
-                    sampling_prob=sampling_prob
-                )
-                
-                # 현재 step 타겟과 마스크
-                step_targets = targets[:, step_idx, :]
-                step_loss_mask = loss_masks[:, step_idx, :]
-                
-                # [A] Main Reconstruction Loss
-                logits_pred = self.model.decode(hidden, attention_mask)
-                
-                if step_loss_mask.sum() > 0:
-                    recon_loss = self.recon_criterion(
-                        logits_pred[step_loss_mask],
-                        step_targets[step_loss_mask]
-                    )
-                else:
-                    recon_loss = torch.tensor(0.0, device=self.device)
-                
-                # [B] Aux Loss: KL Divergence
-                aux_kl = torch.tensor(0.0, device=self.device)
-                
-                if self.loss_weight_aux > 0:
-                    aux_mask = step_loss_mask[:aux_batch_size]
-                    
-                    if aux_mask.sum() > 0:
-                        # Teacher: D(E(GT))
-                        with torch.no_grad():
-                            h_GT = self.model.encode_tokens(step_targets[:aux_batch_size])
-                            logits_GT = self.model.decode(h_GT, attention_mask[:aux_batch_size])
-                            # Target distribution (with temperature)
-                            # Note: Temperature > 1 makes distribution softer
-                            # Temperature < 1 makes distribution sharper
-                            # For semantic consistency, τ=1.0 is reasonable
-                            target_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
-                        
-                        # Student: D(h_recursive)
-                        log_probs_pred = torch.log_softmax(
-                            logits_pred[:aux_batch_size] / self.aux_temp,
-                            dim=-1
-                        )
-                        
-                        # KL Divergence: KL(P_target || P_pred)
-                        # PyTorch KLDivLoss expects (log_pred, target)
-                        kl_criterion = nn.KLDivLoss(reduction='none')
-                        kl_loss_all = kl_criterion(log_probs_pred, target_dist)
-                        
-                        # Apply mask and average
-                        # kl_loss_all: [B_aux, L, V]
-                        # aux_mask: [B_aux, L]
-                        aux_kl = kl_loss_all.sum(dim=-1)[aux_mask].mean()
-                        
-                        # Temperature scaling correction
-                        # When using temperature τ, gradient is scaled by 1/τ²
-                        # So we multiply loss by τ² to compensate
-                        aux_kl = aux_kl * (self.aux_temp ** 2)
-                        
-                        total_aux_loss += aux_kl.item()
-                        num_aux_steps += 1
-                
-                # [C] Gate Loss
-                step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
-                gate_loss = self.gate_criterion(
-                    gate_pred[valid_mask],
-                    step_gate_target[valid_mask]
-                )
-                
-                # Step loss 누적
-                step_loss = (
-                    self.loss_weight_recon * recon_loss +
-                    self.loss_weight_gate * gate_loss +
-                    self.loss_weight_aux * aux_kl
-                )
-                
-                accumulated_loss += step_loss
-                
-                total_recon_loss += recon_loss.item()
-                total_gate_loss += gate_loss.item()
-                num_valid_steps += 1
-            
-            # 최종 손실
-            final_loss = accumulated_loss / num_valid_steps
+        # Accelerate가 mixed_precision을 자동으로 처리하므로 autocast 불필요
+        # --- Step 0: 초기 상태 ---
+        h_0 = self.model.encode_tokens(input_tokens)
+        gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask)
+        gate_loss_0 = self.gate_criterion(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
         
-        # 역전파
-        original_final_loss = final_loss.item()
-        final_loss = final_loss / self.gradient_accumulation_steps
+        accumulated_loss = self.loss_weight_gate * gate_loss_0
+        total_recon_loss = 0.0
+        total_gate_loss = gate_loss_0.item()
+        total_aux_loss = 0.0
         
-        if self.use_amp:
-            self.scaler.scale(final_loss).backward()
-        else:
-            final_loss.backward()
+        num_valid_steps = 1
+        num_aux_steps = 0
         
-        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+        hidden = h_0
+        gate_pred = gate_pred_0
+        pooled = pooled_0
+        
+        # --- Recursive Steps ---
+        for step_idx in range(actual_max_length):
+            valid_mask = chain_lengths > step_idx
+            if valid_mask.sum() == 0:
+                break
+            
+            # Forward step
+            step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
+            hidden, gate_pred, pooled = self.model.forward_step(
+                hidden,
+                attention_mask=attention_mask,
+                last_gate_score=gate_pred,
+                last_pooled=pooled,
+                gt_timestep=step_gt_gate,
+                sampling_prob=sampling_prob
+            )
+            
+            # 현재 step 타겟과 마스크
+            step_targets = targets[:, step_idx, :]
+            step_loss_mask = loss_masks[:, step_idx, :]
+            
+            # [A] Main Reconstruction Loss
+            logits_pred = self.model.decode(hidden, attention_mask)
+            
+            if step_loss_mask.sum() > 0:
+                recon_loss = self.recon_criterion(
+                    logits_pred[step_loss_mask],
+                    step_targets[step_loss_mask]
+                )
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+                recon_loss = torch.tensor(0.0, device=self.accelerator.device)
             
+            # [B] Aux Loss: KL Divergence
+            aux_kl = torch.tensor(0.0, device=self.accelerator.device)
+            
+            if self.loss_weight_aux > 0:
+                aux_mask = step_loss_mask[:aux_batch_size]
+                
+                if aux_mask.sum() > 0:
+                    # Teacher: D(E(GT))
+                    with torch.no_grad():
+                        h_GT = self.model.encode_tokens(step_targets[:aux_batch_size])
+                        logits_GT = self.model.decode(h_GT, attention_mask[:aux_batch_size])
+                        # Target distribution (with temperature)
+                        # Note: Temperature > 1 makes distribution softer
+                        # Temperature < 1 makes distribution sharper
+                        # For semantic consistency, τ=1.0 is reasonable
+                        target_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
+                    
+                    # Student: D(h_recursive)
+                    log_probs_pred = torch.log_softmax(
+                        logits_pred[:aux_batch_size] / self.aux_temp,
+                        dim=-1
+                    )
+                    
+                    # KL Divergence: KL(P_target || P_pred)
+                    # PyTorch KLDivLoss expects (log_pred, target)
+                    kl_criterion = nn.KLDivLoss(reduction='none')
+                    kl_loss_all = kl_criterion(log_probs_pred, target_dist)
+                    
+                    # Apply mask and average
+                    # kl_loss_all: [B_aux, L, V]
+                    # aux_mask: [B_aux, L]
+                    aux_kl = kl_loss_all.sum(dim=-1)[aux_mask].mean()
+                    
+                    # Temperature scaling correction
+                    # When using temperature τ, gradient is scaled by 1/τ²
+                    # So we multiply loss by τ² to compensate
+                    aux_kl = aux_kl * (self.aux_temp ** 2)
+                    
+                    total_aux_loss += aux_kl.item()
+                    num_aux_steps += 1
+            
+            # [C] Gate Loss
+            step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
+            gate_loss = self.gate_criterion(
+                gate_pred[valid_mask],
+                step_gate_target[valid_mask]
+            )
+            
+            # Step loss 누적
+            step_loss = (
+                self.loss_weight_recon * recon_loss +
+                self.loss_weight_gate * gate_loss +
+                self.loss_weight_aux * aux_kl
+            )
+            
+            accumulated_loss += step_loss
+            
+            total_recon_loss += recon_loss.item()
+            total_gate_loss += gate_loss.item()
+            num_valid_steps += 1
+        
+        # 최종 손실
+        final_loss = accumulated_loss / num_valid_steps
+        original_final_loss = final_loss.item()
+        
+        # Accelerate의 accumulate context를 사용하여 gradient sync 자동 관리
+        with self.accelerator.accumulate(self.model):
+            # Backward
+            self.accelerator.backward(final_loss)
+            
+            # Gradient Clipping
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            
+            self.optimizer.step()
             self.optimizer.zero_grad()
             if self.scheduler:
                 self.scheduler.step()
@@ -348,15 +340,15 @@ class RDTTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for raw_batch in tqdm(self.val_loader, desc="Validating", leave=False):
-                raw_input_ids = raw_batch['input_ids'].to(self.device)
+            for raw_batch in tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process):
+                raw_input_ids = raw_batch['input_ids'].to(self.accelerator.device)
                 batch = self.preprocessor(raw_input_ids)
                 
-                input_tokens = batch['input'].to(self.device)
-                targets = batch['targets'].to(self.device)
-                loss_masks = batch['loss_masks'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                gate_targets = batch['gate_targets'].to(self.device)
+                input_tokens = batch['input'].to(self.accelerator.device)
+                targets = batch['targets'].to(self.accelerator.device)
+                loss_masks = batch['loss_masks'].to(self.accelerator.device)
+                attention_mask = batch['attention_mask'].to(self.accelerator.device)
+                gate_targets = batch['gate_targets'].to(self.accelerator.device)
                 chain_lengths = batch['chain_lengths']
                 
                 actual_max_length = chain_lengths.max().item()
@@ -402,13 +394,13 @@ class RDTTrainer:
                         sel_targ = step_targets[step_loss_mask]
                         recon_loss = self.recon_criterion(sel_logits, sel_targ)
                     else:
-                        recon_loss = torch.tensor(0.0, device=self.device)
+                        recon_loss = torch.tensor(0.0, device=self.accelerator.device)
                     
                     # Gate loss
                     step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)
                     gate_pred_valid = gate_pred[valid_mask]
                     gate_target_valid = step_gate_targets[valid_mask]
-                    gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.device)
+                    gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.accelerator.device)
                     
                     batch_recon += recon_loss.item()
                     batch_gate += gate_loss.item()
@@ -440,23 +432,38 @@ class RDTTrainer:
             self._train_by_step()
     
     def _train_by_epoch(self):
-        print(f"\nStarting epoch-based training for {self.num_epochs} epochs...")
+        if self.accelerator.is_main_process:
+            print(f"\nStarting epoch-based training for {self.num_epochs} epochs...")
+        
+        # Resume checkpoint if specified
+        if self.resume_checkpoint:
+            if self.accelerator.is_main_process:
+                print(f"Loading checkpoint from {self.resume_checkpoint}")
+            self.accelerator.load_state(self.resume_checkpoint)
+            # TODO: 저장된 epoch/step 정보 복원 로직 추가 필요
+        
         best_val_loss = float('inf')
         
         for epoch in range(self.num_epochs):
             self.current_epoch = epoch
             sampling_prob = self.get_sampling_prob(epoch=epoch)
-            print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
+            
+            if self.accelerator.is_main_process:
+                print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
             
             epoch_loss = 0; epoch_recon = 0; epoch_gate = 0; epoch_aux = 0
-            progress_bar = tqdm(self.train_loader, desc="Training")
+            progress_bar = tqdm(
+                self.train_loader, 
+                desc="Training",
+                disable=not self.accelerator.is_local_main_process
+            )
             
             for batch in progress_bar:
                 loss, recon, gate, aux = self.train_step(batch)
                 epoch_loss += loss; epoch_recon += recon; epoch_gate += gate; epoch_aux += aux
                 self.global_step += 1
                 
-                if self.global_step % self.log_every_n_steps == 0:
+                if self.global_step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
                     log_data = {
                         'epoch': epoch,
                         'step': self.global_step,
@@ -473,47 +480,64 @@ class RDTTrainer:
                     
                     # W&B logging
                     if self.use_wandb:
-                        wandb.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
-                                  for k, v in log_data.items()})
+                        self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
+                                  for k, v in log_data.items()}, step=self.global_step)
                 
                 progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
             
             # Validation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_loss, val_recon, val_gate = self.validate()
-                print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
                 
-                val_data = {
-                    'epoch': epoch,
-                    'step': self.global_step,
-                    'val_loss': val_loss,
-                    'val_recon': val_recon,
-                    'val_gate': val_gate
-                }
-                self.csv_logger.log(val_data)
-                
-                if self.use_wandb:
-                    wandb.log({
-                        'val/loss': val_loss,
-                        'val/recon_loss': val_recon,
-                        'val/gate_loss': val_gate,
-                        'epoch': epoch
-                    })
-                
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    save_checkpoint(self.model, self.optimizer, self.scheduler, epoch, self.global_step, val_loss, self.config, self.checkpoint_dir, 'best_model.pt')
+                if self.accelerator.is_main_process:
+                    print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
+                    
+                    val_data = {
+                        'epoch': epoch,
+                        'step': self.global_step,
+                        'val_loss': val_loss,
+                        'val_recon': val_recon,
+                        'val_gate': val_gate
+                    }
+                    self.csv_logger.log(val_data)
+                    
+                    if self.use_wandb:
+                        self.accelerator.log({
+                            'val/loss': val_loss,
+                            'val/recon_loss': val_recon,
+                            'val/gate_loss': val_gate,
+                            'epoch': epoch
+                        }, step=self.global_step)
+                    
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        # Unwrap model을 저장해야 호환성 확보
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        save_checkpoint(unwrapped_model, self.optimizer, self.scheduler, epoch, self.global_step, val_loss, self.config, self.checkpoint_dir, 'best_model.pt')
             
             # Checkpoint
             if (epoch + 1) % self.save_every_n_epochs == 0:
-                save_checkpoint(self.model, self.optimizer, self.scheduler, epoch, self.global_step, epoch_loss/len(self.train_loader), self.config, self.checkpoint_dir)
-                cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
+                self.accelerator.wait_for_everyone()
+                if self.accelerator.is_main_process:
+                    unwrapped_model = self.accelerator.unwrap_model(self.model)
+                    save_checkpoint(unwrapped_model, self.optimizer, self.scheduler, epoch, self.global_step, epoch_loss/len(self.train_loader), self.config, self.checkpoint_dir)
+                    cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
         
-        print("\nTraining completed!")
-        self.csv_logger.close()
+        if self.accelerator.is_main_process:
+            print("\nTraining completed!")
+            self.csv_logger.close()
     
     def _train_by_step(self):
-        print(f"\nStarting step-based training for {self.max_training_steps} steps...")
+        if self.accelerator.is_main_process:
+            print(f"\nStarting step-based training for {self.max_training_steps} steps...")
+        
+        # Resume checkpoint if specified
+        if self.resume_checkpoint:
+            if self.accelerator.is_main_process:
+                print(f"Loading checkpoint from {self.resume_checkpoint}")
+            self.accelerator.load_state(self.resume_checkpoint)
+            # TODO: 저장된 epoch/step 정보 복원 로직 추가 필요
+        
         best_val_loss = float('inf')
         
         step = 0
@@ -522,9 +546,15 @@ class RDTTrainer:
         while step < self.max_training_steps:
             self.current_epoch = epoch
             sampling_prob = self.get_sampling_prob(step=step)
-            print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
             
-            progress_bar = tqdm(self.train_loader, desc=f"Training (Step {step})")
+            if self.accelerator.is_main_process:
+                print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
+            
+            progress_bar = tqdm(
+                self.train_loader, 
+                desc=f"Training (Step {step})",
+                disable=not self.accelerator.is_local_main_process
+            )
             
             for batch in progress_bar:
                 if step >= self.max_training_steps:
@@ -534,7 +564,7 @@ class RDTTrainer:
                 step += 1
                 self.global_step = step
                 
-                if step % self.log_every_n_steps == 0:
+                if step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
                     log_data = {
                         'epoch': epoch,
                         'step': step,
@@ -549,43 +579,50 @@ class RDTTrainer:
                     self.csv_logger.log(log_data)
                     
                     if self.use_wandb:
-                        wandb.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
-                                  for k, v in log_data.items()})
+                        self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
+                                  for k, v in log_data.items()}, step=step)
                 
                 # Validation at regular step intervals
                 if step % self.eval_every_n_steps == 0:
                     val_loss, val_recon, val_gate = self.validate()
-                    print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
                     
-                    val_data = {
-                        'epoch': epoch,
-                        'step': step,
-                        'val_loss': val_loss,
-                        'val_recon': val_recon,
-                        'val_gate': val_gate
-                    }
-                    self.csv_logger.log(val_data)
-                    
-                    if self.use_wandb:
-                        wandb.log({
-                            'val/loss': val_loss,
-                            'val/recon_loss': val_recon,
-                            'val/gate_loss': val_gate,
-                            'step': step
-                        })
-                    
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        save_checkpoint(self.model, self.optimizer, self.scheduler, epoch, step, val_loss, self.config, self.checkpoint_dir, 'best_model.pt')
+                    if self.accelerator.is_main_process:
+                        print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
+                        
+                        val_data = {
+                            'epoch': epoch,
+                            'step': step,
+                            'val_loss': val_loss,
+                            'val_recon': val_recon,
+                            'val_gate': val_gate
+                        }
+                        self.csv_logger.log(val_data)
+                        
+                        if self.use_wandb:
+                            self.accelerator.log({
+                                'val/loss': val_loss,
+                                'val/recon_loss': val_recon,
+                                'val/gate_loss': val_gate,
+                                'step': step
+                            }, step=step)
+                        
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            unwrapped_model = self.accelerator.unwrap_model(self.model)
+                            save_checkpoint(unwrapped_model, self.optimizer, self.scheduler, epoch, step, val_loss, self.config, self.checkpoint_dir, 'best_model.pt')
                 
                 # Checkpoint
                 if step % self.save_every_n_steps == 0:
-                    save_checkpoint(self.model, self.optimizer, self.scheduler, epoch, step, loss, self.config, self.checkpoint_dir)
-                    cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
+                    self.accelerator.wait_for_everyone()
+                    if self.accelerator.is_main_process:
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        save_checkpoint(unwrapped_model, self.optimizer, self.scheduler, epoch, step, loss, self.config, self.checkpoint_dir)
+                        cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
                 
                 progress_bar.set_postfix({'step': step, 'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
             
             epoch += 1
         
-        print("\nTraining completed!")
-        self.csv_logger.close()
+        if self.accelerator.is_main_process:
+            print("\nTraining completed!")
+            self.csv_logger.close()

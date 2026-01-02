@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 from rdt.models import RDT, MLM
 from rdt.models.cmlm import CMLM
 from rdt.models.mdlm import MDLM
-from rdt.utils import load_config, load_checkpoint, get_device, create_model_from_config
+from rdt.utils import load_config, load_checkpoint, create_model_from_config
 
 
 def inference_interactive_rdt(model, tokenizer, device, max_steps=20, threshold=0.5):

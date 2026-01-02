@@ -1,15 +1,17 @@
-"""Unified training script for all models (RDT and baselines)"""
+"""Unified training script for all models (RDT and baselines) using Accelerate"""
 
 import argparse
 from pathlib import Path
 import torch
 from transformers import AutoTokenizer
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration
 
 from rdt.models import RDT, MLM
 from rdt.models.cmlm import CMLM
 from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders, create_mdlm_dataloaders
 from rdt.training import RDTTrainer, MLMTrainer
-from rdt.utils import load_config, merge_configs, set_seed, get_device, create_model_from_config
+from rdt.utils import load_config, merge_configs, set_seed, create_model_from_config
 
 
 def main():
@@ -18,8 +20,6 @@ def main():
                         help='Path to config file')
     parser.add_argument('--override', type=str, default=None,
                         help='Path to override config file')
-    parser.add_argument('--device', type=str, default=None,
-                        help='Device to use (cuda/cpu)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to checkpoint to resume from (loads model, optimizer, scheduler, and training state)')
     parser.add_argument('--pretrained', type=str, default=None,
@@ -33,24 +33,37 @@ def main():
                          "Use --checkpoint to resume training with all states, or --pretrained to load only weights.")
     
     # Load config
-    print(f"Loading config from {args.config}")
     config = load_config(args.config)
     
     if args.override:
-        print(f"Loading override config from {args.override}")
         override_config = load_config(args.override)
         config = merge_configs(config, override_config)
     
-    # Override device if specified
-    if args.device:
-        config['device'] = args.device
+    # Initialize Accelerator
+    mixed_precision = config.get('mixed_precision', 'no')
+    if mixed_precision is True or mixed_precision == 'fp16':
+        mixed_precision = 'fp16'
+    elif mixed_precision is False:
+        mixed_precision = 'no'
     
-    # Set seed
+    accelerator = Accelerator(
+        log_with="wandb" if config.get('use_wandb', True) else None,
+        project_config=ProjectConfiguration(
+            project_dir=config['output']['log_dir'],
+            logging_dir=config['output']['log_dir']
+        ),
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
+        mixed_precision=mixed_precision
+    )
+    
+    # Main Process에서만 출력
+    if accelerator.is_main_process:
+        print(f"Loading config from {args.config}")
+        print(f"Accelerator Device: {accelerator.device}, Distributed: {accelerator.num_processes > 1}")
+        print(f"Mixed Precision: {accelerator.mixed_precision}")
+    
+    # Set seed (Accelerate가 모든 프로세스에 시드 동기화)
     set_seed(config['seed'])
-    
-    # Get device
-    device = get_device(config['device'])
-    print(f"Using device: {device}")
     
     # Determine model type
     model_type = config.get('model_type', 'rdt').lower()
@@ -82,7 +95,7 @@ def main():
             train_loader=train_loader,
             val_loader=val_loader,
             config=config,
-            device=device
+            accelerator=accelerator
         )
         
     elif model_type in ['mlm', 'cmlm', 'mdlm']:
@@ -119,7 +132,7 @@ def main():
             train_loader=train_loader,
             val_loader=val_loader,
             config=config,
-            device=device
+            accelerator=accelerator
         )
         
     else:
@@ -127,26 +140,18 @@ def main():
     
     # Resume from checkpoint or load pretrained weights
     if args.checkpoint:
-        print(f"\nResuming from checkpoint: {args.checkpoint}")
-        from rdt.utils import load_checkpoint
-        checkpoint = load_checkpoint(
-            args.checkpoint,
-            trainer.model,
-            trainer.optimizer,
-            trainer.scheduler
-        )
-        trainer.current_epoch = checkpoint.get('epoch', 0) + 1
-        trainer.global_step = checkpoint.get('step', 0)
-        print(f"Resuming from epoch {trainer.current_epoch}, step {trainer.global_step}")
+        if accelerator.is_main_process:
+            print(f"\nResuming from checkpoint: {args.checkpoint}")
+        trainer.resume_checkpoint = args.checkpoint
     
     elif args.pretrained:
-        print(f"\nLoading pretrained weights: {args.pretrained}")
-        from rdt.utils import load_pretrained_weights
-        load_pretrained_weights(
-            args.pretrained,
-            trainer.model
-        )
-        print("Starting training from epoch 0, step 0 with pretrained weights")
+        if accelerator.is_main_process:
+            print(f"\nLoading pretrained weights: {args.pretrained}")
+            from rdt.utils import load_pretrained_weights
+            # unwrap model before loading
+            unwrapped_model = accelerator.unwrap_model(trainer.model)
+            load_pretrained_weights(args.pretrained, unwrapped_model)
+            print("Starting training from epoch 0, step 0 with pretrained weights")
     
     # Train
     trainer.train()
