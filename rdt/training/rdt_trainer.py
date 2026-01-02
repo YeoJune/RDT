@@ -188,6 +188,10 @@ class RDTTrainer:
         
         batch_size = input_tokens.shape[0]
         actual_max_length = chain_lengths.max().item()
+        # TEMP: for TPU
+        use_static_len = True
+        if use_static_len:
+            actual_max_length = self.config['data']['max_chain_length']
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
         
         # Aux batch 샘플링
