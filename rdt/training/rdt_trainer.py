@@ -348,7 +348,10 @@ class RDTTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validating", leave=False):
+            for raw_batch in tqdm(self.val_loader, desc="Validating", leave=False):
+                raw_input_ids = raw_batch['input_ids'].to(self.device)
+                batch = self.preprocessor(raw_input_ids)
+                
                 input_tokens = batch['input'].to(self.device)
                 targets = batch['targets'].to(self.device)
                 loss_masks = batch['loss_masks'].to(self.device)

@@ -64,11 +64,16 @@ def main():
     
     if model_type == 'rdt':
         # Load RDT model
+        from rdt.data.rdt_preprocessor import RDTPreprocessor
+        
         tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
         vocab_size = tokenizer.vocab_size
         
         model = create_model_from_config(config, vocab_size)
         checkpoint = load_checkpoint(args.checkpoint, model)
+        
+        # Create preprocessor
+        preprocessor = RDTPreprocessor(tokenizer, config).to(device)
         
         # Create dataloader
         print(f"\nPreparing RDT {args.split} data...")
@@ -121,7 +126,10 @@ def main():
     print("Model loaded successfully!")
     
     # Create evaluator
-    evaluator = Evaluator(model, device, model_type=model_type)
+    if model_type == 'rdt':
+        evaluator = Evaluator(model, device, model_type=model_type, preprocessor=preprocessor)
+    else:
+        evaluator = Evaluator(model, device, model_type=model_type)
     
     # Evaluate
     print("\n" + "="*60)

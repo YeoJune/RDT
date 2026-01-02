@@ -18,16 +18,18 @@ class Evaluator:
     Provides standard evaluation metrics and comparison utilities.
     """
     
-    def __init__(self, model, device: torch.device, model_type: str = 'rdt'):
+    def __init__(self, model, device: torch.device, model_type: str = 'rdt', preprocessor=None):
         """
         Args:
             model: Model to evaluate (RDT, MLM, or CMLM)
             device: Device to run evaluation on
             model_type: 'rdt', 'mlm', or 'cmlm'
+            preprocessor: RDTPreprocessor for RDT models (optional)
         """
         self.model = model
         self.device = device
         self.model_type = model_type.lower()
+        self.preprocessor = preprocessor
         
         if self.model_type not in ['rdt', 'mlm', 'cmlm', 'mdlm']:
             raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', 'cmlm', or 'mdlm'")
@@ -38,7 +40,7 @@ class Evaluator:
         Evaluate RDT model with batch processing.
         
         Args:
-            dataloader: DataLoader with RDT format data
+            dataloader: DataLoader with RDT format data (raw input_ids)
             max_steps: Maximum recursive steps
             threshold: Gate threshold for stopping
             
@@ -52,7 +54,14 @@ class Evaluator:
         num_samples = 0
         
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Evaluating RDT", leave=False):
+            for raw_batch in tqdm(dataloader, desc="Evaluating RDT", leave=False):
+                # Preprocess raw batch
+                raw_input_ids = raw_batch['input_ids'].to(self.device)
+                if self.preprocessor is not None:
+                    batch = self.preprocessor(raw_input_ids)
+                else:
+                    batch = raw_batch
+                
                 # Move batch to device
                 input_ids = batch['input'].to(self.device)
                 targets = batch['targets'].to(self.device)
