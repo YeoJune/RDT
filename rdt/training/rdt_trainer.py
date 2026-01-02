@@ -225,7 +225,7 @@ class RDTTrainer:
         # --- Recursive Steps ---
         for step_idx in range(max_length):
             valid_mask = chain_lengths > step_idx
-            if valid_mask.sum() == 0:
+            if not is_tpu and valid_mask.sum() == 0:
                 break
             
             # Forward step
