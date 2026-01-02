@@ -54,9 +54,9 @@ rdt-test-masking = "rdt.scripts.test_masking:main"
 rdt-plot = "rdt.scripts.plot_training:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/rdt"
-Repository = "https://github.com/yourusername/rdt"
-Documentation = "https://github.com/yourusername/rdt#readme"
+Homepage = "https://github.com/YeoJune/rdt"
+Repository = "https://github.com/YeoJune/rdt"
+Documentation = "https://github.com/YeoJune/rdt#readme"
 
 [tool.setuptools.packages.find]
 where = ["."]

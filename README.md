@@ -107,7 +107,8 @@ rdt/
 ├── data/                # Data Pipeline
 │   ├── __init__.py
 │   ├── datasets.py         # StreamingTextDataset & WikiTextDataset
-│   └── collators.py        # RDTCollator, MLMCollator (masking & chain generation)
+│   ├── collators.py        # RDTCollator, MLMCollator (masking & chain generation)
+│   └── rdt_preprocessor.py # GPU-accelerated preprocessing for RDT training
 │
 ├── evaluation/          # Evaluation Tools
 │   ├── __init__.py
