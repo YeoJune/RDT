@@ -22,7 +22,7 @@ class RDTPreprocessor(nn.Module):
         self.bert_masking_enabled = bert_config.get('enabled', True)
         self.mask_prob = bert_config.get('mask_prob', 0.8)
         self.random_prob = bert_config.get('random_prob', 0.1)
-
+        
     @torch.no_grad()
     def forward(self, input_ids):
         """
@@ -36,7 +36,7 @@ class RDTPreprocessor(nn.Module):
         
         # 1. Chain Length & Start Step
         chain_lengths = torch.randint(1, self.max_chain_length + 1, (B,), device=device)
-        max_chain_len_in_batch = chain_lengths.max().item()
+        max_chain_len_in_batch = self.max_chain_length #chain_lengths.max().item()
         
         min_starts = chain_lengths
         ranges = self.total_steps - min_starts + 1

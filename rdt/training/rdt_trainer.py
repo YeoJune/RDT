@@ -112,6 +112,8 @@ class RDTTrainer:
             num_params_no_context = count_parameters_without_context(unwrapped_model)
             print(f"Model parameters: {num_params:,}")
             print(f"Model parameters (without context): {num_params_no_context:,}")
+        
+        self.is_tpu = self.accelerator.device.type == 'xla' or (hasattr(self.accelerator.state, "distributed_type") and self.accelerator.state.distributed_type == "TPU")
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""
@@ -186,13 +188,11 @@ class RDTTrainer:
         gate_targets = batch['gate_targets'].to(self.accelerator.device)
         chain_lengths = batch['chain_lengths']
         
-        batch_size = input_tokens.shape[0
+        batch_size = input_tokens.shape[0]
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
 
         # 장치 타입에 따라 Loop 전략 자동 선택
-        is_tpu = self.accelerator.device.type == 'xla' or (hasattr(self.accelerator.state, "distributed_type") and self.accelerator.state.distributed_type == "TPU")
-
-        if is_tpu:
+        if self.is_tpu:
             # TPU: 컴파일 고정을 위해 Max Length 사용 + Break 금지 권장
             max_length = self.config['training']['max_chain_length']
         else:
@@ -223,7 +223,7 @@ class RDTTrainer:
         # --- Recursive Steps ---
         for step_idx in range(max_length):
             valid_mask = chain_lengths > step_idx
-            if not is_tpu and valid_mask.sum() == 0:
+            if not self.is_tpu and valid_mask.sum() == 0:
                 break
             
             # Forward step
