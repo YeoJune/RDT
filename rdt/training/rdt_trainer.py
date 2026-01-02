@@ -186,9 +186,7 @@ class RDTTrainer:
         gate_targets = batch['gate_targets'].to(self.accelerator.device)
         chain_lengths = batch['chain_lengths']
         
-        batch_size = input_tokens.shape[0]
-        actual_max_length = chain_lengths.max().item()
-        static_max_length = self.config['training']['max_chain_length']
+        batch_size = input_tokens.shape[0
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
 
         # 장치 타입에 따라 Loop 전략 자동 선택
@@ -196,10 +194,10 @@ class RDTTrainer:
 
         if is_tpu:
             # TPU: 컴파일 고정을 위해 Max Length 사용 + Break 금지 권장
-            max_length = static_max_length
+            max_length = self.config['training']['max_chain_length']
         else:
             # GPU: 실제 데이터 길이에 맞춰 Dynamic하게 (속도 이득)
-            max_length = actual_max_length
+            max_length = chain_lengths.max().item()
         
         # Aux batch 샘플링
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
