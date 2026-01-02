@@ -188,11 +188,18 @@ class RDTTrainer:
         
         batch_size = input_tokens.shape[0]
         actual_max_length = chain_lengths.max().item()
-        # TEMP: for TPU
-        use_static_len = True
-        if use_static_len:
-            actual_max_length = self.config['data']['max_chain_length']
+        static_max_length = self.config['training']['max_chain_length']
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
+
+        # 장치 타입에 따라 Loop 전략 자동 선택
+        is_tpu = self.accelerator.device.type == 'xla' or (hasattr(self.accelerator.state, "distributed_type") and self.accelerator.state.distributed_type == "TPU")
+
+        if is_tpu:
+            # TPU: 컴파일 고정을 위해 Max Length 사용 + Break 금지 권장
+            max_length = static_max_length
+        else:
+            # GPU: 실제 데이터 길이에 맞춰 Dynamic하게 (속도 이득)
+            max_length = actual_max_length
         
         # Aux batch 샘플링
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
@@ -216,7 +223,7 @@ class RDTTrainer:
         pooled = pooled_0
         
         # --- Recursive Steps ---
-        for step_idx in range(actual_max_length):
+        for step_idx in range(max_length):
             valid_mask = chain_lengths > step_idx
             if valid_mask.sum() == 0:
                 break
