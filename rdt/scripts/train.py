@@ -6,6 +6,7 @@ import torch
 from transformers import AutoTokenizer
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
+import os
 
 from rdt.models import RDT, MLM
 from rdt.models.cmlm import CMLM
@@ -55,6 +56,17 @@ def main():
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
         mixed_precision=mixed_precision
     )
+
+    if config.get('use_wandb', True):
+        # run_name 설정 (config에 없으면 자동 생성)
+        run_name = config.get('run_name', f"{config.get('model_type', 'model')}-run")
+        
+        # main.py에서 설정한 환경변수(WANDB_PROJECT 등)를 자동으로 가져감
+        accelerator.init_trackers(
+            project_name=os.environ.get("WANDB_PROJECT", "rdt"), 
+            config=config,
+            init_kwargs={"wandb": {"name": run_name}}
+        )
     
     # Main Process에서만 출력
     if accelerator.is_main_process:
@@ -155,6 +167,8 @@ def main():
     
     # Train
     trainer.train()
+
+    accelerator.end_training()
     
     print("\n" + "="*60)
     print("Training completed successfully!")
