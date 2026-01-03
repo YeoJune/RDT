@@ -130,7 +130,10 @@ class CMLMCollator:
         # Extract input_ids and attention_mask
         if isinstance(examples[0], dict):
             input_ids = [ex['input_ids'] for ex in examples]
-            attention_mask = [ex['attention_mask'] for ex in examples]
+            attention_mask = [ex.get('attention_mask', None) for ex in examples]
+            # Check if any attention_mask is None
+            if any(mask is None for mask in attention_mask):
+                attention_mask = None
         else:
             input_ids = examples
             attention_mask = None
