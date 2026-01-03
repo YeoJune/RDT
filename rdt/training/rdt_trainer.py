@@ -176,6 +176,9 @@ class RDTTrainer:
         - Aux Loss: D(h_i) -> D(E(GT)) (현재 위상 보존)
         """
         self.model.train()
+        
+        # Unwrap model to access custom methods (DDP-safe)
+        raw_model = self.accelerator.unwrap_model(self.model)
 
         # Accelerate DataLoader가 자동으로 device로 옮겨줌
         raw_input_ids = raw_batch['input_ids'].to(self.accelerator.device)
@@ -207,8 +210,8 @@ class RDTTrainer:
         
         # Accelerate가 mixed_precision을 자동으로 처리하므로 autocast 불필요
         # --- Step 0: 초기 상태 ---
-        h_0 = self.model.encode_tokens(input_tokens)
-        gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask)
+        h_0 = raw_model.encode_tokens(input_tokens)
+        gate_pred_0, pooled_0 = raw_model.gate(h_0, attention_mask)
         gate_loss_0 = self.gate_criterion(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
         
         accumulated_loss = self.loss_weight_gate * gate_loss_0
@@ -231,7 +234,7 @@ class RDTTrainer:
             
             # Forward step
             step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
-            hidden, gate_pred, pooled = self.model.forward_step(
+            hidden, gate_pred, pooled = raw_model.forward_step(
                 hidden,
                 attention_mask=attention_mask,
                 last_gate_score=gate_pred,
@@ -245,7 +248,7 @@ class RDTTrainer:
             step_loss_mask = loss_masks[:, step_idx, :]
             
             # [A] Main Reconstruction Loss
-            logits_pred = self.model.decode(hidden, attention_mask)
+            logits_pred = raw_model.decode(hidden, attention_mask)
             
             if step_loss_mask.sum() > 0:
                 recon_loss = self.recon_criterion(
@@ -264,8 +267,8 @@ class RDTTrainer:
                 if aux_mask.sum() > 0:
                     # Teacher: D(E(GT))
                     with torch.no_grad():
-                        h_GT = self.model.encode_tokens(step_targets[:aux_batch_size])
-                        logits_GT = self.model.decode(h_GT, attention_mask[:aux_batch_size])
+                        h_GT = raw_model.encode_tokens(step_targets[:aux_batch_size])
+                        logits_GT = raw_model.decode(h_GT, attention_mask[:aux_batch_size])
                         # Target distribution (with temperature)
                         # Note: Temperature > 1 makes distribution softer
                         # Temperature < 1 makes distribution sharper
@@ -346,6 +349,10 @@ class RDTTrainer:
     
     def validate(self) -> Tuple[float, float, float]:
         self.model.eval()
+        
+        # Unwrap model to access custom methods (DDP-safe)
+        raw_model = self.accelerator.unwrap_model(self.model)
+        
         total_loss = 0
         total_recon = 0
         total_gate = 0
@@ -369,8 +376,8 @@ class RDTTrainer:
                 num_valid = 0
                 
                 # Initial encoding
-                h_0 = self.model.encode_tokens(input_tokens)
-                gate_pred_0, pooled_0 = self.model.gate(h_0, attention_mask, None, None)
+                h_0 = raw_model.encode_tokens(input_tokens)
+                gate_pred_0, pooled_0 = raw_model.gate(h_0, attention_mask, None, None)
                 
                 # Gate loss for h_0
                 gate_target_0 = gate_targets[:, 0].unsqueeze(1)
@@ -389,7 +396,7 @@ class RDTTrainer:
                         break
                     
                     # Forward step
-                    hidden, gate_pred, pooled = self.model.forward_step(
+                    hidden, gate_pred, pooled = raw_model.forward_step(
                         hidden,
                         attention_mask=attention_mask,
                         last_gate_score=gate_pred,
@@ -401,7 +408,7 @@ class RDTTrainer:
                     step_loss_mask = loss_masks[:, step_idx, :]
                     
                     if step_loss_mask.sum() > 0:
-                        logits = self.model.decode(hidden, attention_mask)
+                        logits = raw_model.decode(hidden, attention_mask)
                         sel_logits = logits[step_loss_mask]
                         sel_targ = step_targets[step_loss_mask]
                         recon_loss = self.recon_criterion(sel_logits, sel_targ)

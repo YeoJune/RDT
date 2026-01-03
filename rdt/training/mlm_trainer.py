@@ -193,6 +193,9 @@ class MLMTrainer:
         """CMLM training with on-the-fly uniform masking"""
         self.model.train()
         
+        # Unwrap model to access custom methods (DDP-safe)
+        raw_model = self.accelerator.unwrap_model(self.model)
+        
         # Move batch to device
         input_ids = batch['input_ids'].to(self.accelerator.device)  # Original tokens
         attention_mask = batch.get('attention_mask')
@@ -200,7 +203,7 @@ class MLMTrainer:
             attention_mask = attention_mask.to(self.accelerator.device)
         
         # Apply uniform masking on-the-fly
-        masked_input_ids, labels, mask_ratio = self.model.uniform_masking(
+        masked_input_ids, labels, mask_ratio = raw_model.uniform_masking(
             input_ids, attention_mask
         )
         
@@ -243,6 +246,9 @@ class MLMTrainer:
         """MDLM training with continuous-time masking and weighted loss"""
         self.model.train()
         
+        # Unwrap model to access custom methods (DDP-safe)
+        raw_model = self.accelerator.unwrap_model(self.model)
+        
         # Move batch to device
         input_ids = batch['input_ids'].to(self.accelerator.device)  # Original tokens
         attention_mask = batch.get('attention_mask')
@@ -250,14 +256,14 @@ class MLMTrainer:
             attention_mask = attention_mask.to(self.accelerator.device)
         
         # Apply continuous-time masking on-the-fly
-        masked_input_ids, labels, t, loss_weight = self.model.continuous_time_masking(
+        masked_input_ids, labels, t, loss_weight = raw_model.continuous_time_masking(
             input_ids, 
             attention_mask,
             low_discrepancy_sampling=True
         )
         
         # Forward pass with time-weighted loss (Accelerate handles mixed precision)
-        loss, logits = self.model.forward_with_time_weighting(
+        loss, logits = raw_model.forward_with_time_weighting(
             masked_input_ids, attention_mask, labels, loss_weight
         )
         
@@ -353,6 +359,10 @@ class MLMTrainer:
     def _evaluate_cmlm(self):
         """CMLM evaluation with uniform masking"""
         self.model.eval()
+        
+        # Unwrap model to access custom methods (DDP-safe)
+        raw_model = self.accelerator.unwrap_model(self.model)
+        
         total_loss = 0
         total_accuracy = 0
         num_batches = 0
@@ -365,7 +375,7 @@ class MLMTrainer:
                     attention_mask = attention_mask.to(self.accelerator.device)
                 
                 # Apply uniform masking for CMLM
-                masked_input_ids, labels, _ = self.model.uniform_masking(
+                masked_input_ids, labels, _ = raw_model.uniform_masking(
                     input_ids, attention_mask
                 )
                 
@@ -400,6 +410,10 @@ class MLMTrainer:
         - Accuracy: Unweighted average accuracy over timesteps.
         """
         self.model.eval()
+        
+        # Unwrap model to access custom methods (DDP-safe)
+        raw_model = self.accelerator.unwrap_model(self.model)
+        
         total_elbo = 0
         total_accuracy = 0  # Accuracy 누적 변수
         total_tokens = 0
@@ -419,20 +433,20 @@ class MLMTrainer:
                 if attention_mask is not None:
                     num_valid_tokens = attention_mask.sum().item()
                 else:
-                    num_valid_tokens = (input_ids != self.model.pad_token_id).sum().item()
+                    num_valid_tokens = (input_ids != raw_model.pad_token_id).sum().item()
 
                 # MC Integration
                 batch_elbo_sum = 0
                 batch_acc_sum = 0 # 배치 내 MC 샘플들의 정확도 합
                 
                 for _ in range(num_mc_samples):
-                    masked_ids, labels, t, loss_weight = self.model.continuous_time_masking(
+                    masked_ids, labels, t, loss_weight = raw_model.continuous_time_masking(
                         input_ids, attention_mask, low_discrepancy_sampling=True
                     )
                     
                     # Accelerate handles mixed precision automatically
                     # Loss (Weighted)
-                    loss, logits = self.model.forward_with_time_weighting(
+                    loss, logits = raw_model.forward_with_time_weighting(
                         masked_ids, attention_mask, labels, loss_weight
                     )
                     
