@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rdt-transformer"
-version = "0.2.0"
+version = "0.2.1" 
 description = "Recursive Denoising Transformer - Progressive text denoising with adaptive computation. Includes MLM, CMLM, and MDLM baselines."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -25,11 +25,22 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
 ]
 
+# [핵심] Kaggle/Colab 환경 충돌 방지를 위한 버전 고정
 dependencies = [
     "torch>=2.0.0",
-    "datasets>=2.14.0",
+    
+    # Datasets와 PyArrow 충돌 방지 (최신 버전 사용)
+    "datasets>=2.21.0",
+    "pyarrow>=15.0.0",
+    
+    # Protobuf 충돌 방지 (TensorFlow 호환성 및 에러 방지용 핵심)
+    "protobuf>=3.20.3,<4.0.0",
+    
     "transformers>=4.30.0",
-    "accelerate>=0.27.0",
+    
+    # Accelerate 최신 기능 (init_trackers 등) 활용
+    "accelerate>=0.28.0",
+    
     "pyyaml>=6.0",
     "wandb>=0.16.0",
     "tqdm>=4.65.0",
