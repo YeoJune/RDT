@@ -22,7 +22,7 @@ class RDTPreprocessor(nn.Module):
         self.bert_masking_enabled = bert_config.get('enabled', True)
         self.mask_prob = bert_config.get('mask_prob', 0.8)
         self.random_prob = bert_config.get('random_prob', 0.1)
-        
+
     @torch.no_grad()
     def forward(self, input_ids):
         """
@@ -68,20 +68,22 @@ class RDTPreprocessor(nn.Module):
             mask_token_mask = (torch.rand(B, L, device=device) < self.mask_prob) & is_masked
             random_token_mask = (torch.rand(B, L, device=device) < (self.mask_prob + self.random_prob)) & is_masked & ~mask_token_mask
             
-            inputs[mask_token_mask] = self.mask_token_id
-            if random_token_mask.any():
-                random_tokens = torch.randint(self.cls_token_id + 1, self.vocab_size, (random_token_mask.sum(),), device=device)
-                inputs[random_token_mask] = random_tokens
+            # TPU 최적화: Boolean indexing 대신 torch.where 사용 (Shape 고정)
+            inputs = torch.where(mask_token_mask, torch.tensor(self.mask_token_id, device=device), inputs)
+            
+            # Random 토큰 적용: 전체 크기 텐서를 미리 생성하여 dynamic shape 방지
+            random_tokens_full = torch.randint(self.cls_token_id + 1, self.vocab_size, (B, L), device=device)
+            inputs = torch.where(random_token_mask, random_tokens_full, inputs)
         else:
-            inputs[is_masked] = self.mask_token_id
+            inputs = torch.where(is_masked, torch.tensor(self.mask_token_id, device=device), inputs)
             
         gate_targets[:, 0] = (input_steps.float() / self.total_steps) * 20.0
         
         # 5. Chain Generation
+        # TPU 최적화: break 없이 고정 횟수 루프 실행
+        # valid_samples가 False인 경우 loss_masks가 0이 되어 학습에 영향 없음
         for i in range(max_chain_len_in_batch):
             valid_samples = chain_lengths > i
-            if not valid_samples.any():
-                break
                 
             # 타겟 스텝 계산
             target_steps = start_steps - (i + 1)

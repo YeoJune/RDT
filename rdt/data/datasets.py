@@ -137,7 +137,7 @@ class StreamingTextDataset(IterableDataset, DatasetLoaderMixin):
                 text,
                 max_length=self.max_seq_length,
                 truncation=True,
-                padding=False,
+                padding='max_length',
                 return_overflowing_tokens=True,
                 stride=0
             )
@@ -215,7 +215,7 @@ class WikiTextDataset(Dataset, DatasetLoaderMixin):
                 text,
                 max_length=self.max_seq_length,
                 truncation=True,
-                padding=False,
+                padding='max_length',
                 return_overflowing_tokens=True,
                 stride=0
             )
@@ -240,17 +240,16 @@ class WikiTextDataset(Dataset, DatasetLoaderMixin):
 def simple_collate_fn(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
     """
     Collate function for RDT (GPU Preprocessing Mode).
+    TPU-optimized: Uses torch.stack for fixed-length tensors.
     """
-    input_ids = [item['input_ids'] for item in batch]
-    padded_inputs = torch.nn.utils.rnn.pad_sequence(
-        input_ids, 
-        batch_first=True, 
-        padding_value=pad_token_id
-    )
-    attention_mask = (padded_inputs != pad_token_id).long()
+    # 모든 input_ids가 이미 max_seq_length로 고정되어 있으므로 stack만 수행
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    
+    # Attention mask는 pad_token이 아닌 곳만 1
+    attention_mask = (input_ids != pad_token_id).long()
     
     return {
-        'input_ids': padded_inputs,
+        'input_ids': input_ids,
         'attention_mask': attention_mask
     }
 
@@ -296,7 +295,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         shuffle=not streaming,
         num_workers=data_config['num_workers'],
         pin_memory=data_config['pin_memory'],
-        collate_fn=lambda x: simple_collate_fn(x, pad_token_id)
+        collate_fn=lambda x: simple_collate_fn(x, pad_token_id),
+        drop_last=True
     )
     
     val_loader = DataLoader(
@@ -305,7 +305,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         shuffle=False,
         num_workers=data_config['num_workers'],
         pin_memory=data_config['pin_memory'],
-        collate_fn=lambda x: simple_collate_fn(x, pad_token_id)
+        collate_fn=lambda x: simple_collate_fn(x, pad_token_id),
+        drop_last=True
     )
     
     return train_loader, val_loader
