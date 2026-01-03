@@ -81,7 +81,7 @@ training:
 
 # Data
 data:
-  dataset_name: "wikitext-103" # 'wikitext-2' or 'wikitext-103'
+  dataset_name: "wikitext-2" # 'wikitext-2' or 'wikitext-103'
   streaming: false # true: buffer-based on-the-fly loading, false: download all at once
   max_seq_length: 512 # Maximum sequence length
   mask_token: "[MASK]"
