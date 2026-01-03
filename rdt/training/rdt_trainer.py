@@ -30,6 +30,9 @@ class RDTTrainer:
         self.accelerator = accelerator
         self.config = config
         self.resume_checkpoint = None  # main에서 설정 가능하도록
+
+        self.train_loader = train_loader
+        self.val_loader = val_loader
         
         # Training config
         self.training_mode = config['training'].get('training_mode', 'epoch')
