@@ -31,6 +31,9 @@ class MLMTrainer:
         self.accelerator = accelerator
         self.config = config
         self.resume_checkpoint = None
+
+        self.train_loader = train_loader
+        self.val_loader = val_loader
         
         # Detect model type
         self.model_type = self._detect_model_type(model)
