@@ -215,9 +215,11 @@ class RDTTrainer:
         gate_loss_0 = self.gate_criterion(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
         
         accumulated_loss = self.loss_weight_gate * gate_loss_0
-        total_recon_loss = 0.0
-        total_gate_loss = gate_loss_0.item()
-        total_aux_loss = 0.0
+        
+        # TPU 최적화: .item() 제거하고 텐서로 누적
+        total_recon_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
+        total_gate_loss_tensor = gate_loss_0.detach()
+        total_aux_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
         
         num_valid_steps = 1
         num_aux_steps = 0
@@ -296,7 +298,8 @@ class RDTTrainer:
                     # So we multiply loss by τ² to compensate
                     aux_kl = aux_kl * (self.aux_temp ** 2)
                     
-                    total_aux_loss += aux_kl.item()
+                    # TPU 최적화: detach()된 텐서로 누적
+                    total_aux_loss_tensor += aux_kl.detach()
                     num_aux_steps += 1
             
             # [C] Gate Loss
@@ -315,13 +318,13 @@ class RDTTrainer:
             
             accumulated_loss += step_loss
             
-            total_recon_loss += recon_loss.item()
-            total_gate_loss += gate_loss.item()
+            # TPU 최적화: detach()된 텐서로 누적 (TPU Sync 방지)
+            total_recon_loss_tensor += recon_loss.detach()
+            total_gate_loss_tensor += gate_loss.detach()
             num_valid_steps += 1
         
         # 최종 손실
         final_loss = accumulated_loss / num_valid_steps
-        original_final_loss = final_loss.item()
         
         # Accelerate의 accumulate context를 사용하여 gradient sync 자동 관리
         with self.accelerator.accumulate(self.model):
@@ -337,14 +340,12 @@ class RDTTrainer:
             if self.scheduler:
                 self.scheduler.step()
         
-        # 평균 계산 (로깅용)
-        avg_aux = total_aux_loss / num_aux_steps if num_aux_steps > 0 else 0.0
-        
+        # TPU 최적화: 마지막에 한번만 .item() 호출
         return (
-            original_final_loss,
-            total_recon_loss / num_valid_steps,
-            total_gate_loss / num_valid_steps,
-            avg_aux
+            final_loss.item(),
+            (total_recon_loss_tensor / num_valid_steps).item(),
+            (total_gate_loss_tensor / num_valid_steps).item(),
+            (total_aux_loss_tensor / num_aux_steps).item() if num_aux_steps > 0 else 0.0
         )
     
     def validate(self) -> Tuple[float, float, float]:
@@ -530,17 +531,16 @@ class RDTTrainer:
                     
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        # Unwrap model을 저장해야 호환성 확보
-                        unwrapped_model = self.accelerator.unwrap_model(self.model)
-                        save_checkpoint(unwrapped_model, self.optimizer, self.scheduler, epoch, self.global_step, val_loss, self.config, self.checkpoint_dir, 'best_model.pt')
+                        # Accelerator의 save_state 사용 (표준화)
+                        save_path = f"{self.checkpoint_dir}/checkpoint-best"
+                        self.accelerator.save_state(save_path)
             
             # Checkpoint
             if (epoch + 1) % self.save_every_n_epochs == 0:
                 self.accelerator.wait_for_everyone()
-                if self.accelerator.is_main_process:
-                    unwrapped_model = self.accelerator.unwrap_model(self.model)
-                    save_checkpoint(unwrapped_model, self.optimizer, self.scheduler, epoch, self.global_step, epoch_loss/len(self.train_loader), self.config, self.checkpoint_dir)
-                    cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
+                save_path = f"{self.checkpoint_dir}/checkpoint-epoch-{epoch+1}"
+                self.accelerator.save_state(save_path)
+                # cleanup_checkpoints는 필요시 별도 구현
         
         if self.accelerator.is_main_process:
             print("\nTraining completed!")
@@ -627,16 +627,16 @@ class RDTTrainer:
                         
                         if val_loss < best_val_loss:
                             best_val_loss = val_loss
-                            unwrapped_model = self.accelerator.unwrap_model(self.model)
-                            save_checkpoint(unwrapped_model, self.optimizer, self.scheduler, epoch, step, val_loss, self.config, self.checkpoint_dir, 'best_model.pt')
+                            # Accelerator의 save_state 사용
+                            save_path = f"{self.checkpoint_dir}/checkpoint-best"
+                            self.accelerator.save_state(save_path)
                 
                 # Checkpoint
                 if step % self.save_every_n_steps == 0:
                     self.accelerator.wait_for_everyone()
-                    if self.accelerator.is_main_process:
-                        unwrapped_model = self.accelerator.unwrap_model(self.model)
-                        save_checkpoint(unwrapped_model, self.optimizer, self.scheduler, epoch, step, loss, self.config, self.checkpoint_dir)
-                        cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
+                    save_path = f"{self.checkpoint_dir}/checkpoint-step-{step}"
+                    self.accelerator.save_state(save_path)
+                    # cleanup_checkpoints는 필요시 별도 구현
                 
                 progress_bar.set_postfix({'step': step, 'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
             
