@@ -68,10 +68,10 @@ class RDTTrainer:
             unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
         
         # torch.compile (optional, 선택적으로 적용)
-        if hasattr(torch, 'compile') and self.accelerator.device.type == 'cuda':
-            if self.accelerator.is_main_process:
-                print("Compiling model with torch.compile...")
-            self.model = torch.compile(self.model)
+        # if hasattr(torch, 'compile') and self.accelerator.device.type == 'cuda':
+        #     if self.accelerator.is_main_process:
+        #         print("Compiling model with torch.compile...")
+        #     self.model = torch.compile(self.model)
         
         # Loss functions
         self.recon_criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding
