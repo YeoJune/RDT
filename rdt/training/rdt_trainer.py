@@ -189,10 +189,12 @@ class RDTTrainer:
         batch_size = input_tokens.shape[0]
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
 
-        # TPU: 고정 길이 루프 사용
+        # [분기점 1] TPU: 고정 길이 루프 / GPU: Dynamic 길이 루프
         if self.is_tpu:
+            # TPU: Config에 설정된 최대 길이로 고정 (중간 탈출 절대 금지)
             max_length = self.config['training']['max_chain_length']
         else:
+            # GPU: 실제 데이터 길이만큼만 돌기 (Dynamic)
             max_length = chain_lengths.max().item()
         
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
@@ -201,7 +203,7 @@ class RDTTrainer:
         h_0 = raw_model.encode_tokens(input_tokens)
         gate_pred_0, pooled_0 = raw_model.gate(h_0, attention_mask)
         
-        # [수정 1] Gate Loss: Indexing 제거 -> 전체 계산
+        # Gate Loss at Step 0 (전체 배치 계산 - GPU/TPU 공통)
         gate_loss_0 = torch.nn.functional.mse_loss(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
         
         accumulated_loss = self.loss_weight_gate * gate_loss_0
@@ -221,9 +223,13 @@ class RDTTrainer:
         # --- Recursive Steps ---
         for step_idx in range(max_length):
             valid_mask = chain_lengths > step_idx
-            # TPU에서는 break 없이 끝까지 돌림 (mask로 무효화)
-            if not self.is_tpu and valid_mask.sum() == 0:
-                break
+            
+            # [분기점 1-2] GPU: Early Break 허용 / TPU: Break 금지
+            if not self.is_tpu:
+                # GPU: 더 이상 계산할 게 없으면 칼같이 종료 (속도 이득)
+                if valid_mask.sum() == 0:
+                    break
+            # TPU: break 없음. 끝까지 돔 (valid_mask로 Loss를 0으로 만들어서 무효화)
             
             step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
             hidden, gate_pred, pooled = raw_model.forward_step(
@@ -238,25 +244,32 @@ class RDTTrainer:
             step_targets = targets[:, step_idx, :]
             step_loss_mask = loss_masks[:, step_idx, :]
             
-            # [A] Recon Loss (Dynamic Shape 제거 - 핵심 수정)
+            # [A] Reconstruction Loss
             logits_pred = raw_model.decode(hidden, attention_mask)
             
-            # 1. 전체 토큰 Loss 계산 (reduction='none') -> Shape 고정 [B, L]
-            loss_per_token = torch.nn.functional.cross_entropy(
-                logits_pred.transpose(1, 2), 
-                step_targets, 
-                reduction='none'
-            )
+            # [분기점 2] Recon Loss 계산 방식 분기
+            if self.is_tpu:
+                # TPU: 전체 계산 -> 마스킹 (Dynamic Shape 방지)
+                loss_per_token = torch.nn.functional.cross_entropy(
+                    logits_pred.transpose(1, 2), 
+                    step_targets, 
+                    reduction='none'
+                )
+                mask_float = step_loss_mask.float()
+                recon_loss = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
+            else:
+                # GPU: 인덱싱 (속도/메모리 최적화)
+                if step_loss_mask.sum() > 0:
+                    recon_loss = self.recon_criterion(
+                        logits_pred[step_loss_mask],
+                        step_targets[step_loss_mask]
+                    )
+                else:
+                    recon_loss = torch.tensor(0.0, device=self.accelerator.device)
             
-            # 2. 마스킹 (Boolean -> Float 변환 후 곱하기)
-            mask_float = step_loss_mask.float()
-            # 3. 유효 Loss 평균 (분모 0 방지)
-            recon_loss = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
-            
-            # [B] Aux Loss (Dynamic Shape 제거)
+            # [B] Aux Loss (KL Divergence)
             aux_kl = torch.tensor(0.0, device=self.accelerator.device)
             if self.loss_weight_aux > 0:
-                # Aux 배치는 슬라이싱(:) 사용 (고정 크기라 허용됨)
                 aux_mask = step_loss_mask[:aux_batch_size]
                 
                 with torch.no_grad():
@@ -267,22 +280,41 @@ class RDTTrainer:
                 log_probs_pred = torch.log_softmax(logits_pred[:aux_batch_size] / self.aux_temp, dim=-1)
                 kl_criterion = torch.nn.KLDivLoss(reduction='none')
                 kl_loss_all = kl_criterion(log_probs_pred, target_dist)
+                kl_per_token = kl_loss_all.sum(dim=-1)  # [B, L]
                 
-                # 인덱싱 대신 마스킹 처리
-                kl_per_token = kl_loss_all.sum(dim=-1)
-                aux_mask_float = aux_mask.float()
-                aux_kl = (kl_per_token * aux_mask_float).sum() / (aux_mask_float.sum() + 1e-6)
+                # [분기점 3] Aux Loss 계산 방식 분기
+                if self.is_tpu:
+                    # TPU: 마스킹 처리
+                    aux_mask_float = aux_mask.float()
+                    aux_kl = (kl_per_token * aux_mask_float).sum() / (aux_mask_float.sum() + 1e-6)
+                else:
+                    # GPU: 인덱싱 처리
+                    if aux_mask.sum() > 0:
+                        aux_kl = kl_per_token[aux_mask].mean()
+                    else:
+                        aux_kl = torch.tensor(0.0, device=self.accelerator.device)
+                
                 aux_kl = aux_kl * (self.aux_temp ** 2)
-                
                 total_aux_loss_tensor += aux_kl.detach()
                 num_aux_steps += 1
             
-            # [C] Gate Loss (Dynamic Shape 제거)
+            # [C] Gate Loss
             step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
             
-            gate_loss_raw = torch.nn.functional.mse_loss(gate_pred, step_gate_target, reduction='none')
-            valid_mask_float = valid_mask.float().unsqueeze(1)
-            gate_loss = (gate_loss_raw * valid_mask_float).sum() / (valid_mask_float.sum() + 1e-6)
+            # [분기점 4] Gate Loss 계산 방식 분기
+            if self.is_tpu:
+                # TPU: 전체 MSE 계산 후 valid_mask 곱하기
+                gate_loss_raw = torch.nn.functional.mse_loss(gate_pred, step_gate_target, reduction='none')
+                valid_mask_float = valid_mask.float().unsqueeze(1)
+                gate_loss = (gate_loss_raw * valid_mask_float).sum() / (valid_mask_float.sum() + 1e-6)
+            else:
+                # GPU: 유효한 샘플만 인덱싱
+                if valid_mask.sum() > 0:
+                    gate_pred_valid = gate_pred[valid_mask]
+                    gate_target_valid = step_gate_target[valid_mask]
+                    gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid)
+                else:
+                    gate_loss = torch.tensor(0.0, device=self.accelerator.device)
             
             step_loss = (
                 self.loss_weight_recon * recon_loss +
