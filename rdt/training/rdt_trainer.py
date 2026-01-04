@@ -278,8 +278,16 @@ class RDTTrainer:
                     target_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
                 
                 log_probs_pred = torch.log_softmax(logits_pred[:aux_batch_size] / self.aux_temp, dim=-1)
-                kl_criterion = torch.nn.KLDivLoss(reduction='none')
-                kl_loss_all = kl_criterion(log_probs_pred, target_dist)
+                
+                # [분기점 5] KL Divergence 계산 방식 분기
+                if self.is_tpu:
+                    # TPU: 수동 계산 (Compile 이슈 회피)
+                    kl_loss_all = target_dist * (torch.log(target_dist + 1e-9) - log_probs_pred)
+                else:
+                    # GPU: nn.KLDivLoss 사용
+                    kl_criterion = torch.nn.KLDivLoss(reduction='none')
+                    kl_loss_all = kl_criterion(log_probs_pred, target_dist)
+                
                 kl_per_token = kl_loss_all.sum(dim=-1)  # [B, L]
                 
                 # [분기점 3] Aux Loss 계산 방식 분기
