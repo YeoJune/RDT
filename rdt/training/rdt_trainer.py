@@ -62,6 +62,11 @@ class RDTTrainer:
                 model, self.optimizer, train_loader, val_loader, self.scheduler
             )
         
+        # Unwrap을 통해 원본 모델 접근 후 재할당
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        if hasattr(unwrapped_model, 'output_projection') and hasattr(unwrapped_model, 'token_embedding'):
+            unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
+        
         # torch.compile (optional, 선택적으로 적용)
         # if hasattr(torch, 'compile') and self.accelerator.device.type == 'cuda':
         #     if self.accelerator.is_main_process:
