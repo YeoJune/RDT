@@ -800,18 +800,21 @@ class RDT(nn.Module):
             prev_gate=last_gate_score
         )
         
-        # 3. Scheduled Sampling
+        # 3. Scheduled Sampling (TPU-Optimized: No .item() call, No Python control flow)
+        current_noise = predicted_gate.detach()  # Default value
+        
         if self.training and gt_timestep is not None:
             if sampling_prob > 0.0:
-                use_gt = torch.rand(1).item() < sampling_prob
-                if use_gt:
-                    current_noise = gt_timestep
-                else:
-                    current_noise = predicted_gate.detach()
-            else:
-                current_noise = predicted_gate.detach()
-        else:
-            current_noise = predicted_gate.detach()
+                # [TPU Standard] Use torch.where instead of Python if/else
+                # 1. Generate random tensor (stays on device)
+                rand_tensor = torch.rand(1, device=predicted_gate.device)
+                
+                # 2. Create boolean mask (tensor operation)
+                use_gt_mask = rand_tensor < sampling_prob
+                
+                # 3. Conditional selection (no graph break)
+                # Both gt_timestep and current_noise should have shape [B, 1]
+                current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
 
         # 4. Create Noise Embedding
         noise_vec = self.noise_emb(current_noise)
@@ -895,18 +898,21 @@ class RDT(nn.Module):
             hidden, attention_mask, last_pooled, last_gate_score
         )
         
-        # 2. Scheduled sampling
+        # 2. Scheduled sampling (TPU-Optimized: No .item() call, No Python control flow)
+        current_noise = predicted_gate.detach()  # Default value
+        
         if self.training and gt_timestep is not None:
             if sampling_prob > 0.0:
-                use_gt = torch.rand(1).item() < sampling_prob
-                if use_gt:
-                    current_noise = gt_timestep
-                else:
-                    current_noise = predicted_gate.detach()
-            else:
-                current_noise = predicted_gate.detach()
-        else:
-            current_noise = predicted_gate.detach()
+                # [TPU Standard] Use torch.where instead of Python if/else
+                # 1. Generate random tensor (stays on device)
+                rand_tensor = torch.rand(1, device=predicted_gate.device)
+                
+                # 2. Create boolean mask (tensor operation)
+                use_gt_mask = rand_tensor < sampling_prob
+                
+                # 3. Conditional selection (no graph break)
+                # Both gt_timestep and current_noise should have shape [B, 1]
+                current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
         
         # 3. Create noise embedding
         noise_vec = self.noise_emb(current_noise)
