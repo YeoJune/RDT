@@ -40,21 +40,13 @@ def main():
         override_config = load_config(args.override)
         config = merge_configs(config, override_config)
     
-    # Initialize Accelerator
-    mixed_precision = config.get('mixed_precision', 'no')
-    if mixed_precision is True or mixed_precision == 'fp16':
-        mixed_precision = 'fp16'
-    elif mixed_precision is False:
-        mixed_precision = 'no'
-    
     accelerator = Accelerator(
         log_with="wandb" if config.get('use_wandb', True) else None,
         project_config=ProjectConfiguration(
             project_dir=config['output']['log_dir'],
             logging_dir=config['output']['log_dir']
         ),
-        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
-        mixed_precision=mixed_precision
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1)
     )
 
     if config.get('use_wandb', True):
