@@ -13,7 +13,6 @@ import math
 
 from ..models.rdt import RDT
 from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters, count_parameters_without_context, CSVLogger
-from ..data.rdt_preprocessor import RDTPreprocessor
 
 
 class RDTTrainer:
@@ -68,10 +67,6 @@ class RDTTrainer:
         #     if self.accelerator.is_main_process:
         #         print("Compiling model with torch.compile...")
         #     self.model = torch.compile(self.model)
-        
-        # Preprocessor
-        tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
-        self.preprocessor = RDTPreprocessor(tokenizer, config).to(self.accelerator.device)
         
         # Loss functions
         self.recon_criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding
@@ -170,21 +165,17 @@ class RDTTrainer:
         
         return sampling_prob
 
-    def train_step(self, raw_batch: Dict) -> Tuple[float, float, float, float]:
+    def train_step(self, batch: Dict) -> Tuple[float, float, float, float]:
         self.model.train()
         raw_model = self.accelerator.unwrap_model(self.model)
 
-        # 데이터 로드
-        raw_input_ids = raw_batch['input_ids'].to(self.accelerator.device)
-        with torch.no_grad():
-            batch = self.preprocessor(raw_input_ids)
-        
-        input_tokens = batch['input']
-        targets = batch['targets']
-        attention_mask = batch['attention_mask']
-        loss_masks = batch['loss_masks']       
-        gate_targets = batch['gate_targets']
-        chain_lengths = batch['chain_lengths']
+        # 데이터 로드 (이미 전처리됨)
+        input_tokens = batch['input'].to(self.accelerator.device)
+        targets = batch['targets'].to(self.accelerator.device)
+        attention_mask = batch['attention_mask'].to(self.accelerator.device)
+        loss_masks = batch['loss_masks'].to(self.accelerator.device)
+        gate_targets = batch['gate_targets'].to(self.accelerator.device)
+        chain_lengths = batch['chain_lengths'].to(self.accelerator.device)
         
         batch_size = input_tokens.shape[0]
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
@@ -366,16 +357,14 @@ class RDTTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for raw_batch in tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process):
-                raw_input_ids = raw_batch['input_ids'].to(self.accelerator.device)
-                batch = self.preprocessor(raw_input_ids)
-                
+            for batch in tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process):
+                # 데이터 로드 (이미 전처리됨)
                 input_tokens = batch['input'].to(self.accelerator.device)
                 targets = batch['targets'].to(self.accelerator.device)
                 loss_masks = batch['loss_masks'].to(self.accelerator.device)
                 attention_mask = batch['attention_mask'].to(self.accelerator.device)
                 gate_targets = batch['gate_targets'].to(self.accelerator.device)
-                chain_lengths = batch['chain_lengths']
+                chain_lengths = batch['chain_lengths'].to(self.accelerator.device)
                 
                 actual_max_length = chain_lengths.max().item()
                 batch_recon = 0

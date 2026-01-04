@@ -1,17 +1,19 @@
 import torch
 import torch.nn as nn
+from typing import Dict, List
 
-class RDTPreprocessor(nn.Module):
+class RDTPreprocessor:
     """
-    RDT 데이터 생성 로직을 GPU에서 배치 단위로 수행하는 모듈.
-    CPU 부하와 PCI-e 병목을 제거함.
+    RDT 데이터 생성 로직을 수행하는 Collator.
+    DataLoader의 collate_fn으로 사용되어 배치 단위로 전처리를 수행.
+    TPU 최적화: CPU에서 동작하며 고정 크기 텐서를 생성.
     """
-    def __init__(self, tokenizer, config):
-        super().__init__()
+    def __init__(self, tokenizer, config, device='cpu'):
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.mask_token_id = tokenizer.mask_token_id
         self.cls_token_id = tokenizer.cls_token_id
         self.vocab_size = tokenizer.vocab_size
+        self.device = device
         
         self.max_chain_length = config['training']['max_chain_length']
         self.total_steps = config['training']['total_steps']
@@ -24,14 +26,20 @@ class RDTPreprocessor(nn.Module):
         self.random_prob = bert_config.get('random_prob', 0.1)
 
     @torch.no_grad()
-    def forward(self, input_ids):
+    def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         """
+        Collator function that processes a batch of samples.
+        
         Args:
-            input_ids: [Batch, SeqLen] - 원본 토큰 (GPU Tensor)
+            batch: List of dicts with 'input_ids' key
         Returns:
             processed_batch: Dict - RDT 모델 입력 형태
         """
-        device = input_ids.device
+        # Stack input_ids from batch
+        input_ids = torch.stack([item['input_ids'] for item in batch])
+        device = self.device
+        input_ids = input_ids.to(device)
+        
         B, L = input_ids.shape
         
         # 1. Chain Length & Start Step

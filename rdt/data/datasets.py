@@ -260,7 +260,7 @@ class WikiTextDataset(Dataset, DatasetLoaderMixin):
 
 def simple_collate_fn(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
     """
-    Collate function for RDT (GPU Preprocessing Mode).
+    Simple collate function for baseline models (not RDT).
     TPU-optimized: Uses torch.stack for fixed-length tensors.
     """
     # 모든 input_ids가 이미 max_seq_length로 고정되어 있으므로 stack만 수행
@@ -276,17 +276,22 @@ def simple_collate_fn(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, tor
 
 
 def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
-    """Create dataloaders for RDT training"""
+    """Create dataloaders for RDT training with preprocessing in collator"""
+    from .rdt_preprocessor import RDTPreprocessor
+    from transformers import AutoTokenizer
+    
     data_config = config['data']
     training_config = config['training']
     streaming = data_config.get('streaming', False)
     
     tokenizer_name = data_config['tokenizer_name']
     
-    # Load tokenizer for pad_token_id
-    from transformers import AutoTokenizer
+    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    
+    # Create RDT Preprocessor as collator
+    rdt_collator = RDTPreprocessor(tokenizer, config, device='cpu')
     
     common_kwargs = {
         'dataset_name': data_config['dataset_name'],
@@ -316,7 +321,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         shuffle=not streaming,
         num_workers=data_config['num_workers'],
         pin_memory=data_config['pin_memory'],
-        collate_fn=lambda x: simple_collate_fn(x, pad_token_id),
+        collate_fn=rdt_collator,
         drop_last=True
     )
     
@@ -326,7 +331,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         shuffle=False,
         num_workers=data_config['num_workers'],
         pin_memory=data_config['pin_memory'],
-        collate_fn=lambda x: simple_collate_fn(x, pad_token_id),
+        collate_fn=rdt_collator,
         drop_last=True
     )
     
