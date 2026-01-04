@@ -12,6 +12,8 @@ import numpy as np
 from typing import List, Dict, Tuple, Iterator, Union, Optional
 from tqdm import tqdm
 import os
+import time
+import random
 
 # Tokenizer parallelism disabled to prevent deadlocks in DataLoader
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -21,13 +23,16 @@ class DatasetLoaderMixin:
     
     @staticmethod
     def _load_single_dataset(dataset_name: str, split: str, streaming: bool):
-        """Load a single dataset by name"""
+        """Load a single dataset by name with Robust Retry Logic"""
         dataset_name_lower = dataset_name.lower()
         
+        # Config 결정 로직 (기존과 동일)
         if 'bookcorpus' in dataset_name_lower:
-            dataset = load_dataset('rojagtap/bookcorpus', split='train', streaming=streaming)
+            load_args = ('rojagtap/bookcorpus',)
+            kwargs = {'split': 'train', 'streaming': streaming}
         elif 'wikipedia' in dataset_name_lower:
-            dataset = load_dataset('wikimedia/wikipedia', '20231101.en', split='train', streaming=streaming)
+            load_args = ('wikimedia/wikipedia', '20231101.en')
+            kwargs = {'split': 'train', 'streaming': streaming}
         else:
             if 'wikitext-2' in dataset_name_lower:
                 config = 'wikitext-2-raw-v1'
@@ -35,10 +40,26 @@ class DatasetLoaderMixin:
                 config = 'wikitext-103-raw-v1'
             else:
                 config = dataset_name
-            
-            dataset = load_dataset('wikitext', config, split=split, streaming=streaming)
+            load_args = ('wikitext', config)
+            kwargs = {'split': split, 'streaming': streaming}
         
-        return dataset
+        # 재시도 로직
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    sleep_time = random.uniform(1, 5) + (attempt * 2)
+                    print(f"Retrying dataset load (attempt {attempt+1}) after {sleep_time:.1f}s...")
+                    time.sleep(sleep_time)
+                
+                dataset = load_dataset(*load_args, **kwargs)
+                return dataset
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"Failed to load dataset after {max_retries} attempts.")
+                    raise e
+                continue
     
     @staticmethod
     def _needs_split_filtering(dataset_name: str) -> bool:
