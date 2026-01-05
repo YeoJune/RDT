@@ -338,10 +338,24 @@ class RDTTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            if self.use_tqdm:
-                val_iter = tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process)
+            # [TPU Fix] ParallelLoader 강제 적용으로 데이터 공급 데드락 방지
+            if self.is_tpu:
+                # XLA 전용 로더를 lazy import로 가져옴 (CPU 환경 호환성 유지)
+                import torch_xla.distributed.parallel_loader as pl
+                
+                # ParallelLoader로 래핑하여 백그라운드에서 TPU로 데이터 고속 전송
+                val_device_loader = pl.ParallelLoader(
+                    self.val_loader, 
+                    [self.accelerator.device]
+                ).per_device_loader(self.accelerator.device)
+                
+                val_iter = val_device_loader
             else:
                 val_iter = self.val_loader
+            
+            # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
+            if self.use_tqdm and not self.is_tpu:
+                val_iter = tqdm(val_iter, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process)
             
             for batch in val_iter:
                 # 데이터 로드 (이미 전처리됨)
