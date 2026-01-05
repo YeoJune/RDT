@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from accelerate import Accelerator
+import torch_xla.core.xla_model as xm
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -335,14 +336,20 @@ class RDTTrainer:
         
         final_loss = accumulated_loss / num_valid_steps
         
-        with self.accelerator.accumulate(self.model):
-            self.accelerator.backward(final_loss)
-            if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            if self.scheduler:
-                self.scheduler.step()
+        self.accelerator.backward(final_loss)
+        
+        xm.mark_step() 
+        
+        if self.accelerator.sync_gradients:
+            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        
+        self.optimizer.step()
+        
+        xm.mark_step() 
+        
+        self.optimizer.zero_grad()
+        if self.scheduler:
+            self.scheduler.step()
         
         return (
             final_loss.item(),
