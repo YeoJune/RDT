@@ -176,7 +176,7 @@ class RDTTrainer:
         self.model.train()
         raw_model = self.accelerator.unwrap_model(self.model)
 
-        # 데이터 로드 (이미 전처리됨)
+        # 데이터 로드
         input_tokens = batch['input'].to(self.accelerator.device)
         targets = batch['targets'].to(self.accelerator.device)
         attention_mask = batch['attention_mask'].to(self.accelerator.device)
@@ -187,12 +187,9 @@ class RDTTrainer:
         batch_size = input_tokens.shape[0]
         sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
 
-        # [분기점 1] TPU: 고정 길이 루프 / GPU: Dynamic 길이 루프
         if self.is_tpu:
-            # TPU: Config에 설정된 최대 길이로 고정 (중간 탈출 절대 금지)
             max_length = self.config['training']['max_chain_length']
         else:
-            # GPU: 실제 데이터 길이만큼만 돌기 (Dynamic)
             max_length = chain_lengths.max().item()
         
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
@@ -201,12 +198,10 @@ class RDTTrainer:
         h_0 = raw_model.encode_tokens(input_tokens)
         gate_pred_0, pooled_0 = raw_model.gate(h_0, attention_mask)
         
-        # Gate Loss at Step 0 (전체 배치 계산 - GPU/TPU 공통)
         gate_loss_0 = torch.nn.functional.mse_loss(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
-        
         accumulated_loss = self.loss_weight_gate * gate_loss_0
         
-        # TPU 최적화: detach()된 텐서로 누적
+        # Logging용 텐서 (Gradient 계산엔 영향 X)
         total_recon_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
         total_gate_loss_tensor = gate_loss_0.detach()
         total_aux_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
@@ -221,55 +216,34 @@ class RDTTrainer:
         # --- Recursive Steps ---
         for step_idx in range(max_length):
             valid_mask = chain_lengths > step_idx
-            
-            # [분기점 1-2] GPU: Early Break 허용 / TPU: Break 금지
-            if not self.is_tpu:
-                # GPU: 더 이상 계산할 게 없으면 칼같이 종료 (속도 이득)
-                if valid_mask.sum() == 0:
-                    break
-            # TPU: break 없음. 끝까지 돔 (valid_mask로 Loss를 0으로 만들어서 무효화)
+            if not self.is_tpu and valid_mask.sum() == 0:
+                break
             
             step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
             hidden, gate_pred, pooled = raw_model.forward_step(
-                hidden,
-                attention_mask=attention_mask,
-                last_gate_score=gate_pred,
-                last_pooled=pooled,
-                gt_timestep=step_gt_gate,
-                sampling_prob=sampling_prob
+                hidden, attention_mask=attention_mask, last_gate_score=gate_pred,
+                last_pooled=pooled, gt_timestep=step_gt_gate, sampling_prob=sampling_prob
             )
             
             step_targets = targets[:, step_idx, :]
             step_loss_mask = loss_masks[:, step_idx, :]
             
-            # [A] Reconstruction Loss
+            # [A] Recon Loss
             logits_pred = raw_model.decode(hidden, attention_mask)
-            
-            # [분기점 2] Recon Loss 계산 방식 분기
             if self.is_tpu:
-                # TPU: 전체 계산 -> 마스킹 (Dynamic Shape 방지)
-                loss_per_token = torch.nn.functional.cross_entropy(
-                    logits_pred.transpose(1, 2), 
-                    step_targets, 
-                    reduction='none'
-                )
+                loss_per_token = torch.nn.functional.cross_entropy(logits_pred.transpose(1, 2), step_targets, reduction='none')
                 mask_float = step_loss_mask.float()
                 recon_loss = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
             else:
-                # GPU: 인덱싱 (속도/메모리 최적화)
                 if step_loss_mask.sum() > 0:
-                    recon_loss = self.recon_criterion(
-                        logits_pred[step_loss_mask],
-                        step_targets[step_loss_mask]
-                    )
+                    recon_loss = self.recon_criterion(logits_pred[step_loss_mask], step_targets[step_loss_mask])
                 else:
                     recon_loss = torch.tensor(0.0, device=self.accelerator.device)
             
-            # [B] Aux Loss (KL Divergence)
+            # [B] Aux Loss
             aux_kl = torch.tensor(0.0, device=self.accelerator.device)
             if self.loss_weight_aux > 0:
                 aux_mask = step_loss_mask[:aux_batch_size]
-                
                 with torch.no_grad():
                     h_GT = raw_model.encode_tokens(step_targets[:aux_batch_size])
                     logits_GT = raw_model.decode(h_GT, attention_mask[:aux_batch_size])
@@ -277,28 +251,16 @@ class RDTTrainer:
                 
                 log_probs_pred = torch.log_softmax(logits_pred[:aux_batch_size] / self.aux_temp, dim=-1)
                 
-                # [분기점 5] KL Divergence 계산 방식 분기
                 if self.is_tpu:
-                    # TPU: 수동 계산 (Compile 이슈 회피)
                     kl_loss_all = target_dist * (torch.log(target_dist + 1e-9) - log_probs_pred)
-                else:
-                    # GPU: nn.KLDivLoss 사용
-                    kl_criterion = torch.nn.KLDivLoss(reduction='none')
-                    kl_loss_all = kl_criterion(log_probs_pred, target_dist)
-                
-                kl_per_token = kl_loss_all.sum(dim=-1)  # [B, L]
-                
-                # [분기점 3] Aux Loss 계산 방식 분기
-                if self.is_tpu:
-                    # TPU: 마스킹 처리
+                    kl_per_token = kl_loss_all.sum(dim=-1)
                     aux_mask_float = aux_mask.float()
                     aux_kl = (kl_per_token * aux_mask_float).sum() / (aux_mask_float.sum() + 1e-6)
                 else:
-                    # GPU: 인덱싱 처리
                     if aux_mask.sum() > 0:
+                        kl_criterion = torch.nn.KLDivLoss(reduction='none')
+                        kl_per_token = kl_criterion(log_probs_pred, target_dist).sum(dim=-1)
                         aux_kl = kl_per_token[aux_mask].mean()
-                    else:
-                        aux_kl = torch.tensor(0.0, device=self.accelerator.device)
                 
                 aux_kl = aux_kl * (self.aux_temp ** 2)
                 total_aux_loss_tensor += aux_kl.detach()
@@ -306,53 +268,58 @@ class RDTTrainer:
             
             # [C] Gate Loss
             step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
-            
-            # [분기점 4] Gate Loss 계산 방식 분기
             if self.is_tpu:
-                # TPU: 전체 MSE 계산 후 valid_mask 곱하기
                 gate_loss_raw = torch.nn.functional.mse_loss(gate_pred, step_gate_target, reduction='none')
                 valid_mask_float = valid_mask.float().unsqueeze(1)
                 gate_loss = (gate_loss_raw * valid_mask_float).sum() / (valid_mask_float.sum() + 1e-6)
             else:
-                # GPU: 유효한 샘플만 인덱싱
                 if valid_mask.sum() > 0:
-                    gate_pred_valid = gate_pred[valid_mask]
-                    gate_target_valid = step_gate_target[valid_mask]
-                    gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid)
+                    gate_loss = self.gate_criterion(gate_pred[valid_mask], step_gate_target[valid_mask])
                 else:
                     gate_loss = torch.tensor(0.0, device=self.accelerator.device)
             
-            step_loss = (
-                self.loss_weight_recon * recon_loss +
-                self.loss_weight_gate * gate_loss +
-                self.loss_weight_aux * aux_kl
-            )
-            
+            step_loss = (self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss + self.loss_weight_aux * aux_kl)
             accumulated_loss += step_loss
             
             total_recon_loss_tensor += recon_loss.detach()
             total_gate_loss_tensor += gate_loss.detach()
             num_valid_steps += 1
         
+        # --- Gradient Accumulation Logic ---
+        
+        # 1. 평균 Loss 계산
         final_loss = accumulated_loss / num_valid_steps
         
+        # 2. Loss Scaling
+        if self.gradient_accumulation_steps > 1:
+            final_loss = final_loss / self.gradient_accumulation_steps
+        
+        # 3. Backward (매 배치마다 수행하여 그래프 생성)
         self.accelerator.backward(final_loss)
         
+        # 4. [필수] mark_step (Backward 직후): 여기서 미분 계산을 실행하라고 TPU에 명령
+        # 이걸 안 하면 Accumulation 동안 그래프가 메모리에 계속 쌓여서 OOM 남
         xm.mark_step() 
         
-        if self.accelerator.sync_gradients:
-            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        # 5. 조건부 Update (Accumulation이 찼을 때만 수행)
+        # self.global_step은 현재 완료된 배치가 아니라 '시작 전' 카운트이므로 +1 해서 체크
+        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            
+            self.optimizer.step()
+            
+            # 6. [필수] mark_step (Update 직후): 가중치 갱신 실행 명령
+            xm.mark_step() 
+            
+            self.optimizer.zero_grad()
+            
+            if self.scheduler:
+                self.scheduler.step()
         
-        self.optimizer.step()
-        
-        xm.mark_step() 
-        
-        self.optimizer.zero_grad()
-        if self.scheduler:
-            self.scheduler.step()
-        
+        # Logging용 Loss는 원래 스케일대로 리턴 (나누기 전 값)
         return (
-            final_loss.item(),
+            (final_loss.item() * self.gradient_accumulation_steps) if self.gradient_accumulation_steps > 1 else final_loss.item(),
             (total_recon_loss_tensor / num_valid_steps).item(),
             (total_gate_loss_tensor / num_valid_steps).item(),
             (total_aux_loss_tensor / num_aux_steps).item() if num_aux_steps > 0 else 0.0
@@ -486,15 +453,29 @@ class RDTTrainer:
             
             epoch_loss = 0; epoch_recon = 0; epoch_gate = 0; epoch_aux = 0
             
-            if self.use_tqdm:
-                progress_bar = tqdm(
+            # [TPU Fix] ParallelLoader 강제 적용으로 데이터 공급 데드락 방지
+            if self.is_tpu:
+                # XLA 전용 로더를 lazy import로 가져옴 (CPU 환경 호환성 유지)
+                import torch_xla.distributed.parallel_loader as pl
+                
+                # ParallelLoader로 래핑하여 백그라운드에서 TPU로 데이터 고속 전송
+                train_device_loader = pl.ParallelLoader(
                     self.train_loader, 
+                    [self.accelerator.device]
+                ).per_device_loader(self.accelerator.device)
+                
+                train_iter = train_device_loader
+            else:
+                train_iter = self.train_loader
+            
+            # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
+            if self.use_tqdm and not self.is_tpu:
+                progress_bar = tqdm(
+                    train_iter, 
                     desc="Training",
                     disable=not self.accelerator.is_local_main_process
                 )
                 train_iter = progress_bar
-            else:
-                train_iter = self.train_loader
             
             for batch in train_iter:
                 loss, recon, gate, aux = self.train_step(batch)
@@ -592,15 +573,29 @@ class RDTTrainer:
             if self.accelerator.is_main_process:
                 print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
             
-            if self.use_tqdm:
-                progress_bar = tqdm(
+            # [TPU Fix] ParallelLoader 강제 적용으로 데이터 공급 데드락 방지
+            if self.is_tpu:
+                # XLA 전용 로더를 lazy import로 가져옴 (CPU 환경 호환성 유지)
+                import torch_xla.distributed.parallel_loader as pl
+                
+                # ParallelLoader로 래핑하여 백그라운드에서 TPU로 데이터 고속 전송
+                train_device_loader = pl.ParallelLoader(
                     self.train_loader, 
+                    [self.accelerator.device]
+                ).per_device_loader(self.accelerator.device)
+                
+                train_iter = train_device_loader
+            else:
+                train_iter = self.train_loader
+            
+            # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
+            if self.use_tqdm and not self.is_tpu:
+                progress_bar = tqdm(
+                    train_iter, 
                     desc=f"Training (Step {step})",
                     disable=not self.accelerator.is_local_main_process
                 )
                 train_iter = progress_bar
-            else:
-                train_iter = self.train_loader
             
             for batch in train_iter:
                 if step >= self.max_training_steps:
