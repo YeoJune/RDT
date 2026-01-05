@@ -317,12 +317,13 @@ class RDTTrainer:
             if self.scheduler:
                 self.scheduler.step()
         
-        # Logging용 Loss는 원래 스케일대로 리턴 (나누기 전 값)
+        # [수정] .item() 제거! 텐서 그대로 반환해야 파이프라인이 안 끊김
+        # CPU로 값을 가져오지 말고 TPU 메모리에 둔 채로 레퍼런스만 넘깁니다.
         return (
-            (final_loss.item() * self.gradient_accumulation_steps) if self.gradient_accumulation_steps > 1 else final_loss.item(),
-            (total_recon_loss_tensor / num_valid_steps).item(),
-            (total_gate_loss_tensor / num_valid_steps).item(),
-            (total_aux_loss_tensor / num_aux_steps).item() if num_aux_steps > 0 else 0.0
+            (final_loss.detach() * self.gradient_accumulation_steps) if self.gradient_accumulation_steps > 1 else final_loss.detach(),
+            (total_recon_loss_tensor / num_valid_steps).detach(),
+            (total_gate_loss_tensor / num_valid_steps).detach(),
+            (total_aux_loss_tensor / num_aux_steps).detach() if num_aux_steps > 0 else torch.tensor(0.0, device=self.accelerator.device)
         )
     
     def validate(self) -> Tuple[float, float, float]:
@@ -479,17 +480,30 @@ class RDTTrainer:
             
             for batch in train_iter:
                 loss, recon, gate, aux = self.train_step(batch)
-                epoch_loss += loss; epoch_recon += recon; epoch_gate += gate; epoch_aux += aux
+                
+                # [수정] 텐서 누적 (CPU 동기화 X)
+                epoch_loss += loss
+                epoch_recon += recon
+                epoch_gate += gate
+                epoch_aux += aux
+                
                 self.global_step += 1
                 
                 if self.global_step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
+                    # [핵심] 로그 찍는 순간에만 .item() 호출해서 값 가져옴
+                    # 이렇게 해야 N steps 마다 한 번만 멈추고, 나머지는 전속력으로 달림
+                    current_loss = loss.item()
+                    current_recon = recon.item()
+                    current_gate = gate.item()
+                    current_aux = aux.item()
+
                     log_data = {
                         'epoch': epoch,
                         'step': self.global_step,
-                        'loss': loss,
-                        'recon_loss': recon,
-                        'gate_loss': gate,
-                        'aux_loss': aux,
+                        'loss': current_loss,
+                        'recon_loss': current_recon,
+                        'gate_loss': current_gate,
+                        'aux_loss': current_aux,
                         'lr': self.optimizer.param_groups[0]['lr'],
                         'sampling_prob': sampling_prob
                     }
@@ -504,10 +518,11 @@ class RDTTrainer:
                     
                     # Print logging when tqdm is disabled
                     if not self.use_tqdm:
-                        print(f"Epoch {epoch+1}/{self.num_epochs} | Step {self.global_step} | Loss: {loss:.4f} | Recon: {recon:.4f} | Gate: {gate:.4f} | Aux: {aux:.4f} | LR: {log_data['lr']:.6f}")
+                        print(f"Epoch {epoch+1}/{self.num_epochs} | Step {self.global_step} | Loss: {current_loss:.4f} | Recon: {current_recon:.4f} | Gate: {current_gate:.4f} | Aux: {current_aux:.4f} | LR: {log_data['lr']:.6f}")
                 
                 if self.use_tqdm:
-                    progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
+                    # tqdm도 로깅 시점에만 .item() 호출
+                    progress_bar.set_postfix({'loss': f'{loss.item():.4f}', 'recon': f'{recon.item():.4f}', 'aux': f'{aux.item():.4f}'})
             
             # Validation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
@@ -606,13 +621,19 @@ class RDTTrainer:
                 self.global_step = step
                 
                 if step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
+                    # [핵심] 여기서만 .item() 호출
+                    current_loss = loss.item()
+                    current_recon = recon.item()
+                    current_gate = gate.item()
+                    current_aux = aux.item()
+
                     log_data = {
                         'epoch': epoch,
                         'step': step,
-                        'loss': loss,
-                        'recon_loss': recon,
-                        'gate_loss': gate,
-                        'aux_loss': aux,
+                        'loss': current_loss,
+                        'recon_loss': current_recon,
+                        'gate_loss': current_gate,
+                        'aux_loss': current_aux,
                         'lr': self.optimizer.param_groups[0]['lr'],
                         'sampling_prob': self.get_sampling_prob(step=step)
                     }
@@ -625,7 +646,7 @@ class RDTTrainer:
                     
                     # Print logging when tqdm is disabled
                     if not self.use_tqdm:
-                        print(f"Epoch {epoch+1} | Step {step}/{self.max_training_steps} | Loss: {loss:.4f} | Recon: {recon:.4f} | Gate: {gate:.4f} | Aux: {aux:.4f} | LR: {log_data['lr']:.6f}")
+                        print(f"Epoch {epoch+1} | Step {step}/{self.max_training_steps} | Loss: {current_loss:.4f} | Recon: {current_recon:.4f} | Gate: {current_gate:.4f} | Aux: {current_aux:.4f} | LR: {log_data['lr']:.6f}")
                 
                 # Validation at regular step intervals
                 if step % self.eval_every_n_steps == 0:
@@ -665,7 +686,8 @@ class RDTTrainer:
                     # cleanup_checkpoints는 필요시 별도 구현
                 
                 if self.use_tqdm:
-                    progress_bar.set_postfix({'step': step, 'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
+                    # tqdm도 로깅 시점에만 .item() 호출
+                    progress_bar.set_postfix({'step': step, 'loss': f'{loss.item():.4f}', 'recon': f'{recon.item():.4f}', 'aux': f'{aux.item():.4f}'})
             
             epoch += 1
         
