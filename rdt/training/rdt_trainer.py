@@ -353,8 +353,9 @@ class RDTTrainer:
                 chain_lengths = batch['chain_lengths'].to(self.accelerator.device)
                 
                 actual_max_length = chain_lengths.max().item()
-                batch_recon = 0
-                batch_gate = 0
+                # [최적화] 텐서로 누적 (매 스텝마다 .item() 호출하지 않음)
+                batch_recon_tensor = torch.tensor(0.0, device=self.accelerator.device)
+                batch_gate_tensor = torch.tensor(0.0, device=self.accelerator.device)
                 num_valid = 0
                 
                 # Initial encoding
@@ -364,7 +365,7 @@ class RDTTrainer:
                 # Gate loss for h_0
                 gate_target_0 = gate_targets[:, 0].unsqueeze(1)
                 gate_loss_0 = self.gate_criterion(gate_pred_0, gate_target_0)
-                batch_gate += gate_loss_0.item()
+                batch_gate_tensor += gate_loss_0
                 num_valid += 1
                 
                 # Iterative steps
@@ -403,13 +404,15 @@ class RDTTrainer:
                     gate_target_valid = step_gate_targets[valid_mask]
                     gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.accelerator.device)
                     
-                    batch_recon += recon_loss.item()
-                    batch_gate += gate_loss.item()
+                    # [최적화] 텐서끼리 덧셈 (동기화 없음)
+                    batch_recon_tensor += recon_loss
+                    batch_gate_tensor += gate_loss
                     num_valid += 1
                 
+                # [최적화] 배치 끝에 한 번만 .item() 호출
                 if num_valid > 0:
-                    avg_recon = batch_recon / num_valid
-                    avg_gate = batch_gate / num_valid
+                    avg_recon = (batch_recon_tensor / num_valid).item()
+                    avg_gate = (batch_gate_tensor / num_valid).item()
                     avg_total = self.loss_weight_recon * avg_recon + self.loss_weight_gate * avg_gate
                     
                     total_loss += avg_total
