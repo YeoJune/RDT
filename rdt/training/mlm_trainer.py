@@ -329,7 +329,7 @@ class MLMTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process):
+            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process or not self.use_tqdm):
                 input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
