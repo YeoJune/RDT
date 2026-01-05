@@ -363,7 +363,12 @@ class RDTTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process or not self.use_tqdm):
+            if self.use_tqdm:
+                val_iter = tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process)
+            else:
+                val_iter = self.val_loader
+            
+            for batch in val_iter:
                 # 데이터 로드 (이미 전처리됨)
                 input_tokens = batch['input'].to(self.accelerator.device)
                 targets = batch['targets'].to(self.accelerator.device)

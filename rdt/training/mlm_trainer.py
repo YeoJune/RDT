@@ -329,7 +329,12 @@ class MLMTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process or not self.use_tqdm):
+            if self.use_tqdm:
+                val_iter = tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process)
+            else:
+                val_iter = self.val_loader
+            
+            for batch in val_iter:
                 input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
@@ -372,7 +377,12 @@ class MLMTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process or not self.use_tqdm):
+            if self.use_tqdm:
+                val_iter = tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process)
+            else:
+                val_iter = self.val_loader
+            
+            for batch in val_iter:
                 input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
@@ -427,7 +437,12 @@ class MLMTrainer:
         num_mc_samples = self.config.get('mdlm', {}).get('mc_samples', 10)
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating MDLM", leave=False, disable=not self.accelerator.is_local_main_process or not self.use_tqdm):
+            if self.use_tqdm:
+                val_iter = tqdm(self.val_loader, desc="Evaluating MDLM", leave=False, disable=not self.accelerator.is_local_main_process)
+            else:
+                val_iter = self.val_loader
+            
+            for batch in val_iter:
                 input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
