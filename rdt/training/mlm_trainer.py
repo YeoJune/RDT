@@ -76,6 +76,7 @@ class MLMTrainer:
             self.csv_logger = CSVLogger(str(log_dir))
         
         self.log_every_n_steps = config['output']['log_every_n_steps']
+        self.use_tqdm = config['output'].get('use_tqdm', True)
         self.eval_every_n_epochs = config['output'].get('eval_every_n_epochs', 1)
         self.eval_every_n_steps = config['output'].get('eval_every_n_steps', 5000)
         
@@ -371,7 +372,7 @@ class MLMTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process):
+            for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, disable=not self.accelerator.is_local_main_process or not self.use_tqdm):
                 input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
@@ -426,7 +427,7 @@ class MLMTrainer:
         num_mc_samples = self.config.get('mdlm', {}).get('mc_samples', 10)
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Evaluating MDLM", leave=False, disable=not self.accelerator.is_local_main_process):
+            for batch in tqdm(self.val_loader, desc="Evaluating MDLM", leave=False, disable=not self.accelerator.is_local_main_process or not self.use_tqdm):
                 input_ids = batch['input_ids'].to(self.accelerator.device)
                 attention_mask = batch.get('attention_mask')
                 if attention_mask is not None:
@@ -579,12 +580,17 @@ class MLMTrainer:
                 print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
             
             # Training loop
-            pbar = tqdm(
-                self.train_loader, 
-                desc=f"Epoch {epoch + 1}",
-                disable=not self.accelerator.is_local_main_process
-            )
-            for batch in pbar:
+            if self.use_tqdm:
+                pbar = tqdm(
+                    self.train_loader, 
+                    desc=f"Epoch {epoch + 1}",
+                    disable=not self.accelerator.is_local_main_process
+                )
+                train_iter = pbar
+            else:
+                train_iter = self.train_loader
+            
+            for batch in train_iter:
                 metrics = self.train_step(batch)
                 self.global_step += 1
                 
@@ -596,8 +602,14 @@ class MLMTrainer:
                     if self.use_wandb:
                         self.accelerator.log({'train/' + k if k not in ['epoch', 'step'] else k: v 
                                   for k, v in log_data.items()}, step=self.global_step)
-                    pbar.set_postfix(loss=f"{metrics['loss']:.4f}", 
-                                    acc=f"{metrics['accuracy']:.4f}")
+                    
+                    # Print logging when tqdm is disabled
+                    if not self.use_tqdm:
+                        print(f"Epoch {epoch+1}/{self.num_epochs} | Step {self.global_step} | Loss: {metrics['loss']:.4f} | Acc: {metrics['accuracy']:.4f} | LR: {metrics['lr']:.6f}")
+                    
+                    if self.use_tqdm:
+                        pbar.set_postfix(loss=f"{metrics['loss']:.4f}", 
+                                        acc=f"{metrics['accuracy']:.4f}")
             
             # Evaluation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
@@ -643,12 +655,13 @@ class MLMTrainer:
     
     def _train_by_step(self):
         """Train by steps"""
-        pbar = tqdm(
-            total=self.max_training_steps, 
-            desc="Training",
-            disable=not self.accelerator.is_local_main_process
-        )
-        pbar.update(self.global_step)
+        if self.use_tqdm:
+            pbar = tqdm(
+                total=self.max_training_steps, 
+                desc="Training",
+                disable=not self.accelerator.is_local_main_process
+            )
+            pbar.update(self.global_step)
         
         epoch = 0
         while self.global_step < self.max_training_steps:
@@ -658,7 +671,8 @@ class MLMTrainer:
                 
                 metrics = self.train_step(batch)
                 self.global_step += 1
-                pbar.update(1)
+                if self.use_tqdm:
+                    pbar.update(1)
                 
                 # Logging (Main Process Only)
                 if self.global_step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
@@ -668,8 +682,14 @@ class MLMTrainer:
                     if self.use_wandb:
                         self.accelerator.log({'train/' + k if k not in ['epoch', 'step'] else k: v 
                                   for k, v in log_data.items()}, step=self.global_step)
-                    pbar.set_postfix(loss=f"{metrics['loss']:.4f}",
-                                    acc=f"{metrics['accuracy']:.4f}")
+                    
+                    # Print logging when tqdm is disabled
+                    if not self.use_tqdm:
+                        print(f"Epoch {epoch+1} | Step {self.global_step}/{self.max_training_steps} | Loss: {metrics['loss']:.4f} | Acc: {metrics['accuracy']:.4f} | LR: {metrics['lr']:.6f}")
+                    
+                    if self.use_tqdm:
+                        pbar.set_postfix(loss=f"{metrics['loss']:.4f}",
+                                        acc=f"{metrics['accuracy']:.4f}")
                 
                 # Evaluation
                 if self.global_step % self.eval_every_n_steps == 0:
@@ -715,4 +735,5 @@ class MLMTrainer:
             
             epoch += 1
         
-        pbar.close()
+        if self.use_tqdm:
+            pbar.close()

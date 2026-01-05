@@ -73,6 +73,7 @@ output:
   log_every_n_steps: 100
   eval_every_n_epochs: 1
   eval_every_n_steps: 1000
+  use_tqdm: false # Enable/disable tqdm progress bars (if false, print logs at log_every_n_steps)
 
 # Hardware
 device: "cuda"

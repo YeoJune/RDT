@@ -90,6 +90,7 @@ class RDTTrainer:
             self.csv_logger = CSVLogger(str(log_dir))
         
         self.log_every_n_steps = config['output']['log_every_n_steps']
+        self.use_tqdm = config['output'].get('use_tqdm', True)
         self.eval_every_n_epochs = config['output'].get('eval_every_n_epochs', 1)
         self.eval_every_n_steps = config['output'].get('eval_every_n_steps', 5000)
         
@@ -362,7 +363,7 @@ class RDTTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process):
+            for batch in tqdm(self.val_loader, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process or not self.use_tqdm):
                 # 데이터 로드 (이미 전처리됨)
                 input_tokens = batch['input'].to(self.accelerator.device)
                 targets = batch['targets'].to(self.accelerator.device)
@@ -472,13 +473,18 @@ class RDTTrainer:
                 print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
             
             epoch_loss = 0; epoch_recon = 0; epoch_gate = 0; epoch_aux = 0
-            progress_bar = tqdm(
-                self.train_loader, 
-                desc="Training",
-                disable=not self.accelerator.is_local_main_process
-            )
             
-            for batch in progress_bar:
+            if self.use_tqdm:
+                progress_bar = tqdm(
+                    self.train_loader, 
+                    desc="Training",
+                    disable=not self.accelerator.is_local_main_process
+                )
+                train_iter = progress_bar
+            else:
+                train_iter = self.train_loader
+            
+            for batch in train_iter:
                 loss, recon, gate, aux = self.train_step(batch)
                 epoch_loss += loss; epoch_recon += recon; epoch_gate += gate; epoch_aux += aux
                 self.global_step += 1
@@ -502,8 +508,13 @@ class RDTTrainer:
                     if self.use_wandb:
                         self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
                                   for k, v in log_data.items()}, step=self.global_step)
+                    
+                    # Print logging when tqdm is disabled
+                    if not self.use_tqdm:
+                        print(f"Epoch {epoch+1}/{self.num_epochs} | Step {self.global_step} | Loss: {loss:.4f} | Recon: {recon:.4f} | Gate: {gate:.4f} | Aux: {aux:.4f} | LR: {log_data['lr']:.6f}")
                 
-                progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
+                if self.use_tqdm:
+                    progress_bar.set_postfix({'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
             
             # Validation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
@@ -569,13 +580,17 @@ class RDTTrainer:
             if self.accelerator.is_main_process:
                 print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
             
-            progress_bar = tqdm(
-                self.train_loader, 
-                desc=f"Training (Step {step})",
-                disable=not self.accelerator.is_local_main_process
-            )
+            if self.use_tqdm:
+                progress_bar = tqdm(
+                    self.train_loader, 
+                    desc=f"Training (Step {step})",
+                    disable=not self.accelerator.is_local_main_process
+                )
+                train_iter = progress_bar
+            else:
+                train_iter = self.train_loader
             
-            for batch in progress_bar:
+            for batch in train_iter:
                 if step >= self.max_training_steps:
                     break
                 
@@ -600,6 +615,10 @@ class RDTTrainer:
                     if self.use_wandb:
                         self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
                                   for k, v in log_data.items()}, step=step)
+                    
+                    # Print logging when tqdm is disabled
+                    if not self.use_tqdm:
+                        print(f"Epoch {epoch+1} | Step {step}/{self.max_training_steps} | Loss: {loss:.4f} | Recon: {recon:.4f} | Gate: {gate:.4f} | Aux: {aux:.4f} | LR: {log_data['lr']:.6f}")
                 
                 # Validation at regular step intervals
                 if step % self.eval_every_n_steps == 0:
@@ -638,7 +657,8 @@ class RDTTrainer:
                     self.accelerator.save_state(save_path)
                     # cleanup_checkpoints는 필요시 별도 구현
                 
-                progress_bar.set_postfix({'step': step, 'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
+                if self.use_tqdm:
+                    progress_bar.set_postfix({'step': step, 'loss': f'{loss:.4f}', 'recon': f'{recon:.4f}', 'aux': f'{aux:.4f}'})
             
             epoch += 1
         
