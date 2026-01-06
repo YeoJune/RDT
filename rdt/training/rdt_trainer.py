@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from accelerate import Accelerator
 import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -73,7 +74,7 @@ class RDTTrainer:
             # Accelerate Wrapper 대신 순정 DataLoader + DistributedSampler 사용
             train_sampler = DistributedSampler(
                 train_loader.dataset,
-                num_replicas=xm.xrt_world_size(),
+                num_replicas=xr.world_size(),
                 rank=xm.get_ordinal(),
                 shuffle=True
             )
@@ -90,7 +91,7 @@ class RDTTrainer:
             # [Val Loader 재구성]
             val_sampler = DistributedSampler(
                 val_loader.dataset,
-                num_replicas=xm.xrt_world_size(),
+                num_replicas=xr.world_size(),
                 rank=xm.get_ordinal(),
                 shuffle=False
             )
