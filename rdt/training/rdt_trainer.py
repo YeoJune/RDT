@@ -57,10 +57,56 @@ class RDTTrainer:
         # Scheduler
         self.scheduler = self._create_scheduler()
         
-        # Accelerate Prepare: 모델, 옵티마이저, 데이터로더를 래핑하여 장치 분산 및 정밀도 관리 자동화
-        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = \
-            self.accelerator.prepare(
-                model, self.optimizer, train_loader, val_loader, self.scheduler
+        # TPU 환경 감지 (prepare 전에 미리 확인)
+        self.is_tpu = self.accelerator.device.type == 'xla' or (hasattr(self.accelerator.state, "distributed_type") and self.accelerator.state.distributed_type == "TPU")
+        
+        # 1. 모델, 옵티마이저, 스케줄러만 Accelerate로 준비 (로더 제외!)
+        self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
+            model, self.optimizer, self.scheduler
+        )
+        
+        # 2. 데이터로더는 TPU일 때 '수동'으로 분산 처리 (Accelerate Wrapper 제거)
+        if self.is_tpu:
+            from torch.utils.data.distributed import DistributedSampler
+            
+            # [Train Loader 재구성]
+            # Accelerate Wrapper 대신 순정 DataLoader + DistributedSampler 사용
+            train_sampler = DistributedSampler(
+                train_loader.dataset,
+                num_replicas=xm.xrt_world_size(),
+                rank=xm.get_ordinal(),
+                shuffle=True
+            )
+            self.train_loader = DataLoader(
+                train_loader.dataset,
+                batch_size=train_loader.batch_size,
+                sampler=train_sampler,
+                num_workers=train_loader.num_workers,
+                collate_fn=train_loader.collate_fn,
+                pin_memory=train_loader.pin_memory,
+                drop_last=train_loader.drop_last
+            )
+            
+            # [Val Loader 재구성]
+            val_sampler = DistributedSampler(
+                val_loader.dataset,
+                num_replicas=xm.xrt_world_size(),
+                rank=xm.get_ordinal(),
+                shuffle=False
+            )
+            self.val_loader = DataLoader(
+                val_loader.dataset,
+                batch_size=val_loader.batch_size,
+                sampler=val_sampler,
+                num_workers=val_loader.num_workers,
+                collate_fn=val_loader.collate_fn,
+                pin_memory=val_loader.pin_memory,
+                drop_last=val_loader.drop_last
+            )
+        else:
+            # GPU/CPU일 때는 Accelerate가 알아서 잘 하므로 맡김
+            self.train_loader, self.val_loader = self.accelerator.prepare(
+                train_loader, val_loader
             )
         
         # Unwrap을 통해 원본 모델 접근 후 재할당
@@ -117,8 +163,6 @@ class RDTTrainer:
             num_params_no_context = count_parameters_without_context(unwrapped_model)
             print(f"Model parameters: {num_params:,}")
             print(f"Model parameters (without context): {num_params_no_context:,}")
-        
-        self.is_tpu = self.accelerator.device.type == 'xla' or (hasattr(self.accelerator.state, "distributed_type") and self.accelerator.state.distributed_type == "TPU")
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""
