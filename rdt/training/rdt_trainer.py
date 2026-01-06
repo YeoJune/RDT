@@ -75,7 +75,7 @@ class RDTTrainer:
             train_sampler = DistributedSampler(
                 train_loader.dataset,
                 num_replicas=xr.world_size(),
-                rank=xm.get_ordinal(),
+                rank=xr.global_ordinal(),
                 shuffle=True
             )
             self.train_loader = DataLoader(
@@ -92,7 +92,7 @@ class RDTTrainer:
             val_sampler = DistributedSampler(
                 val_loader.dataset,
                 num_replicas=xr.world_size(),
-                rank=xm.get_ordinal(),
+                rank=xr.global_ordinal(),
                 shuffle=False
             )
             self.val_loader = DataLoader(
