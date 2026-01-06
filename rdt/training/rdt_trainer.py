@@ -399,7 +399,7 @@ class RDTTrainer:
                 val_iter = self.val_loader
             
             # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
-            if self.use_tqdm and not self.is_tpu:
+            if self.use_tqdm:
                 val_iter = tqdm(val_iter, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process)
             
             for batch in val_iter:
@@ -532,7 +532,7 @@ class RDTTrainer:
                 train_iter = self.train_loader
             
             # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
-            if self.use_tqdm and not self.is_tpu:
+            if self.use_tqdm:
                 progress_bar = tqdm(
                     train_iter, 
                     desc="Training",
@@ -666,7 +666,7 @@ class RDTTrainer:
                 train_iter = self.train_loader
             
             # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
-            if self.use_tqdm and not self.is_tpu:
+            if self.use_tqdm:
                 progress_bar = tqdm(
                     train_iter, 
                     desc=f"Training (Step {step})",

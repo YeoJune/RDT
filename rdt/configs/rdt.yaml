@@ -91,8 +91,8 @@ data:
   tokenizer_name: "bert-base-uncased" # Using standard BERT tokenizer
 
   # DataLoader
-  num_workers: 0
-  pin_memory: false
+  num_workers: 4
+  pin_memory: true
   cache_dir: "./data_cache"
 
 # Logging & Checkpoints
@@ -102,7 +102,7 @@ output:
   log_every_n_steps: 100
   eval_every_n_epochs: 1 # Used when training_mode is 'epoch'
   eval_every_n_steps: 10000 # Used when training_mode is 'step'
-  use_tqdm: false # Enable/disable tqdm progress bars (if false, print logs at log_every_n_steps)
+  use_tqdm: true # Enable/disable tqdm progress bars (if false, print logs at log_every_n_steps)
 
 # Hardware
 device: "cuda" # 'cuda' or 'cpu'
