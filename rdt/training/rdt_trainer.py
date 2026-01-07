@@ -56,73 +56,14 @@ class RDTTrainer:
         # Scheduler
         self.scheduler = self._create_scheduler()
         
-        # TPU 환경 감지 (prepare 전에 미리 확인)
+        # TPU 환경 감지
         self.is_tpu = self.accelerator.device.type == 'xla' or (hasattr(self.accelerator.state, "distributed_type") and self.accelerator.state.distributed_type == "TPU")
         
-        # TPU 관련 모듈을 초기화 시점에 한 번만 임포트 (성능 최적화)
-        self.xm = None
-        self.xr = None
-        self.pl = None
-        if self.is_tpu:
-            try:
-                import torch_xla.core.xla_model as xm
-                import torch_xla.runtime as xr
-                import torch_xla.distributed.parallel_loader as pl
-                self.xm = xm
-                self.xr = xr
-                self.pl = pl
-            except ImportError:
-                raise ImportError("torch_xla is required for TPU training but not installed.")
-        
-        # 1. 모델, 옵티마이저, 스케줄러만 Accelerate로 준비 (로더 제외!)
-        self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
-            model, self.optimizer, self.scheduler
+        # [수정] 모든 구성요소를 한 번에 prepare (로더 포함!)
+        # Accelerate가 TPU용 Sampler와 Loader를 자동으로 처리합니다.
+        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = self.accelerator.prepare(
+            model, self.optimizer, train_loader, val_loader, self.scheduler
         )
-        
-        # 2. 데이터로더는 TPU일 때 '수동'으로 분산 처리 (Accelerate Wrapper 제거)
-        if self.is_tpu:
-            
-            from torch.utils.data.distributed import DistributedSampler
-            
-            # [Train Loader 재구성]
-            # Accelerate Wrapper 대신 순정 DataLoader + DistributedSampler 사용
-            train_sampler = DistributedSampler(
-                train_loader.dataset,
-                num_replicas=self.xr.world_size(),
-                rank=self.xr.global_ordinal(),
-                shuffle=True
-            )
-            self.train_loader = DataLoader(
-                train_loader.dataset,
-                batch_size=train_loader.batch_size,
-                sampler=train_sampler,
-                num_workers=train_loader.num_workers,
-                collate_fn=train_loader.collate_fn,
-                pin_memory=train_loader.pin_memory,
-                drop_last=train_loader.drop_last
-            )
-            
-            # [Val Loader 재구성]
-            val_sampler = DistributedSampler(
-                val_loader.dataset,
-                num_replicas=self.xr.world_size(),
-                rank=self.xr.global_ordinal(),
-                shuffle=False
-            )
-            self.val_loader = DataLoader(
-                val_loader.dataset,
-                batch_size=val_loader.batch_size,
-                sampler=val_sampler,
-                num_workers=val_loader.num_workers,
-                collate_fn=val_loader.collate_fn,
-                pin_memory=val_loader.pin_memory,
-                drop_last=val_loader.drop_last
-            )
-        else:
-            # GPU/CPU일 때는 Accelerate가 알아서 잘 하므로 맡김
-            self.train_loader, self.val_loader = self.accelerator.prepare(
-                train_loader, val_loader
-            )
         
         # Unwrap을 통해 원본 모델 접근 후 재할당
         unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -356,23 +297,13 @@ class RDTTrainer:
         # 3. Backward (매 배치마다 수행하여 그래프 생성)
         self.accelerator.backward(final_loss)
         
-        # 4. [필수] mark_step (Backward 직후): 여기서 미분 계산을 실행하라고 TPU에 명령
-        # 이걸 안 하면 Accumulation 동안 그래프가 메모리에 계속 쌓여서 OOM 남
-        if self.is_tpu and self.xm:
-            self.xm.mark_step()
-        
-        # 5. 조건부 Update (Accumulation이 찼을 때만 수행)
+        # 4. 조건부 Update (Accumulation이 찼을 때만 수행)
         # self.global_step은 현재 완료된 배치가 아니라 '시작 전' 카운트이므로 +1 해서 체크
         if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
             if self.accelerator.sync_gradients:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             
             self.optimizer.step()
-            
-            # 6. [필수] mark_step (Update 직후): 가중치 갱신 실행 명령
-            # if self.is_tpu and self.xm:
-            #     self.xm.mark_step()
-            
             self.optimizer.zero_grad()
             
             if self.scheduler:
@@ -399,17 +330,8 @@ class RDTTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            # [TPU Fix] ParallelLoader 강제 적용으로 데이터 공급 데드락 방지
-            if self.is_tpu and self.pl:
-                # ParallelLoader로 래핑하여 백그라운드에서 TPU로 데이터 고속 전송
-                val_device_loader = self.pl.ParallelLoader(
-                    self.val_loader, 
-                    [self.accelerator.device]
-                ).per_device_loader(self.accelerator.device)
-                
-                val_iter = val_device_loader
-            else:
-                val_iter = self.val_loader
+            # Accelerate가 준비한 val_loader를 그대로 사용
+            val_iter = self.val_loader
             
             # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
             if self.use_tqdm:
@@ -529,19 +451,10 @@ class RDTTrainer:
             
             epoch_loss = 0; epoch_recon = 0; epoch_gate = 0; epoch_aux = 0
             
-            # [TPU Fix] ParallelLoader 강제 적용으로 데이터 공급 데드락 방지
-            if self.is_tpu and self.pl:
-                # ParallelLoader로 래핑하여 백그라운드에서 TPU로 데이터 고속 전송
-                train_device_loader = self.pl.ParallelLoader(
-                    self.train_loader, 
-                    [self.accelerator.device]
-                ).per_device_loader(self.accelerator.device)
-                
-                train_iter = train_device_loader
-            else:
-                train_iter = self.train_loader
+            # Accelerate가 준비한 train_loader를 그대로 사용
+            train_iter = self.train_loader
             
-            # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
+            # tqdm 적용
             if self.use_tqdm:
                 progress_bar = tqdm(
                     train_iter, 
@@ -660,19 +573,10 @@ class RDTTrainer:
             if self.accelerator.is_main_process:
                 print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
             
-            # [TPU Fix] ParallelLoader 강제 적용으로 데이터 공급 데드락 방지
-            if self.is_tpu and self.pl:
-                # ParallelLoader로 래핑하여 백그라운드에서 TPU로 데이터 고속 전송
-                train_device_loader = self.pl.ParallelLoader(
-                    self.train_loader, 
-                    [self.accelerator.device]
-                ).per_device_loader(self.accelerator.device)
-                
-                train_iter = train_device_loader
-            else:
-                train_iter = self.train_loader
+            # Accelerate가 준비한 train_loader를 그대로 사용
+            train_iter = self.train_loader
             
-            # tqdm은 TPU I/O 락을 유발하므로 XLA 환경에서는 강제로 끄거나 주의해서 사용
+            # tqdm 적용
             if self.use_tqdm:
                 progress_bar = tqdm(
                     train_iter, 
