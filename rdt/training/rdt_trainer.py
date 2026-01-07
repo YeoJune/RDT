@@ -59,10 +59,61 @@ class RDTTrainer:
         # TPU 환경 감지
         self.is_tpu = self.accelerator.device.type == 'xla' or (hasattr(self.accelerator.state, "distributed_type") and self.accelerator.state.distributed_type == "TPU")
         
-        # 모든 구성요소를 Accelerate에 맡김 (자동 처리)
-        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = self.accelerator.prepare(
-            model, self.optimizer, train_loader, val_loader, self.scheduler
+        # TPU 관련 모듈을 초기화 시점에 한 번만 임포트
+        if self.is_tpu:
+            try:
+                import torch_xla.runtime as xr
+                self.xr = xr
+            except ImportError:
+                raise ImportError("torch_xla is required for TPU training but not installed.")
+        
+        # 모델, 옵티마이저, 스케줄러는 Accelerate에 맡김
+        self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
+            model, self.optimizer, self.scheduler
         )
+        
+        # DataLoader는 TPU에서 수동 처리 (Accelerate prepare 사용 시 멈춤 현상 발생)
+        if self.is_tpu:
+            from torch.utils.data.distributed import DistributedSampler
+            
+            train_sampler = DistributedSampler(
+                train_loader.dataset,
+                num_replicas=self.xr.world_size(),
+                rank=self.xr.global_ordinal(),
+                shuffle=True,
+                drop_last=True
+            )
+            self.train_loader = DataLoader(
+                train_loader.dataset,
+                batch_size=train_loader.batch_size,
+                sampler=train_sampler,
+                num_workers=train_loader.num_workers,
+                collate_fn=train_loader.collate_fn,
+                pin_memory=False,  # TPU에서는 pin_memory 불필요
+                drop_last=True
+            )
+            
+            val_sampler = DistributedSampler(
+                val_loader.dataset,
+                num_replicas=self.xr.world_size(),
+                rank=self.xr.global_ordinal(),
+                shuffle=False,
+                drop_last=False
+            )
+            self.val_loader = DataLoader(
+                val_loader.dataset,
+                batch_size=val_loader.batch_size,
+                sampler=val_sampler,
+                num_workers=val_loader.num_workers,
+                collate_fn=val_loader.collate_fn,
+                pin_memory=False,
+                drop_last=False
+            )
+        else:
+            # GPU/CPU에서는 Accelerate가 자동 처리
+            self.train_loader, self.val_loader = self.accelerator.prepare(
+                train_loader, val_loader
+            )
         
         # Unwrap을 통해 원본 모델 접근 후 재할당
         unwrapped_model = self.accelerator.unwrap_model(self.model)
