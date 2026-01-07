@@ -179,7 +179,7 @@ def main():
         xmp.spawn(
             train_worker,
             args=(args_tuple,),
-            nprocs=8,
+            nprocs=None,
             start_method='fork'
         )
     else:
