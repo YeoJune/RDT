@@ -59,8 +59,8 @@ training:
   aux_temp: 0.5
 
   # Optimization
-  batch_size: 16
-  gradient_accumulation_steps: 1 # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 32
+  gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 15 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
