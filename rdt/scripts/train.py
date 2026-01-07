@@ -16,38 +16,30 @@ from rdt.training import RDTTrainer, MLMTrainer
 from rdt.utils import load_config, merge_configs, set_seed, create_model_from_config
 
 
-def is_kaggle_tpu():
-    """Detect if running in Kaggle TPU environment"""
-    try:
-        import torch_xla.core.xla_model as xm
-        # Check if we're in a notebook/Kaggle environment
-        in_notebook = 'ipykernel' in sys.modules or 'IPython' in sys.modules
-        # Check if TPU is available
-        has_tpu = os.environ.get('PJRT_DEVICE') == 'TPU' or os.environ.get('TPU_NAME') is not None
-        return in_notebook and has_tpu
-    except ImportError:
-        return False
-
-
-def train_worker(index, args_tuple):
-    """Worker function for TPU multiprocessing (fork mode)"""
-    config_path, override_path, checkpoint_path, pretrained_path = args_tuple
+def main():
+    parser = argparse.ArgumentParser(description='Train RDT or Baseline Models')
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to config file')
+    parser.add_argument('--override', type=str, default=None,
+                        help='Path to override config file')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='Path to pretrained weights to load')
     
-    # Import here to avoid issues in main process
-    from rdt.models import RDT, MLM
-    from rdt.models.cmlm import CMLM
-    from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders, create_mdlm_dataloaders
-    from rdt.training import RDTTrainer, MLMTrainer
-    from rdt.utils import load_config, merge_configs, set_seed, create_model_from_config
+    args = parser.parse_args()
+    
+    if args.checkpoint and args.pretrained:
+        raise ValueError("Cannot use both --checkpoint and --pretrained flags simultaneously.")
     
     # Load config
-    config = load_config(config_path)
+    config = load_config(args.config)
     
-    if override_path:
-        override_config = load_config(override_path)
+    if args.override:
+        override_config = load_config(args.override)
         config = merge_configs(config, override_config)
     
-    # Create accelerator
+    # Accelerator 초기화 (단일 프로세스)
     accelerator = Accelerator(
         log_with="wandb" if config.get('use_wandb', True) else None,
         project_config=ProjectConfiguration(
@@ -66,11 +58,13 @@ def train_worker(index, args_tuple):
         )
     
     if accelerator.is_main_process:
-        print(f"Worker {index} | Device: {accelerator.device} | Distributed: {accelerator.num_processes > 1}")
+        print(f"Loading config from {args.config}")
+        print(f"Accelerator Device: {accelerator.device}")
+        print(f"Mixed Precision: {accelerator.mixed_precision}")
+        print(f"Num Processes: {accelerator.num_processes}")
     
     set_seed(config['seed'])
     
-    # Determine model type
     model_type = config.get('model_type', 'rdt').lower()
     
     if model_type == 'rdt':
@@ -81,9 +75,7 @@ def train_worker(index, args_tuple):
         train_loader, val_loader = create_dataloaders(config)
         tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
         vocab_size = tokenizer.vocab_size
-        
-        if accelerator.is_main_process:
-            print(f"Vocabulary size: {vocab_size}")
+        print(f"Vocabulary size: {vocab_size}")
         
         model = create_model_from_config(config, vocab_size)
         
@@ -102,17 +94,20 @@ def train_worker(index, args_tuple):
         
         if model_type == 'mlm':
             model = MLM.from_config(config)
-            train_loader, val_loader = create_mlm_dataloaders(config)
         elif model_type == 'cmlm':
             model = CMLM.from_config(config)
-            train_loader, val_loader = create_cmlm_dataloaders(config)
         elif model_type == 'mdlm':
             from rdt.models.mdlm import MDLM
             model = MDLM.from_config(config)
-            train_loader, val_loader = create_mdlm_dataloaders(config)
         
-        if accelerator.is_main_process:
-            print(f"\nModel parameters: {model.count_parameters()/1e6:.1f}M")
+        print(f"\nModel parameters: {model.count_parameters()/1e6:.1f}M")
+        
+        if model_type == 'mlm':
+            train_loader, val_loader = create_mlm_dataloaders(config)
+        elif model_type == 'mdlm':
+            train_loader, val_loader = create_mdlm_dataloaders(config)
+        elif model_type == 'cmlm':
+            train_loader, val_loader = create_cmlm_dataloaders(config)
         
         trainer = MLMTrainer(
             model=model,
@@ -121,74 +116,31 @@ def train_worker(index, args_tuple):
             config=config,
             accelerator=accelerator
         )
+        
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
-    # Resume from checkpoint or load pretrained weights
-    if checkpoint_path:
+    if args.checkpoint:
         if accelerator.is_main_process:
-            print(f"\nResuming from checkpoint: {checkpoint_path}")
-        trainer.resume_checkpoint = checkpoint_path
+            print(f"\nResuming from checkpoint: {args.checkpoint}")
+        trainer.resume_checkpoint = args.checkpoint
     
-    elif pretrained_path:
+    elif args.pretrained:
         if accelerator.is_main_process:
-            print(f"\nLoading pretrained weights: {pretrained_path}")
+            print(f"\nLoading pretrained weights: {args.pretrained}")
             from rdt.utils import load_pretrained_weights
             unwrapped_model = accelerator.unwrap_model(trainer.model)
-            load_pretrained_weights(pretrained_path, unwrapped_model)
+            load_pretrained_weights(args.pretrained, unwrapped_model)
     
     # Train
     trainer.train()
     accelerator.end_training()
     
-    if accelerator.is_main_process:
-        print("\n" + "="*60)
-        print("Training completed successfully!")
-        print(f"Checkpoints saved to: {config['output']['checkpoint_dir']}")
-        print(f"Logs saved to: {config['output']['log_dir']}")
-        print("="*60)
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Train RDT or Baseline Models')
-    parser.add_argument('--config', type=str, required=True,
-                        help='Path to config file')
-    parser.add_argument('--override', type=str, default=None,
-                        help='Path to override config file')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to checkpoint to resume from')
-    parser.add_argument('--pretrained', type=str, default=None,
-                        help='Path to pretrained weights to load')
-    
-    args = parser.parse_args()
-    
-    if args.checkpoint and args.pretrained:
-        raise ValueError("Cannot use both --checkpoint and --pretrained flags simultaneously.")
-    
-    # Detect environment
-    if is_kaggle_tpu():
-        print("\n" + "="*60)
-        print("Detected Kaggle TPU environment - using xmp.spawn with fork")
-        print("="*60)
-        
-        # Use xmp.spawn for Kaggle TPU (fork mode for notebook compatibility)
-        import torch_xla.distributed.xla_multiprocessing as xmp
-        
-        args_tuple = (args.config, args.override, args.checkpoint, args.pretrained)
-        
-        xmp.spawn(
-            train_worker,
-            args=(args_tuple,),
-            nprocs=None,
-            start_method='fork'
-        )
-    else:
-        print("\n" + "="*60)
-        print("Using standard training mode (non-Kaggle or non-TPU)")
-        print("="*60)
-        
-        # Standard training (GPU, CPU, or Cloud TPU with accelerate launch)
-        train_worker(0, (args.config, args.override, args.checkpoint, args.pretrained))
+    print("\n" + "="*60)
+    print("Training completed successfully!")
+    print(f"Checkpoints saved to: {config['output']['checkpoint_dir']}")
+    print(f"Logs saved to: {config['output']['log_dir']}")
+    print("="*60)
 
 
 if __name__ == '__main__':
