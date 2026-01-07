@@ -44,7 +44,6 @@ class RDTTrainer:
         self.loss_weight_aux = config['training'].get('loss_weight_aux', 0.1)
         self.aux_ratio = config['training'].get('aux_ratio', 0.25)
         self.aux_temp = config['training'].get('aux_temp', 0.5)
-        print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -87,7 +86,7 @@ class RDTTrainer:
                 train_loader.dataset,
                 batch_size=train_loader.batch_size,
                 sampler=train_sampler,
-                num_workers=train_loader.num_workers,
+                num_workers=0,  # Force 0 for TPU stability
                 collate_fn=train_loader.collate_fn,
                 pin_memory=False,  # TPU에서는 pin_memory 불필요
                 drop_last=True
@@ -104,7 +103,7 @@ class RDTTrainer:
                 val_loader.dataset,
                 batch_size=val_loader.batch_size,
                 sampler=val_sampler,
-                num_workers=val_loader.num_workers,
+                num_workers=0,  # Force 0 for TPU stability
                 collate_fn=val_loader.collate_fn,
                 pin_memory=False,
                 drop_last=False
@@ -235,7 +234,9 @@ class RDTTrainer:
         chain_lengths = batch['chain_lengths'].to(self.accelerator.device)
         
         batch_size = input_tokens.shape[0]
-        sampling_prob = self.get_sampling_prob(self.current_epoch, self.global_step)
+        # [Standard Fix] Float를 Tensor로 변환하여 XLA 컴파일 최적화
+        sampling_prob_val = self.get_sampling_prob(self.current_epoch, self.global_step)
+        sampling_prob = torch.tensor(sampling_prob_val, device=self.accelerator.device)
 
         if self.is_tpu:
             max_length = self.config['training']['max_chain_length']
@@ -251,13 +252,13 @@ class RDTTrainer:
         gate_loss_0 = torch.nn.functional.mse_loss(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
         accumulated_loss = self.loss_weight_gate * gate_loss_0
         
-        # Logging용 텐서 (Gradient 계산엔 영향 X)
+        # Logging용 텐서 (detached internally where created or via logic below)
         total_recon_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
         total_gate_loss_tensor = gate_loss_0.detach()
         total_aux_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
         
-        num_valid_steps = 1
-        num_aux_steps = 0
+        num_valid_steps = torch.tensor(1.0, device=self.accelerator.device)
+        num_aux_steps = torch.tensor(0.0, device=self.accelerator.device)
         
         hidden = h_0
         gate_pred = gate_pred_0
@@ -314,7 +315,7 @@ class RDTTrainer:
                 
                 aux_kl = aux_kl * (self.aux_temp ** 2)
                 total_aux_loss_tensor += aux_kl.detach()
-                num_aux_steps += 1
+                num_aux_steps += 1.0
             
             # [C] Gate Loss
             step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
@@ -333,7 +334,7 @@ class RDTTrainer:
             
             total_recon_loss_tensor += recon_loss.detach()
             total_gate_loss_tensor += gate_loss.detach()
-            num_valid_steps += 1
+            num_valid_steps += 1.0
         
         # --- Gradient Accumulation Logic ---
         
@@ -351,7 +352,7 @@ class RDTTrainer:
             final_loss,
             (total_recon_loss_tensor / num_valid_steps).detach(),
             (total_gate_loss_tensor / num_valid_steps).detach(),
-            (total_aux_loss_tensor / num_aux_steps).detach() if num_aux_steps > 0 else torch.tensor(0.0, device=self.accelerator.device)
+            (total_aux_loss_tensor / (num_aux_steps + 1e-6)).detach()
         )
     
     def validate(self) -> Tuple[float, float, float]:
@@ -484,7 +485,7 @@ class RDTTrainer:
             if self.accelerator.is_main_process:
                 print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
             
-            epoch_loss = 0; epoch_recon = 0; epoch_gate = 0; epoch_aux = 0
+            # [Standard Fix] 에폭 단위 누적 변수 제거 (TPU 그래프 폭발 방지)
             
             # Accelerate가 준비한 DataLoader 그대로 사용
             train_iter = self.train_loader
@@ -514,49 +515,50 @@ class RDTTrainer:
                     if self.scheduler:
                         self.scheduler.step()
                 
-                # [수정] .item()으로 즉시 Python float 변환 - 그래프 누적 방지
-                # 모든 코어가 동시에 .item() 호출하여 sync 맞춤
-                epoch_loss += loss.item()
-                epoch_recon += recon.item()
-                epoch_gate += gate.item()
-                epoch_aux += aux.item()
+                # [Standard Fix] 루프 내 불필요한 연산 및 동기화 제거
+                # epoch_loss += loss.item()  <-- 삭제 (매 스텝 Sync 유발)
+                # epoch_loss += loss.detach() <-- 삭제 (그래프 폭발 유발)
                 
                 self.global_step += 1
                 
-                if self.global_step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
-                    # [핵심] 로그 찍는 순간에만 .item() 호출해서 값 가져옴
-                    # loss는 scaling 되었으므로 실제 loss를 보려면 다시 곱해줌
-                    current_loss = loss.item() * self.gradient_accumulation_steps if self.gradient_accumulation_steps > 1 else loss.item()
+                # Logging (표준: 필요한 순간에만 값을 가져온다)
+                if self.global_step % self.log_every_n_steps == 0:
+                    # Scaling 복원
+                    scale = self.gradient_accumulation_steps if self.gradient_accumulation_steps > 1 else 1.0
+                    
+                    # [Standard Fix] .item()은 여기서 한 번만 호출
+                    current_loss = loss.item() * scale
                     current_recon = recon.item()
                     current_gate = gate.item()
                     current_aux = aux.item()
-
-                    log_data = {
-                        'epoch': epoch,
-                        'step': self.global_step,
-                        'loss': current_loss,
-                        'recon_loss': current_recon,
-                        'gate_loss': current_gate,
-                        'aux_loss': current_aux,
-                        'lr': self.optimizer.param_groups[0]['lr'],
-                        'sampling_prob': sampling_prob
-                    }
                     
-                    # CSV logging
-                    self.csv_logger.log(log_data)
+                    if self.accelerator.is_main_process:
+                        log_data = {
+                            'epoch': epoch,
+                            'step': self.global_step,
+                            'loss': current_loss,
+                            'recon_loss': current_recon,
+                            'gate_loss': current_gate,
+                            'aux_loss': current_aux,
+                            'lr': self.optimizer.param_groups[0]['lr'],
+                            'sampling_prob': sampling_prob
+                        }
+                        
+                        # CSV logging
+                        self.csv_logger.log(log_data)
+                        
+                        # W&B logging
+                        if self.use_wandb:
+                            self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
+                                      for k, v in log_data.items()}, step=self.global_step)
+                        
+                        # Print logging when tqdm is disabled
+                        if not self.use_tqdm:
+                            print(f"Epoch {epoch+1}/{self.num_epochs} | Step {self.global_step} | Loss: {current_loss:.4f} | Recon: {current_recon:.4f} | Gate: {current_gate:.4f} | Aux: {current_aux:.4f} | LR: {log_data['lr']:.6f}")
                     
-                    # W&B logging
-                    if self.use_wandb:
-                        self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
-                                  for k, v in log_data.items()}, step=self.global_step)
-                    
-                    # Print logging when tqdm is disabled
-                    if not self.use_tqdm:
-                        print(f"Epoch {epoch+1}/{self.num_epochs} | Step {self.global_step} | Loss: {current_loss:.4f} | Recon: {current_recon:.4f} | Gate: {current_gate:.4f} | Aux: {current_aux:.4f} | LR: {log_data['lr']:.6f}")
-                
-                if self.use_tqdm:
-                    # tqdm도 로깅 시점에만 .item() 호출
-                    progress_bar.set_postfix({'loss': f'{loss.item():.4f}', 'recon': f'{recon.item():.4f}', 'aux': f'{aux.item():.4f}'})
+                    # TQDM update (Logging 시점에만 수행)
+                    if self.use_tqdm:
+                        progress_bar.set_postfix({'loss': f'{current_loss:.4f}'})
             
             # Validation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
