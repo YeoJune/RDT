@@ -505,8 +505,8 @@ class RDTTrainer:
                     # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
                     self.accelerator.backward(loss)
                     
-                    if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    # [TPU 최적화] 조건문 제거 - clip_grad_norm_은 내부에서 sync 확인
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
                     self.optimizer.step()
                     self.optimizer.zero_grad()
@@ -643,8 +643,8 @@ class RDTTrainer:
                     # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
                     self.accelerator.backward(loss)
                     
-                    if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    # [TPU 최적화] 조건문 제거 - clip_grad_norm_은 내부에서 sync 확인
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
                     self.optimizer.step()
                     self.optimizer.zero_grad()
