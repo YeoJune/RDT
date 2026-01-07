@@ -646,6 +646,10 @@ class RDTTrainer:
                     # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
                     self.accelerator.backward(loss)
                     
+                    if self.is_tpu:
+                        import torch_xla.core.xla_model as xm
+                        xm.mark_step()
+                    
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
