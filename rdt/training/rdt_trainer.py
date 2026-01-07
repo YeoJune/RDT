@@ -90,7 +90,8 @@ class RDTTrainer:
                 train_loader.dataset,
                 num_replicas=self.xr.world_size(),
                 rank=self.xr.global_ordinal(),
-                shuffle=True
+                shuffle=True,
+                drop_last=True
             )
             self.train_loader = DataLoader(
                 train_loader.dataset,
@@ -107,7 +108,8 @@ class RDTTrainer:
                 val_loader.dataset,
                 num_replicas=self.xr.world_size(),
                 rank=self.xr.global_ordinal(),
-                shuffle=False
+                shuffle=False,
+                drop_last=True
             )
             self.val_loader = DataLoader(
                 val_loader.dataset,
