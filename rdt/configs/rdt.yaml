@@ -91,7 +91,7 @@ data:
   tokenizer_name: "bert-base-uncased" # Using standard BERT tokenizer
 
   # DataLoader
-  num_workers: 40
+  num_workers: 32
   pin_memory: true
   cache_dir: "./data_cache"
 
