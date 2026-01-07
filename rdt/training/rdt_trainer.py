@@ -505,8 +505,8 @@ class RDTTrainer:
                     # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
                     self.accelerator.backward(loss)
                     
-                    # [TPU 최적화] 조건문 제거 - clip_grad_norm_은 내부에서 sync 확인
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
                     self.optimizer.step()
                     self.optimizer.zero_grad()
@@ -514,11 +514,12 @@ class RDTTrainer:
                     if self.scheduler:
                         self.scheduler.step()
                 
-                # [수정] 텐서 누적 (CPU 동기화 X)
-                epoch_loss += loss.detach()
-                epoch_recon += recon.detach()
-                epoch_gate += gate.detach()
-                epoch_aux += aux.detach()
+                # [수정] .item()으로 즉시 Python float 변환 - 그래프 누적 방지
+                # 모든 코어가 동시에 .item() 호출하여 sync 맞춤
+                epoch_loss += loss.item()
+                epoch_recon += recon.item()
+                epoch_gate += gate.item()
+                epoch_aux += aux.item()
                 
                 self.global_step += 1
                 
@@ -643,8 +644,8 @@ class RDTTrainer:
                     # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
                     self.accelerator.backward(loss)
                     
-                    # [TPU 최적화] 조건문 제거 - clip_grad_norm_은 내부에서 sync 확인
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
                     self.optimizer.step()
                     self.optimizer.zero_grad()
