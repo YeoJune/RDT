@@ -804,17 +804,11 @@ class RDT(nn.Module):
         current_noise = predicted_gate.detach()  # Default value
         
         if self.training and gt_timestep is not None:
-            if sampling_prob > 0.0:
-                # [TPU Standard] Use torch.where instead of Python if/else
-                # 1. Generate random tensor (stays on device)
-                rand_tensor = torch.rand(1, device=predicted_gate.device)
-                
-                # 2. Create boolean mask (tensor operation)
-                use_gt_mask = rand_tensor < sampling_prob
-                
-                # 3. Conditional selection (no graph break)
-                # Both gt_timestep and current_noise should have shape [B, 1]
-                current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
+            # sampling_prob가 0이어도 수식은 성립함 (use_gt_mask가 모두 False가 됨)
+            # Python 제어문 없이 순수 그래프 연산만 남김 -> XLA 컴파일 1회로 끝
+            rand_tensor = torch.rand(1, device=predicted_gate.device)
+            use_gt_mask = rand_tensor < sampling_prob
+            current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
 
         # 4. Create Noise Embedding
         noise_vec = self.noise_emb(current_noise)
@@ -902,17 +896,11 @@ class RDT(nn.Module):
         current_noise = predicted_gate.detach()  # Default value
         
         if self.training and gt_timestep is not None:
-            if sampling_prob > 0.0:
-                # [TPU Standard] Use torch.where instead of Python if/else
-                # 1. Generate random tensor (stays on device)
-                rand_tensor = torch.rand(1, device=predicted_gate.device)
-                
-                # 2. Create boolean mask (tensor operation)
-                use_gt_mask = rand_tensor < sampling_prob
-                
-                # 3. Conditional selection (no graph break)
-                # Both gt_timestep and current_noise should have shape [B, 1]
-                current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
+            # sampling_prob가 0이어도 수식은 성립함 (use_gt_mask가 모두 False가 됨)
+            # Python 제어문 없이 순수 그래프 연산만 남김 -> XLA 컴파일 1회로 끝
+            rand_tensor = torch.rand(1, device=predicted_gate.device)
+            use_gt_mask = rand_tensor < sampling_prob
+            current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
         
         # 3. Create noise embedding
         noise_vec = self.noise_emb(current_noise)
