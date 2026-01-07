@@ -80,7 +80,7 @@ class RDTTrainer:
         )
         
         # 2. 데이터로더는 TPU일 때 '수동'으로 분산 처리 (Accelerate Wrapper 제거)
-        if self.is_tpu:
+        if False:
             
             from torch.utils.data.distributed import DistributedSampler
             
