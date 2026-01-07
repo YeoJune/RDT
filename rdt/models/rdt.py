@@ -880,7 +880,7 @@ class RDT(nn.Module):
             last_gate_score: [B, 1] previous gate prediction
             last_pooled: [B, D] previous pooled features
             gt_timestep: [B, 1] ground truth timestep for scheduled sampling
-            sampling_prob: probability of using GT vs predicted gate
+            sampling_prob: scalar tensor (0~1) for soft mixing
         
         Returns:
             hidden: [B, L, D] next hidden states (after recursive blocks)
@@ -892,15 +892,28 @@ class RDT(nn.Module):
             hidden, attention_mask, last_pooled, last_gate_score
         )
         
-        # 2. Scheduled sampling (TPU-Optimized: No .item() call, No Python control flow)
-        current_noise = predicted_gate.detach()  # Default value
+        # ============================================================
+        # 2. [XLA-Safe] Soft Mixing for Scheduled Sampling
+        # ============================================================
+        # Before: Random sampling with torch.rand() -> XLA recompilation
+        # After: Deterministic weighted combination -> Single graph
+        #
+        # Soft mixing formula:
+        #   effective_timestep = sampling_prob * GT + (1 - sampling_prob) * Pred
+        #
+        # Benefits:
+        # - Completely deterministic (no random number generation)
+        # - XLA-friendly (no graph structure changes)
+        # - Differentiable (gradients flow to both GT and Pred)
+        # - sampling_prob can change every step without recompilation
+        # ============================================================
         
         if self.training and gt_timestep is not None:
-            # sampling_prob가 0이어도 수식은 성립함 (use_gt_mask가 모두 False가 됨)
-            # Python 제어문 없이 순수 그래프 연산만 남김 -> XLA 컴파일 1회로 끝
-            rand_tensor = torch.rand(1, device=predicted_gate.device)
-            use_gt_mask = rand_tensor < sampling_prob
-            current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
+            # Soft mixing: weighted combination of GT and predicted
+            current_noise = sampling_prob * gt_timestep + (1.0 - sampling_prob) * predicted_gate.detach()
+        else:
+            # Inference: always use predicted gate
+            current_noise = predicted_gate.detach()
         
         # 3. Create noise embedding
         noise_vec = self.noise_emb(current_noise)
