@@ -52,21 +52,26 @@ class RDTTrainer:
             weight_decay=config['training']['weight_decay']
         )
         
-        # Scheduler
-        self.scheduler = self._create_scheduler()
-        
         # TPU 환경 감지 (표준 방식)
-        self.is_tpu = self.accelerator.state.distributed_type == DistributedType.TPU
+        self.is_tpu = self.accelerator.state.distributed_type == DistributedType.XLA
         
         # Weight tying 설정 (prepare 전에 실행)
         if hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
             model.output_projection.weight = model.token_embedding.weight
         
         # Accelerate에 모든 것을 위임 (GPU/TPU 구분 없이 표준 방식)
-        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = \
+        # Scheduler는 prepare 후에 생성하므로 여기서는 제외
+        self.model, self.optimizer, self.train_loader, self.val_loader = \
             self.accelerator.prepare(
-                model, self.optimizer, train_loader, val_loader, self.scheduler
+                model, self.optimizer, train_loader, val_loader
             )
+        
+        # Scheduler는 prepare 후에 생성 (prepare된 DataLoader 길이 사용)
+        self.scheduler = self._create_scheduler()
+        
+        # Scheduler도 prepare (선택사항이지만 권장)
+        if self.scheduler:
+            self.scheduler = self.accelerator.prepare(self.scheduler)
         
         # torch.compile (optional, 선택적으로 적용)
         # if hasattr(torch, 'compile') and self.accelerator.device.type == 'cuda':
@@ -174,22 +179,25 @@ class RDTTrainer:
         self.model.train()
         raw_model = self.accelerator.unwrap_model(self.model)
 
-        # 데이터 로드
-        input_tokens = batch['input'].to(self.accelerator.device)
-        targets = batch['targets'].to(self.accelerator.device)
-        attention_mask = batch['attention_mask'].to(self.accelerator.device)
-        loss_masks = batch['loss_masks'].to(self.accelerator.device)
-        gate_targets = batch['gate_targets'].to(self.accelerator.device)
-        chain_lengths = batch['chain_lengths'].to(self.accelerator.device)
+        # 데이터 로드 (prepare된 DataLoader는 이미 올바른 device에 배치됨)
+        input_tokens = batch['input']
+        targets = batch['targets']
+        attention_mask = batch['attention_mask']
+        loss_masks = batch['loss_masks']
+        gate_targets = batch['gate_targets']
+        chain_lengths = batch['chain_lengths']
         
         batch_size = input_tokens.shape[0]
         # [Standard Fix] Float를 Tensor로 변환하여 XLA 컴파일 최적화
         sampling_prob_val = self.get_sampling_prob(self.current_epoch, self.global_step)
         sampling_prob = torch.tensor(sampling_prob_val, device=self.accelerator.device)
 
+        # [TPU Optimization] max_length 계산
         if self.is_tpu:
+            # TPU: 고정 길이 사용하여 그래프 안정성 확보
             max_length = self.config['training']['max_chain_length']
         else:
+            # GPU: 동적 길이로 효율성 확보
             max_length = chain_lengths.max().item()
         
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
@@ -323,15 +331,19 @@ class RDTTrainer:
                 val_iter = tqdm(val_iter, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process)
             
             for batch in val_iter:
-                # 데이터 로드 (이미 전처리됨)
-                input_tokens = batch['input'].to(self.accelerator.device)
-                targets = batch['targets'].to(self.accelerator.device)
-                loss_masks = batch['loss_masks'].to(self.accelerator.device)
-                attention_mask = batch['attention_mask'].to(self.accelerator.device)
-                gate_targets = batch['gate_targets'].to(self.accelerator.device)
-                chain_lengths = batch['chain_lengths'].to(self.accelerator.device)
+                # 데이터 로드 (prepare된 DataLoader는 이미 올바른 device에 배치됨)
+                input_tokens = batch['input']
+                targets = batch['targets']
+                loss_masks = batch['loss_masks']
+                attention_mask = batch['attention_mask']
+                gate_targets = batch['gate_targets']
+                chain_lengths = batch['chain_lengths']
                 
-                actual_max_length = chain_lengths.max().item()
+                # [TPU Optimization] max_length 계산
+                if self.is_tpu:
+                    actual_max_length = self.config['training']['max_chain_length']
+                else:
+                    actual_max_length = chain_lengths.max().item()
                 # [최적화] 텐서로 누적 (매 스텝마다 .item() 호출하지 않음)
                 batch_recon_tensor = torch.tensor(0.0, device=self.accelerator.device)
                 batch_gate_tensor = torch.tensor(0.0, device=self.accelerator.device)
@@ -501,13 +513,17 @@ class RDTTrainer:
                             self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
                                       for k, v in log_data.items()}, step=self.global_step)
                         
-                        # Print logging when tqdm is disabled
-                        if not self.use_tqdm:
+                        # tqdm 업데이트 (이미 계산된 값 재사용)
+                        if self.use_tqdm:
+                            progress_bar.set_postfix({
+                                'step': self.global_step,
+                                'loss': f'{current_loss:.4f}',
+                                'recon': f'{current_recon:.4f}',
+                                'aux': f'{current_aux:.4f}'
+                            })
+                        else:
+                            # Print logging when tqdm is disabled
                             print(f"Epoch {epoch+1}/{self.num_epochs} | Step {self.global_step} | Loss: {current_loss:.4f} | Recon: {current_recon:.4f} | Gate: {current_gate:.4f} | Aux: {current_aux:.4f} | LR: {log_data['lr']:.6f}")
-                    
-                    # TQDM update (Logging 시점에만 수행)
-                    if self.use_tqdm:
-                        progress_bar.set_postfix({'loss': f'{current_loss:.4f}'})
             
             # Validation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
@@ -632,8 +648,16 @@ class RDTTrainer:
                         self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
                                   for k, v in log_data.items()}, step=step)
                     
-                    # Print logging when tqdm is disabled
-                    if not self.use_tqdm:
+                    # tqdm 업데이트 (이미 계산된 값 재사용)
+                    if self.use_tqdm:
+                        progress_bar.set_postfix({
+                            'step': step,
+                            'loss': f'{current_loss:.4f}',
+                            'recon': f'{current_recon:.4f}',
+                            'aux': f'{current_aux:.4f}'
+                        })
+                    else:
+                        # Print logging when tqdm is disabled
                         print(f"Epoch {epoch+1} | Step {step}/{self.max_training_steps} | Loss: {current_loss:.4f} | Recon: {current_recon:.4f} | Gate: {current_gate:.4f} | Aux: {current_aux:.4f} | LR: {log_data['lr']:.6f}")
                 
                 # Validation at regular step intervals
@@ -672,10 +696,6 @@ class RDTTrainer:
                     save_path = f"{self.checkpoint_dir}/checkpoint-step-{step}"
                     self.accelerator.save_state(save_path)
                     # cleanup_checkpoints는 필요시 별도 구현
-                
-                if self.use_tqdm:
-                    # tqdm도 로깅 시점에만 .item() 호출
-                    progress_bar.set_postfix({'step': step, 'loss': f'{loss.item():.4f}', 'recon': f'{recon.item():.4f}', 'aux': f'{aux.item():.4f}'})
             
             epoch += 1
         
