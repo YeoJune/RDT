@@ -38,8 +38,8 @@ class MetricCalculator:
         
         # Load GPT-2 Large for perplexity
         print("Loading GPT-2 Large for perplexity calculation...")
-        self.gpt2_model = GPT2LMHeadModel.from_pretrained('gpt2-small').to(device)
-        self.gpt2_tokenizer = GPT2TokenizerFast.from_pretrained('gpt2-small')
+        self.gpt2_model = GPT2LMHeadModel.from_pretrained('distilgpt2').to(device)
+        self.gpt2_tokenizer = GPT2TokenizerFast.from_pretrained('distilgpt2')
         self.gpt2_model.eval()
         
         self.smoothing = SmoothingFunction()
@@ -53,7 +53,7 @@ class MetricCalculator:
             predictions, 
             references, 
             lang='en', 
-            model_type='roberta-small',
+            model_type='distilroberta-base',
             device=self.device,
             batch_size=32,
             verbose=False
