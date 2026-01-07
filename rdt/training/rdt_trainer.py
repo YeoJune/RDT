@@ -79,9 +79,10 @@ class RDTTrainer:
             model, self.optimizer, self.scheduler
         )
         
-        # 2. 데이터로더는 TPU일 때 '수동'으로 분산 처리 (Accelerate Wrapper 제거)
-        if False:
-            
+        # 2. 데이터로더는 TPU일 때 '수동'으로 분산 처리
+        # Accelerate의 prepare()를 DataLoader에 사용하면 RNG state 동기화 에러 발생
+        # TPU에서는 순정 DataLoader + DistributedSampler만 사용
+        if self.is_tpu:
             from torch.utils.data.distributed import DistributedSampler
             
             # [Train Loader 재구성]
