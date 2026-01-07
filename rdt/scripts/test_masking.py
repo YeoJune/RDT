@@ -38,8 +38,8 @@ class MetricCalculator:
         
         # Load GPT-2 Large for perplexity
         print("Loading GPT-2 Large for perplexity calculation...")
-        self.gpt2_model = GPT2LMHeadModel.from_pretrained('gpt2-large').to(device)
-        self.gpt2_tokenizer = GPT2TokenizerFast.from_pretrained('gpt2-large')
+        self.gpt2_model = GPT2LMHeadModel.from_pretrained('gpt2-small').to(device)
+        self.gpt2_tokenizer = GPT2TokenizerFast.from_pretrained('gpt2-small')
         self.gpt2_model.eval()
         
         self.smoothing = SmoothingFunction()
@@ -53,7 +53,7 @@ class MetricCalculator:
             predictions, 
             references, 
             lang='en', 
-            model_type='roberta-large',
+            model_type='roberta-small',
             device=self.device,
             batch_size=32,
             verbose=False
@@ -1103,8 +1103,8 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             d_ff=config['model']['d_ff'],
             dropout=config['model']['dropout'],
             max_seq_len=config['data']['max_seq_length'],
-            input_mlp_hidden=config['model'].get('input_mlp_hidden', [512]),
-            output_mlp_hidden=config['model'].get('output_mlp_hidden', [512]),
+            input_processor_layers=config['model'].get('input_processor_layers', 1),
+            output_processor_layers=config['model'].get('output_processor_layers', 1),
             gate_hidden_dim=config['model']['gate_hidden_dim'],
             gate_num_layers=config['model']['gate_num_layers'],
             gate_num_heads=config['model']['gate_num_heads'],
@@ -1113,6 +1113,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
         
+        model = torch.compile(model)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
         model.eval()
