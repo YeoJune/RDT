@@ -55,8 +55,10 @@ class RDTTrainer:
         # TPU 환경 감지 (표준 방식)
         self.is_tpu = self.accelerator.state.distributed_type == DistributedType.XLA
         
-        # Weight tying 설정 (prepare 전에 실행)
-        if hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
+        # [1차] Weight tying 설정 (prepare 전 - optimizer 생성을 위해 필요)
+        if hasattr(model, 'tie_weights'):
+            model.tie_weights()
+        elif hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
             model.output_projection.weight = model.token_embedding.weight
         
         # Accelerate에 모든 것을 위임 (GPU/TPU 구분 없이 표준 방식)
@@ -65,6 +67,14 @@ class RDTTrainer:
             self.accelerator.prepare(
                 model, self.optimizer, train_loader, val_loader
             )
+        
+        # [2차] Weight tying 재적용 (prepare 후 - wrapper 내부에서 다시 적용)
+        # DDP/FSDP wrapping으로 인해 weight sharing이 깨질 수 있으므로 다시 설정
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        if hasattr(unwrapped_model, 'tie_weights'):
+            unwrapped_model.tie_weights()
+        elif hasattr(unwrapped_model, 'output_projection') and hasattr(unwrapped_model, 'token_embedding'):
+            unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
         
         # Scheduler는 prepare 후에 생성 (prepare된 DataLoader 길이 사용)
         self.scheduler = self._create_scheduler()
@@ -122,6 +132,20 @@ class RDTTrainer:
             num_params_no_context = count_parameters_without_context(unwrapped_model)
             print(f"Model parameters: {num_params:,}")
             print(f"Model parameters (without context): {num_params_no_context:,}")
+            
+            # Weight tying 검증
+            if hasattr(unwrapped_model, 'output_projection') and hasattr(unwrapped_model, 'token_embedding'):
+                is_tied = unwrapped_model.output_projection.weight is unwrapped_model.token_embedding.weight
+                print(f"Weight tying: {'✓ Enabled' if is_tied else '✗ WARNING: Failed!'}")
+                if not is_tied:
+                    print("WARNING: Weight tying verification failed! Re-applying...")
+                    if hasattr(unwrapped_model, 'tie_weights'):
+                        unwrapped_model.tie_weights()
+                    else:
+                        unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
+                    # 재검증
+                    is_tied = unwrapped_model.output_projection.weight is unwrapped_model.token_embedding.weight
+                    print(f"After re-apply: {'✓ Success' if is_tied else '✗ Still Failed'}")
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""
@@ -366,7 +390,8 @@ class RDTTrainer:
                 
                 for step_idx in range(actual_max_length):
                     valid_mask = chain_lengths > step_idx
-                    if valid_mask.sum() == 0:
+                    # [TPU Consistency] train_step과 동일한 패턴 적용
+                    if not self.is_tpu and valid_mask.sum() == 0:
                         break
                     
                     # Forward step
@@ -412,12 +437,28 @@ class RDTTrainer:
                     num_batches += 1
         
         if num_batches == 0:
-            return 0, 0, 0
+            return 0.0, 0.0, 0.0
+        
+        # [Distributed Validation] 모든 프로세스에서 값을 수집하여 평균 계산
+        # 이렇게 하면 전체 validation set의 정확한 평균을 얻을 수 있음
+        total_loss_tensor = torch.tensor(total_loss, device=self.accelerator.device)
+        total_recon_tensor = torch.tensor(total_recon, device=self.accelerator.device)
+        total_gate_tensor = torch.tensor(total_gate, device=self.accelerator.device)
+        num_batches_tensor = torch.tensor(num_batches, device=self.accelerator.device)
+        
+        # gather: 모든 프로세스의 값을 수집
+        total_loss_tensor = self.accelerator.gather(total_loss_tensor).mean()
+        total_recon_tensor = self.accelerator.gather(total_recon_tensor).mean()
+        total_gate_tensor = self.accelerator.gather(total_gate_tensor).mean()
+        num_batches_tensor = self.accelerator.gather(num_batches_tensor).sum()
+        
+        if num_batches_tensor == 0:
+            return 0.0, 0.0, 0.0
         
         return (
-            total_loss / num_batches,
-            total_recon / num_batches,
-            total_gate / num_batches
+            total_loss_tensor.item(),
+            total_recon_tensor.item(),
+            total_gate_tensor.item()
         )
 
     def train(self):
