@@ -343,10 +343,10 @@ class RDTTrainer:
         # Accelerate가 gradient accumulation을 자동 처리하므로 scaling 불필요
         # backward는 train loop에서 accumulate 컨텍스트 내에서 호출됨
         
-        # [수정] .item() 제거! 텐서 그대로 반환해야 파이프라인이 안 끊김
-        # CPU로 값을 가져오지 말고 TPU 메모리에 둔 채로 레퍼런스만 넘깁니다.
+        # [중요] loss는 detach하지 않고 그대로 반환 (backward 필요)
+        # logging용 텐서들만 detach
         return (
-            final_loss.detach(),
+            final_loss,
             (total_recon_loss_tensor / num_valid_steps).detach(),
             (total_gate_loss_tensor / num_valid_steps).detach(),
             (total_aux_loss_tensor / num_aux_steps).detach() if num_aux_steps > 0 else torch.tensor(0.0, device=self.accelerator.device)
