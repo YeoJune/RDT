@@ -92,7 +92,7 @@ data:
 
   # DataLoader
   num_workers: 0
-  pin_memory: true
+  pin_memory: false
   cache_dir: "./data_cache"
 
 # Logging & Checkpoints
