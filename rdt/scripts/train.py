@@ -46,7 +46,9 @@ def main():
             project_dir=config['output']['log_dir'],
             logging_dir=config['output']['log_dir']
         ),
-        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1)
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
+        # TPU RNG 동기화 문제 해결: even_batches를 False로 설정
+        even_batches=False
     )
 
     if config.get('use_wandb', True):

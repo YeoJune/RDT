@@ -56,76 +56,13 @@ class RDTTrainer:
         # Scheduler
         self.scheduler = self._create_scheduler()
         
-        # TPU 환경 감지 (prepare 전에 미리 확인)
+        # TPU 환경 감지
         self.is_tpu = self.accelerator.device.type == 'xla' or (hasattr(self.accelerator.state, "distributed_type") and self.accelerator.state.distributed_type == "TPU")
         
-        # TPU 관련 모듈을 초기화 시점에 한 번만 임포트 (성능 최적화)
-        self.xm = None
-        self.xr = None
-        self.pl = None
-        if self.is_tpu:
-            try:
-                import torch_xla.core.xla_model as xm
-                import torch_xla.runtime as xr
-                import torch_xla.distributed.parallel_loader as pl
-                self.xm = xm
-                self.xr = xr
-                self.pl = pl
-            except ImportError:
-                raise ImportError("torch_xla is required for TPU training but not installed.")
-        
-        # 1. 모델, 옵티마이저, 스케줄러만 Accelerate로 준비 (로더 제외!)
-        self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
-            model, self.optimizer, self.scheduler
+        # 모든 구성요소를 Accelerate에 맡김 (자동 처리)
+        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = self.accelerator.prepare(
+            model, self.optimizer, train_loader, val_loader, self.scheduler
         )
-        
-        # 2. 데이터로더는 TPU일 때 '수동'으로 분산 처리
-        # Accelerate의 prepare()를 DataLoader에 사용하면 RNG state 동기화 에러 발생
-        # TPU에서는 순정 DataLoader + DistributedSampler만 사용
-        if self.is_tpu:
-            from torch.utils.data.distributed import DistributedSampler
-            
-            # [Train Loader 재구성]
-            # Accelerate Wrapper 대신 순정 DataLoader + DistributedSampler 사용
-            train_sampler = DistributedSampler(
-                train_loader.dataset,
-                num_replicas=self.xr.world_size(),
-                rank=self.xr.global_ordinal(),
-                shuffle=True,
-                drop_last=True
-            )
-            self.train_loader = DataLoader(
-                train_loader.dataset,
-                batch_size=train_loader.batch_size,
-                sampler=train_sampler,
-                num_workers=train_loader.num_workers,
-                collate_fn=train_loader.collate_fn,
-                pin_memory=train_loader.pin_memory,
-                drop_last=train_loader.drop_last
-            )
-            
-            # [Val Loader 재구성]
-            val_sampler = DistributedSampler(
-                val_loader.dataset,
-                num_replicas=self.xr.world_size(),
-                rank=self.xr.global_ordinal(),
-                shuffle=False,
-                drop_last=True
-            )
-            self.val_loader = DataLoader(
-                val_loader.dataset,
-                batch_size=val_loader.batch_size,
-                sampler=val_sampler,
-                num_workers=val_loader.num_workers,
-                collate_fn=val_loader.collate_fn,
-                pin_memory=val_loader.pin_memory,
-                drop_last=val_loader.drop_last
-            )
-        else:
-            # GPU/CPU일 때는 Accelerate가 알아서 잘 하므로 맡김
-            self.train_loader, self.val_loader = self.accelerator.prepare(
-                train_loader, val_loader
-            )
         
         # Unwrap을 통해 원본 모델 접근 후 재할당
         unwrapped_model = self.accelerator.unwrap_model(self.model)
