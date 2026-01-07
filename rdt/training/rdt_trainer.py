@@ -358,8 +358,8 @@ class RDTTrainer:
         
         # 4. [필수] mark_step (Backward 직후): 여기서 미분 계산을 실행하라고 TPU에 명령
         # 이걸 안 하면 Accumulation 동안 그래프가 메모리에 계속 쌓여서 OOM 남
-        # if self.is_tpu and self.xm:
-        #     self.xm.mark_step()
+        if self.is_tpu and self.xm:
+            self.xm.mark_step()
         
         # 5. 조건부 Update (Accumulation이 찼을 때만 수행)
         # self.global_step은 현재 완료된 배치가 아니라 '시작 전' 카운트이므로 +1 해서 체크
@@ -370,8 +370,8 @@ class RDTTrainer:
             self.optimizer.step()
             
             # 6. [필수] mark_step (Update 직후): 가중치 갱신 실행 명령
-            if self.is_tpu and self.xm:
-                self.xm.mark_step()
+            # if self.is_tpu and self.xm:
+            #     self.xm.mark_step()
             
             self.optimizer.zero_grad()
             
