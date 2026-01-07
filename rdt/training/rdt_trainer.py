@@ -337,11 +337,13 @@ class RDTTrainer:
         
         # --- Gradient Accumulation Logic ---
         
-        # Loss 평균 계산 (최종 loss)
+        # 1. Loss 평균 계산
         final_loss = accumulated_loss / num_valid_steps
         
-        # Accelerate가 gradient accumulation을 자동 처리하므로 scaling 불필요
-        # backward는 train loop에서 accumulate 컨텍스트 내에서 호출됨
+        # 2. Gradient Accumulation Scaling
+        # Accelerate의 accumulate()는 자동 스케일링하지 않으므로 수동으로 나눔
+        if self.gradient_accumulation_steps > 1:
+            final_loss = final_loss / self.gradient_accumulation_steps
         
         # [중요] loss는 detach하지 않고 그대로 반환 (backward 필요)
         # logging용 텐서들만 detach
@@ -522,8 +524,8 @@ class RDTTrainer:
                 
                 if self.global_step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
                     # [핵심] 로그 찍는 순간에만 .item() 호출해서 값 가져옴
-                    # 이렇게 해야 N steps 마다 한 번만 멈추고, 나머지는 전속력으로 달림
-                    current_loss = loss.item()
+                    # loss는 scaling 되었으므로 실제 loss를 보려면 다시 곱해줌
+                    current_loss = loss.item() * self.gradient_accumulation_steps if self.gradient_accumulation_steps > 1 else loss.item()
                     current_recon = recon.item()
                     current_gate = gate.item()
                     current_aux = aux.item()
@@ -655,7 +657,8 @@ class RDTTrainer:
                 
                 if step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
                     # [핵심] 여기서만 .item() 호출
-                    current_loss = loss.item()
+                    # loss는 scaling 되었으므로 실제 loss를 보려면 다시 곱해줌
+                    current_loss = loss.item() * self.gradient_accumulation_steps if self.gradient_accumulation_steps > 1 else loss.item()
                     current_recon = recon.item()
                     current_gate = gate.item()
                     current_aux = aux.item()
