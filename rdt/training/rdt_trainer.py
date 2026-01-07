@@ -560,14 +560,25 @@ class RDTTrainer:
                 epoch_aux += aux
                 
                 self.global_step += 1
-                
+                # 1. 모든 프로세스가 다 같이 .item()을 호출해서 싱크를 맞춘다 (필수!)
+                # 이렇게 해야 Rank 0이 기다리지 않고 데이터를 받아올 수 있어.
+                current_loss = loss.item()
+                current_recon = recon.item()
+                current_gate = gate.item()
+                current_aux = aux.item()
+
+                # 2. 출력은 메인 프로세스만 조용히 처리
                 if self.global_step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
-                    # [핵심] 로그 찍는 순간에만 .item() 호출해서 값 가져옴
-                    # 이렇게 해야 N steps 마다 한 번만 멈추고, 나머지는 전속력으로 달림
-                    current_loss = loss.item()
-                    current_recon = recon.item()
-                    current_gate = gate.item()
-                    current_aux = aux.item()
+                    log_data = {
+                        'epoch': epoch,
+                        'step': self.global_step,
+                        'loss': current_loss,
+                        'recon_loss': current_recon,
+                        'gate_loss': current_gate,
+                        'aux_loss': current_aux,
+                        'lr': self.optimizer.param_groups[0]['lr'],
+                        'sampling_prob': sampling_prob
+                    }
 
                     log_data = {
                         'epoch': epoch,
