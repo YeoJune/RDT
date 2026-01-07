@@ -520,6 +520,11 @@ class RDTTrainer:
                 # [Standard Fix] 루프 내 불필요한 연산 및 동기화 제거
                 # epoch_loss += loss.item()  <-- 삭제 (매 스텝 Sync 유발)
                 # epoch_loss += loss.detach() <-- 삭제 (그래프 폭발 유발)
+
+
+                if self.is_tpu:
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
                 
                 self.global_step += 1
                 
