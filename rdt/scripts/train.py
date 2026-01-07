@@ -4,10 +4,25 @@ import argparse
 from pathlib import Path
 import torch
 from transformers import AutoTokenizer
-from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
 import os
 import sys
+
+# ===== 최우선: Accelerate import 전에 TPU 단일 디바이스 강제 =====
+os.environ["TPU_NUM_DEVICES"] = "1"
+os.environ["XLA_USE_BF16"] = "0"
+
+# XLA 디바이스 강제 초기화
+import torch_xla
+import torch_xla.core.xla_model as xm
+
+# 단일 디바이스만 사용하도록 강제
+def get_single_xla_device():
+    """Force single XLA device usage"""
+    return xm.xla_device()
+
+# Accelerate import (이제 단일 디바이스만 인식할 것)
+from accelerate import Accelerator
 
 from rdt.models import RDT, MLM
 from rdt.models.cmlm import CMLM
@@ -39,7 +54,11 @@ def main():
         override_config = load_config(args.override)
         config = merge_configs(config, override_config)
     
-    # Accelerator 초기화 (단일 프로세스)
+    # 단일 디바이스 강제
+    device = get_single_xla_device()
+    print(f"\n[FORCED] Using single XLA device: {device}")
+    
+    # Accelerator 초기화
     accelerator = Accelerator(
         log_with="wandb" if config.get('use_wandb', True) else None,
         project_config=ProjectConfiguration(
@@ -62,6 +81,11 @@ def main():
         print(f"Accelerator Device: {accelerator.device}")
         print(f"Mixed Precision: {accelerator.mixed_precision}")
         print(f"Num Processes: {accelerator.num_processes}")
+        
+        # 경고: 8개 프로세스 감지되면
+        if accelerator.num_processes > 1:
+            print(f"\n⚠️  WARNING: Accelerator detected {accelerator.num_processes} processes")
+            print(f"⚠️  This will likely HANG. Forcing single device usage...")
     
     set_seed(config['seed'])
     
