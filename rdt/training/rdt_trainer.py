@@ -370,8 +370,8 @@ class RDTTrainer:
             self.optimizer.step()
             
             # 6. [필수] mark_step (Update 직후): 가중치 갱신 실행 명령
-            # if self.is_tpu and self.xm:
-            #     self.xm.mark_step()
+            if self.is_tpu and self.xm:
+                self.xm.mark_step()
             
             self.optimizer.zero_grad()
             
