@@ -39,7 +39,7 @@ model:
 # Training Strategy
 training:
   # Chain & Masking
-  max_chain_length: 1 # L: length of training segment
+  max_chain_length: 2 # L: length of training segment
   total_steps: 20 # N: total denoising steps (100% → 0%)
   masking_strategy: "shuffle" # 'shuffle' (index-based)
   visible_loss_ratio: 0.05 # Visible 중에서도 loss 계산할 비율 (안정화)
