@@ -910,7 +910,8 @@ class RDT(nn.Module):
         
         if self.training and gt_timestep is not None:
             # Soft mixing: weighted combination of GT and predicted
-            current_noise = sampling_prob * gt_timestep + (1.0 - sampling_prob) * predicted_gate.detach()
+            # Both GT and predicted are detached to stop gradient flow into noise_emb
+            current_noise = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * predicted_gate.detach()
         else:
             # Inference: always use predicted gate
             current_noise = predicted_gate.detach()
