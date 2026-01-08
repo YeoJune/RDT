@@ -329,8 +329,25 @@ class MLMTrainer:
                 total_accuracy += accuracy.item()
                 num_batches += 1
         
-        avg_loss = total_loss / num_batches
-        avg_accuracy = total_accuracy / num_batches
+        if num_batches == 0:
+            return {'val_loss': 0.0, 'val_accuracy': 0.0}
+        
+        # [Distributed Validation] 각 프로세스의 결과를 수집하여 평균 계산
+        total_loss_tensor = torch.tensor(total_loss, device=self.accelerator.device)
+        total_accuracy_tensor = torch.tensor(total_accuracy, device=self.accelerator.device)
+        num_batches_tensor = torch.tensor(num_batches, device=self.accelerator.device)
+        
+        # gather: 모든 프로세스의 값을 수집 (sum으로 통합)
+        total_loss_tensor = self.accelerator.gather(total_loss_tensor).sum()
+        total_accuracy_tensor = self.accelerator.gather(total_accuracy_tensor).sum()
+        num_batches_tensor = self.accelerator.gather(num_batches_tensor).sum()
+        
+        if num_batches_tensor == 0:
+            return {'val_loss': 0.0, 'val_accuracy': 0.0}
+        
+        # 전체 배치 수로 나누어 최종 평균 계산 (단 한 번만)
+        avg_loss = (total_loss_tensor / num_batches_tensor).item()
+        avg_accuracy = (total_accuracy_tensor / num_batches_tensor).item()
         
         return {
             'val_loss': avg_loss,
@@ -381,8 +398,25 @@ class MLMTrainer:
                 total_accuracy += accuracy.item()
                 num_batches += 1
         
-        avg_loss = total_loss / num_batches
-        avg_accuracy = total_accuracy / num_batches
+        if num_batches == 0:
+            return {'val_loss': 0.0, 'val_accuracy': 0.0}
+        
+        # [Distributed Validation] 각 프로세스의 결과를 수집하여 평균 계산
+        total_loss_tensor = torch.tensor(total_loss, device=self.accelerator.device)
+        total_accuracy_tensor = torch.tensor(total_accuracy, device=self.accelerator.device)
+        num_batches_tensor = torch.tensor(num_batches, device=self.accelerator.device)
+        
+        # gather: 모든 프로세스의 값을 수집 (sum으로 통합)
+        total_loss_tensor = self.accelerator.gather(total_loss_tensor).sum()
+        total_accuracy_tensor = self.accelerator.gather(total_accuracy_tensor).sum()
+        num_batches_tensor = self.accelerator.gather(num_batches_tensor).sum()
+        
+        if num_batches_tensor == 0:
+            return {'val_loss': 0.0, 'val_accuracy': 0.0}
+        
+        # 전체 배치 수로 나누어 최종 평균 계산 (단 한 번만)
+        avg_loss = (total_loss_tensor / num_batches_tensor).item()
+        avg_accuracy = (total_accuracy_tensor / num_batches_tensor).item()
         
         return {
             'val_loss': avg_loss,
@@ -463,13 +497,31 @@ class MLMTrainer:
                 total_tokens += num_valid_tokens
                 num_batches += 1
         
-        # Final Metrics
-        if total_tokens > 0:
-            avg_elbo = total_elbo / total_tokens
+        if num_batches == 0 or total_tokens == 0:
+            return {'val_loss': 0.0, 'val_accuracy': 0.0, 'mc_samples': num_mc_samples}
+        
+        # [Distributed Validation] 각 프로세스의 결과를 수집하여 평균 계산
+        total_elbo_tensor = torch.tensor(total_elbo, device=self.accelerator.device)
+        total_accuracy_tensor = torch.tensor(total_accuracy, device=self.accelerator.device)
+        total_tokens_tensor = torch.tensor(total_tokens, device=self.accelerator.device)
+        num_batches_tensor = torch.tensor(num_batches, device=self.accelerator.device)
+        
+        # gather: 모든 프로세스의 값을 수집 (sum으로 통합)
+        total_elbo_tensor = self.accelerator.gather(total_elbo_tensor).sum()
+        total_accuracy_tensor = self.accelerator.gather(total_accuracy_tensor).sum()
+        total_tokens_tensor = self.accelerator.gather(total_tokens_tensor).sum()
+        num_batches_tensor = self.accelerator.gather(num_batches_tensor).sum()
+        
+        # Final Metrics (전체 프로세스 통합 후 계산)
+        if total_tokens_tensor > 0:
+            avg_elbo = (total_elbo_tensor / total_tokens_tensor).item()
         else:
             avg_elbo = 0.0
             
-        avg_accuracy = total_accuracy / max(1, num_batches)
+        if num_batches_tensor > 0:
+            avg_accuracy = (total_accuracy_tensor / num_batches_tensor).item()
+        else:
+            avg_accuracy = 0.0
         
         return {
             'val_loss': avg_elbo,     # Weighted NLL (Train Loss와 비교용)
