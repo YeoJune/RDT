@@ -74,8 +74,8 @@ class RDTPreprocessor:
         # 4. Input Generation (s_0)
         input_steps = start_steps
         visible_ratios = 1.0 - (input_steps.float() / self.total_steps)
-        # 실제 토큰 개수 기준으로 visible_counts 계산
-        visible_counts = (visible_ratios.unsqueeze(1) * actual_lengths.unsqueeze(1)).long()
+        # 실제 토큰 개수 기준으로 visible_counts 계산 [B]
+        visible_counts = (visible_ratios * actual_lengths).long()
         
         is_masked = restore_ranks >= visible_counts.unsqueeze(1)
         is_masked = is_masked & (attention_mask.bool()) # 패딩은 마스킹 제외
@@ -110,9 +110,11 @@ class RDTPreprocessor:
             curr_visible_ratios = 1.0 - (start_steps - i).float() / self.total_steps
             target_visible_ratios = 1.0 - target_steps.float() / self.total_steps
             
-            curr_visible_counts = (curr_visible_ratios.unsqueeze(1) * actual_lengths.unsqueeze(1)).long()
-            target_visible_counts = (target_visible_ratios.unsqueeze(1) * actual_lengths.unsqueeze(1)).long()
+            # [B] shape - 각 샘플별 visible 토큰 개수
+            curr_visible_counts = (curr_visible_ratios * actual_lengths).long()
+            target_visible_counts = (target_visible_ratios * actual_lengths).long()
             
+            # [B, 1] shape로 확장하여 [B, L]과 비교 가능하도록
             lower_bound = curr_visible_counts.unsqueeze(1)
             upper_bound = target_visible_counts.unsqueeze(1)
             
