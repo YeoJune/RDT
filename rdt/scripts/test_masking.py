@@ -1133,7 +1133,6 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
         
-        model = torch.compile(model)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
         model.eval()
