@@ -1141,20 +1141,52 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
         
-        state_dict = checkpoint['model_state_dict']
+        # [수정된 강력한 로딩 로직]
+        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+        
+        # 키 매핑을 위한 임시 딕셔너리 생성
         new_state_dict = {}
         for key, value in state_dict.items():
-            if key.startswith('_orig_mod.'):
-                new_key = key[len('_orig_mod.'):]
-                new_state_dict[new_key] = value
-            else:
-                new_state_dict[key] = value
+            new_key = key
+            # 1. _orig_mod. 제거 (torch.compile)
+            if new_key.startswith('_orig_mod.'):
+                new_key = new_key.replace('_orig_mod.', '')
+            # 2. module. 제거 (DDP/DataParallel)
+            if new_key.startswith('module.'):
+                new_key = new_key.replace('module.', '')
+            
+            new_state_dict[new_key] = value
         
-        model.load_state_dict(new_state_dict, strict=False)
+        # strict=False로 로드하되, 결과를 받아서 검증
+        load_result = model.load_state_dict(new_state_dict, strict=False)
+        
+        print("\n" + "="*40)
+        print("Checkpoint Loading Report")
+        print("="*40)
+        
+        # 누락된 키가 있는지 확인 (Missing Keys)
+        if len(load_result.missing_keys) > 0:
+            print(f"⚠️  WARNING: {len(load_result.missing_keys)} keys are missing!")
+            # 일부 키만 출력 (너무 많을 수 있으므로)
+            print(f"Examples: {load_result.missing_keys[:5]}")
+            
+            # 중요 파라미터가 누락되었는지 체크
+            if any('encoder_layers' in k for k in load_result.missing_keys):
+                print("❌ CRITICAL: Encoder layers not loaded. The model is effectively untreated.")
+        else:
+            print("✅ All model keys matched successfully.")
+            
+        # 예상치 못한 키가 있는지 확인 (Unexpected Keys)
+        if len(load_result.unexpected_keys) > 0:
+            print(f"ℹ️  Info: {len(load_result.unexpected_keys)} unexpected keys in checkpoint (usually fine).")
+        
         model = model.to(device)
 
         # CRITICAL: Weight tying 복원 (.to() 이후 다시 적용)
-        model.output_projection.weight = model.token_embedding.weight
+        # RDT 모델인 경우에만 적용
+        if hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
+            model.output_projection.weight = model.token_embedding.weight
+            print("✅ Weight tying reapplied.")
 
         # 검증
         is_tied = model.output_projection.weight is model.token_embedding.weight
