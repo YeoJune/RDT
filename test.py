@@ -191,6 +191,8 @@ def main():
                         help='Number of training epochs (default: 50)')
     parser.add_argument('--output_dir', type=str, default='test_outputs',
                         help='Output directory for checkpoints and results')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Override batch size for testing (default: use config value)')
     
     args = parser.parse_args()
     
@@ -203,6 +205,10 @@ def main():
     config['output']['checkpoint_dir'] = f"{args.output_dir}/checkpoints"
     config['output']['log_dir'] = f"{args.output_dir}/logs"
     config['use_wandb'] = False  # Disable wandb for testing
+    
+    # Override batch size if specified
+    if args.batch_size is not None:
+        config['training']['batch_size'] = args.batch_size
     
     # Set seed
     set_seed(config['seed'])
@@ -286,6 +292,9 @@ def main():
     print("\nStep 3: Training model (overfitting)...")
     trainer.train()
     
+    # End training properly (like train.py)
+    accelerator.end_training()
+    
     print(f"\nTraining completed!")
     print(f"Checkpoints saved to: {config['output']['checkpoint_dir']}")
     
@@ -295,23 +304,23 @@ def main():
     print("\nStep 4: Testing with different masking ratios...")
     
     # Get test texts (same as training data for overfitting check)
+    # Use the exact same method as test_masking.py's load_test_texts_rdt
     test_texts = []
-    for idx in indices:
-        sample = full_dataset.data[idx]
-        tokens = sample['input_ids']
+    for tokens in [full_dataset.tokenized_data[idx] for idx in indices]:
         text = tokenizer.decode(tokens, skip_special_tokens=True)
-        test_texts.append(text)
+        if len(text) > 50:  # Same filtering as test_masking.py
+            test_texts.append(text)
     
     print(f"Number of test texts: {len(test_texts)}")
     
-    # Masking ratios from 0% to 100%
+    # Masking ratios from 0% to 100% (same as test_masking.py default)
     mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     
-    # Get trained model (unwrap if needed)
+    # Get trained model (unwrap exactly like test_masking.py)
     trained_model = accelerator.unwrap_model(trainer.model)
     trained_model.eval()
     
-    # Run test-masking
+    # Run test-masking (exactly like test_masking.py)
     results = test_rdt_model(
         model=trained_model,
         tokenizer=tokenizer,
@@ -321,7 +330,7 @@ def main():
         max_seq_len=config['data']['max_seq_length'],
         max_steps=config['training']['total_steps'],
         threshold=config['model']['threshold'],
-        batch_size=config['training']['batch_size']
+        batch_size=args.batch_size if args.batch_size is not None else config['training']['batch_size']
     )
     
     # =========================================================================
