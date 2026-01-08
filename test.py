@@ -147,7 +147,9 @@ def main():
     
     # Load model
     print(f"\nLoading model from {args.checkpoint}...")
-    checkpoint = torch.load(args.checkpoint, map_location='cpu')
+    
+    from pathlib import Path
+    checkpoint_path = Path(args.checkpoint)
     
     model = RDT(
         vocab_size=tokenizer.vocab_size,
@@ -167,8 +169,22 @@ def main():
         gradient_checkpointing=False
     )
     
+    # Check if checkpoint is a directory or file
+    if checkpoint_path.is_dir():
+        # Load from accelerator saved directory
+        safetensors_path = checkpoint_path / 'model.safetensors'
+        if safetensors_path.exists():
+            from safetensors.torch import load_file
+            state_dict = load_file(str(safetensors_path))
+            print(f"Loaded from {safetensors_path}")
+        else:
+            raise FileNotFoundError(f"No model.safetensors found in {checkpoint_path}")
+    else:
+        # Load from .pt file
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        state_dict = checkpoint['model_state_dict']
+    
     # Handle _orig_mod prefix
-    state_dict = checkpoint['model_state_dict']
     new_state_dict = {}
     for key, value in state_dict.items():
         if key.startswith('_orig_mod.'):
