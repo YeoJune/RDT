@@ -1051,7 +1051,7 @@ class RDT(nn.Module):
                 steps_taken[active_mask] += 1
                 step += 1
             
-            # Decode final hidden states
+            # Decode final hidden states (once at the end)
             logits = self.decode(final_hidden, attention_mask)
             output_tokens = logits.argmax(dim=-1)
         
@@ -1060,3 +1060,11 @@ class RDT(nn.Module):
         else:
             # Return mean steps for backward compatibility
             return output_tokens, steps_taken.mean().item()
+    
+    def tie_weights(self):
+        """Tie output projection weights with token embedding"""
+        self.output_projection.weight = self.token_embedding.weight
+    
+    def count_parameters(self):
+        """Count total trainable parameters"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

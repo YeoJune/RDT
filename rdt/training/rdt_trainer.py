@@ -478,25 +478,26 @@ class RDTTrainer:
             return 0.0, 0.0, 0.0
         
         # [Distributed Validation] 모든 프로세스에서 값을 수집하여 평균 계산
-        # 이렇게 하면 전체 validation set의 정확한 평균을 얻을 수 있음
+        # 각 프로세스는 배치들의 평균을 누적했으므로 (total_loss / num_batches)로 정규화
         total_loss_tensor = torch.tensor(total_loss, device=self.accelerator.device)
         total_recon_tensor = torch.tensor(total_recon, device=self.accelerator.device)
         total_gate_tensor = torch.tensor(total_gate, device=self.accelerator.device)
         num_batches_tensor = torch.tensor(num_batches, device=self.accelerator.device)
         
-        # gather: 모든 프로세스의 값을 수집
-        total_loss_tensor = self.accelerator.gather(total_loss_tensor).mean()
-        total_recon_tensor = self.accelerator.gather(total_recon_tensor).mean()
-        total_gate_tensor = self.accelerator.gather(total_gate_tensor).mean()
+        # gather: 모든 프로세스의 값을 수집 (sum으로 통합)
+        total_loss_tensor = self.accelerator.gather(total_loss_tensor).sum()
+        total_recon_tensor = self.accelerator.gather(total_recon_tensor).sum()
+        total_gate_tensor = self.accelerator.gather(total_gate_tensor).sum()
         num_batches_tensor = self.accelerator.gather(num_batches_tensor).sum()
         
         if num_batches_tensor == 0:
             return 0.0, 0.0, 0.0
         
+        # 전체 배치 수로 나누어 최종 평균 계산 (단 한 번만)
         return (
-            total_loss_tensor.item(),
-            total_recon_tensor.item(),
-            total_gate_tensor.item()
+            (total_loss_tensor / num_batches_tensor).item(),
+            (total_recon_tensor / num_batches_tensor).item(),
+            (total_gate_tensor / num_batches_tensor).item()
         )
 
     def train(self):

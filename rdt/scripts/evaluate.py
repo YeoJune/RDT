@@ -73,8 +73,6 @@ def main():
     
     if model_type == 'rdt':
         # Load RDT model
-        from rdt.data.rdt_preprocessor import RDTPreprocessor
-        
         tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
         vocab_size = tokenizer.vocab_size
         
@@ -82,24 +80,37 @@ def main():
         checkpoint = load_checkpoint(args.checkpoint, model)
         print(f"Model loaded from epoch {checkpoint.get('epoch', 'N/A')}, step {checkpoint.get('step', 'N/A')}")
         
-        # Create preprocessor
-        preprocessor = RDTPreprocessor(tokenizer, config).to(device)
+        # Store tokenizer info in model for evaluation
+        model.mask_token_id = tokenizer.mask_token_id
+        model.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        model.vocab_size = vocab_size
         
-        # Create dataloader
+        # Create dataloader WITHOUT preprocessor
+        # Evaluation tests actual inference capability (no intermediate targets)
         print(f"\nPreparing RDT {args.split} data...")
-        # Temporarily override split in config
-        original_split = config['data'].get('split', 'train')
-        config['data']['split'] = args.split
+        from rdt.data.datasets import WikiTextDataset, simple_collate_fn
+        from torch.utils.data import DataLoader
         
-        if args.split == 'train':
-            dataloader, _ = create_dataloaders(config)
-        elif args.split == 'validation':
-            _, dataloader = create_dataloaders(config)
-        else:  # test
-            # For test, use validation loader structure but with test split
-            _, dataloader = create_dataloaders(config)
+        # Create dataset
+        dataset = WikiTextDataset(
+            dataset_name=config['data']['dataset_name'],
+            tokenizer_name=config['data']['tokenizer_name'],
+            max_seq_length=config['data']['max_seq_length'],
+            split=args.split,
+            samples_per_text=1,
+            max_val_samples=config['data'].get('max_val_samples', 5000),
+            max_test_samples=config['data'].get('max_test_samples', 10000)
+        )
         
-        config['data']['split'] = original_split
+        # Use simple collate function (no preprocessing)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config['training']['batch_size'],
+            shuffle=False,
+            num_workers=config['data']['num_workers'],
+            pin_memory=config['data']['pin_memory'],
+            collate_fn=lambda batch: simple_collate_fn(batch, pad_token_id=model.pad_token_id)
+        )
         
     elif model_type == 'mlm':
         # Load baseline MLM model
@@ -138,11 +149,9 @@ def main():
     model = model.to(device)
     print("Model loaded successfully!")
     
-    # Create evaluator
-    if model_type == 'rdt':
-        evaluator = Evaluator(model, device, model_type=model_type, preprocessor=preprocessor)
-    else:
-        evaluator = Evaluator(model, device, model_type=model_type)
+    # Create evaluator (no preprocessor for any model type)
+    # Evaluation tests actual inference capability
+    evaluator = Evaluator(model, device, model_type=model_type)
     
     # Evaluate
     print("\n" + "="*60)

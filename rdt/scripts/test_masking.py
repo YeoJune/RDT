@@ -274,11 +274,7 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             # Stack into batch tensors
             batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
             batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
-            # Line 305 이전에 추가
-            if i == 0 and ratio == 0.5:
-                print(f"\n=== Input Check ===")
-                print(f"batch_input_ids_tensor[0][:10]: {batch_input_ids_tensor[0][:10]}")
-                print(f"batch_attention_masks_tensor[0][:10]: {batch_attention_masks_tensor[0][:10]}")
+            
             # Batch inference
             with torch.no_grad():
                 output_ids, steps_taken = model.inference(
@@ -297,37 +293,27 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                 original_tokens = batch_original_tokens[j]
                 eval_mask = batch_eval_masks[j]
                 
-                # Extract predictions (remove padding)
-                pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
-
-                # === CRITICAL DEBUG ===
-                if j == 0 and ratio == 0.5:
-                    print(f"\n=== CRITICAL DEBUG (ratio=0.5) ===")
-                    print(f"original_tokens: {original_tokens[:10]}")
-                    print(f"pred_tokens:     {pred_tokens[:10]}")
-                    print(f"eval_mask:       {eval_mask[:10]}")
-                    print(f"eval_mask.sum(): {eval_mask.sum()}")
-                    
-                    # 마스킹된 위치의 실제 비교
-                    masked_orig = original_tokens[eval_mask][:5]
-                    masked_pred = pred_tokens[eval_mask][:5]
-                    print(f"\nMasked positions (first 5):")
-                    print(f"  Original: {masked_orig}")
-                    print(f"  Predicted: {masked_pred}")
-                    print(f"  Match: {(masked_orig == masked_pred).sum().item()}/{len(masked_orig)}")
-                    
-                    # 전체 정확도
-                    accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
-                    print(f"\nEM: {accuracy:.4f}")
+                # Extract predictions (remove padding to match original length)
+                # This is critical: pred_tokens must have same length as original_tokens
+                orig_len = len(original_tokens)
+                pred_tokens = pred_tokens_batch[j][:orig_len]
+                
+                # Verify length consistency
+                assert len(pred_tokens) == len(original_tokens) == len(eval_mask), \
+                    f"Length mismatch: pred={len(pred_tokens)}, orig={len(original_tokens)}, mask={len(eval_mask)}"
                 num_steps = steps_batch[j].item()
                 
-                # 1. Exact Match Accuracy
+                # 1. Exact Match Accuracy (only on masked positions)
                 accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
                 results['exact_match'][ratio].append(accuracy)
                 
-                # 2. Reconstructed text - combine original unmasked + predicted masked tokens
+                # 2. Reconstruct full text for other metrics
+                # Strategy: Use original tokens for unmasked positions,
+                #           use predicted tokens for masked positions
                 reconstructed_tokens = original_tokens.clone()
                 reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
+                
+                # Decode for text-based metrics
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                 original_text = batch_texts[j]
                 
@@ -484,12 +470,20 @@ def test_cmlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_l
             for j in range(len(batch_tokens)):
                 original_tokens = batch_original_tokens[j]
                 eval_mask = batch_eval_masks[j]
-                pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
+                
+                # Extract predictions (remove padding to match original length)
+                orig_len = len(original_tokens)
+                pred_tokens = pred_tokens_batch[j][:orig_len]
+                
+                # Verify length consistency
+                assert len(pred_tokens) == len(original_tokens) == len(eval_mask), \
+                    f"CMLM length mismatch: pred={len(pred_tokens)}, orig={len(original_tokens)}, mask={len(eval_mask)}"
                 
                 # Calculate metrics
                 accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
                 results['exact_match'][ratio].append(accuracy)
                 
+                # Reconstruct: original unmasked + predicted masked
                 reconstructed_tokens = original_tokens.clone()
                 reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
@@ -623,12 +617,20 @@ def test_mdlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_l
             for j in range(len(batch_tokens)):
                 original_tokens = batch_original_tokens[j]
                 eval_mask = batch_eval_masks[j]
-                pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
+                
+                # Extract predictions (remove padding to match original length)
+                orig_len = len(original_tokens)
+                pred_tokens = pred_tokens_batch[j][:orig_len]
+                
+                # Verify length consistency
+                assert len(pred_tokens) == len(original_tokens) == len(eval_mask), \
+                    f"MDLM length mismatch: pred={len(pred_tokens)}, orig={len(original_tokens)}, mask={len(eval_mask)}"
                 
                 # Calculate metrics
                 accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
                 results['exact_match'][ratio].append(accuracy)
                 
+                # Reconstruct: original unmasked + predicted masked
                 reconstructed_tokens = original_tokens.clone()
                 reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
@@ -761,14 +763,19 @@ def test_mlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                 original_tokens = batch_original_tokens[j]
                 eval_mask = batch_eval_masks[j]
                 
-                # Extract predictions (remove padding)
-                pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
+                # Extract predictions (remove padding to match original length)
+                orig_len = len(original_tokens)
+                pred_tokens = pred_tokens_batch[j][:orig_len]
                 
-                # 1. Exact Match Accuracy
+                # Verify length consistency
+                assert len(pred_tokens) == len(original_tokens) == len(eval_mask), \
+                    f"MLM length mismatch: pred={len(pred_tokens)}, orig={len(original_tokens)}, mask={len(eval_mask)}"
+                
+                # 1. Exact Match Accuracy (only on masked positions)
                 accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
                 results['exact_match'][ratio].append(accuracy)
                 
-                # 2. Reconstructed text - combine original unmasked + predicted masked tokens
+                # 2. Reconstruct: original unmasked + predicted masked
                 reconstructed_tokens = original_tokens.clone()
                 reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
@@ -1025,17 +1032,14 @@ def load_test_texts_rdt(config, num_samples=None):
     
     print(f"Loading test data from {config['data']['dataset_name']}...")
     
-    # Create dataset
+    # Create dataset (no preprocessing - just raw data)
     dataset = WikiTextDataset(
         dataset_name=config['data']['dataset_name'],
         split='test',
         tokenizer_name=config['data']['tokenizer_name'],
         max_seq_length=config['data']['max_seq_length'],
-        total_steps=config['training']['total_steps'],
-        max_chain_length=config['training']['max_chain_length'],
-        visible_loss_ratio=config['training'].get('visible_loss_ratio', 0.15),
         samples_per_text=1,
-        streaming=False
+        max_test_samples=config['data'].get('max_test_samples', 10000)
     )
     
     # Extract raw texts

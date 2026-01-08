@@ -16,33 +16,38 @@ class Evaluator:
     """
     Unified evaluator for RDT and baseline models.
     Provides standard evaluation metrics and comparison utilities.
+    
+    Note: RDT evaluation tests actual inference capability (no preprocessor).
+          Training/validation use preprocessor for chain-based learning.
     """
     
-    def __init__(self, model, device: torch.device, model_type: str = 'rdt', preprocessor=None):
+    def __init__(self, model, device: torch.device, model_type: str = 'rdt'):
         """
         Args:
-            model: Model to evaluate (RDT, MLM, or CMLM)
+            model: Model to evaluate (RDT, MLM, CMLM, or MDLM)
             device: Device to run evaluation on
-            model_type: 'rdt', 'mlm', or 'cmlm'
-            preprocessor: RDTPreprocessor for RDT models (optional)
+            model_type: 'rdt', 'mlm', 'cmlm', or 'mdlm'
         """
         self.model = model
         self.device = device
         self.model_type = model_type.lower()
-        self.preprocessor = preprocessor
         
         if self.model_type not in ['rdt', 'mlm', 'cmlm', 'mdlm']:
             raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', 'cmlm', or 'mdlm'")
     
     def evaluate_rdt(self, dataloader: DataLoader, max_steps: int = 20,
-                     threshold: float = 0.02) -> Dict[str, float]:
+                     threshold: float = 0.02, mask_ratio: float = 0.15) -> Dict[str, float]:
         """
-        Evaluate RDT model with batch processing.
+        Evaluate RDT model with actual inference capability (no preprocessor).
+        
+        Tests the model's ability to denoise masked input without intermediate targets.
+        This is different from training/validation which use preprocessor chains.
         
         Args:
-            dataloader: DataLoader with RDT format data (raw input_ids)
+            dataloader: DataLoader with raw input_ids (no preprocessing)
             max_steps: Maximum recursive steps
             threshold: Gate threshold for stopping
+            mask_ratio: Ratio of tokens to mask for evaluation (default: 0.15)
             
         Returns:
             Dictionary of evaluation metrics
@@ -53,64 +58,85 @@ class Evaluator:
         total_steps_taken = 0
         num_samples = 0
         
+        # Get tokenizer info from model
+        mask_token_id = getattr(self.model, 'mask_token_id', 103)  # Default BERT mask
+        pad_token_id = getattr(self.model, 'pad_token_id', 0)
+        
         with torch.no_grad():
-            for raw_batch in tqdm(dataloader, desc="Evaluating RDT", leave=False):
-                # Preprocess raw batch
-                raw_input_ids = raw_batch['input_ids'].to(self.device)
-                if self.preprocessor is not None:
-                    batch = self.preprocessor(raw_input_ids)
-                else:
-                    batch = raw_batch
+            for batch in tqdm(dataloader, desc="Evaluating RDT", leave=False):
+                # Get raw input_ids (original tokens without preprocessing)
+                raw_input_ids = batch['input_ids'].to(self.device)
+                batch_size, seq_len = raw_input_ids.shape
                 
-                # Move batch to device
-                input_ids = batch['input'].to(self.device)
-                targets = batch['targets'].to(self.device)
-                loss_masks = batch['loss_masks'].to(self.device)
-                attention_mask = batch.get('attention_mask')
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
-                chain_lengths = batch['chain_lengths']
+                # Create attention mask
+                attention_mask = (raw_input_ids != pad_token_id).long()
                 
-                batch_size = input_ids.size(0)
+                # Randomly mask tokens for evaluation (BERT-style)
+                # This simulates real denoising task without preprocessor chains
+                masked_input_ids = raw_input_ids.clone()
                 
-                # Batch inference using model.inference()
+                # Select tokens to mask (excluding special tokens)
+                non_special_mask = attention_mask.bool()
+                
+                # Random masking
+                rand_mask = torch.rand(batch_size, seq_len, device=self.device) < mask_ratio
+                mask_positions = rand_mask & non_special_mask
+                
+                # Apply masking (80% [MASK], 10% random, 10% original)
+                mask_token_mask = (torch.rand(batch_size, seq_len, device=self.device) < 0.8) & mask_positions
+                random_token_mask = (torch.rand(batch_size, seq_len, device=self.device) < 0.5) & mask_positions & ~mask_token_mask
+                
+                masked_input_ids[mask_token_mask] = mask_token_id
+                if hasattr(self.model, 'vocab_size'):
+                    vocab_size = self.model.vocab_size
+                    random_tokens = torch.randint(0, vocab_size, (batch_size, seq_len), device=self.device)
+                    masked_input_ids[random_token_mask] = random_tokens[random_token_mask]
+                
+                # Run inference (model denoises without intermediate targets)
+                # Note: inference() decodes only ONCE at the end (not at every step)
+                # This is the key difference from training where we decode at every step
                 output_ids, steps_taken = self.model.inference(
-                    input_ids,
+                    masked_input_ids,
                     attention_mask=attention_mask,
                     max_steps=max_steps,
                     threshold=threshold,
                     return_steps=True
                 )
                 
-                # Decode to get logits
-                # Need to get logits for metric calculation
-                # Use model's output projection
-                hidden = self.model.token_embedding(output_ids)
-                logits = self.model.decode(hidden, attention_mask=attention_mask)
+                # Calculate accuracy on masked positions only
+                # Accuracy measures exact token match after inference
+                correct_predictions = (output_ids == raw_input_ids) & mask_positions
+                total_masked = mask_positions.sum().item()
                 
-                # Calculate metrics for each sample
-                for b in range(batch_size):
-                    chain_len = chain_lengths[b].item()
+                if total_masked > 0:
+                    accuracy = correct_predictions.sum().item() / total_masked
+                    total_accuracy += accuracy * batch_size
                     
-                    if chain_len > 0:
-                        target = targets[b, 0]  # Use first target
-                        loss_mask = loss_masks[b, 0]
-                        
-                        # Apply loss mask
-                        masked_logits = logits[b][loss_mask]
-                        masked_target = target[loss_mask]
-                        
-                        if masked_target.numel() > 0:
-                            metrics = calculate_metrics(
-                                masked_logits.unsqueeze(0),
-                                masked_target.unsqueeze(0),
-                                ignore_index=-100
-                            )
-                            total_loss += metrics['loss']
-                            total_accuracy += metrics['accuracy']
+                    # Calculate loss on masked positions
+                    # For loss calculation, we need logits (not just tokens)
+                    # Re-encoding and decoding is necessary to get probability distributions
+                    # This still respects the "decode once" principle of inference
+                    with torch.no_grad():
+                        hidden = self.model.encode_tokens(output_ids, attention_mask)
+                        logits = self.model.decode(hidden, attention_mask)
                     
-                    total_steps_taken += steps_taken[b].item()
-                    num_samples += 1
+                    # Loss only on masked tokens
+                    loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+                    token_losses = loss_fn(logits.view(-1, logits.size(-1)), raw_input_ids.view(-1))
+                    token_losses = token_losses.view(batch_size, seq_len)
+                    
+                    masked_losses = token_losses[mask_positions]
+                    if masked_losses.numel() > 0:
+                        avg_loss = masked_losses.mean().item()
+                        total_loss += avg_loss * batch_size
+                
+                # Track steps
+                if isinstance(steps_taken, torch.Tensor):
+                    total_steps_taken += steps_taken.sum().item()
+                else:
+                    total_steps_taken += steps_taken * batch_size
+                
+                num_samples += batch_size
         
         if num_samples == 0:
             return {'loss': 0.0, 'accuracy': 0.0, 'perplexity': float('inf'), 'avg_steps': 0}
