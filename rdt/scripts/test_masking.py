@@ -1132,14 +1132,24 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             rope_base=config['model'].get('rope_base', 10000.0),
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
-        new_state_dict = {}
         
-        model.load_state_dict(new_state_dict, strict=False)  # strict=False
+        state_dict = checkpoint['model_state_dict']
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('_orig_mod.'):
+                new_key = key[len('_orig_mod.'):]
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        
+        # Load checkpoint
+        model.load_state_dict(new_state_dict, strict=False)
         model = model.to(device)
-
-        # Weight tying 강제 복원
-        model.output_projection.weight = model.token_embedding.weight
-
+        
+        # Weight tying is already preserved
+        is_tied = model.output_projection.weight is model.token_embedding.weight
+        print(f"Weight tying verified: {is_tied}")
+        
         model.eval()
         
         # Load test data
