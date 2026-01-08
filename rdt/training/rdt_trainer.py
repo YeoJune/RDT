@@ -436,12 +436,15 @@ class RDTTrainer:
                         break
                     
                     # Forward step
-                    hidden, gate_pred, pooled = raw_model.forward_step(
+                    hidden, _, _ = raw_model.forward_step(
                         hidden,
                         attention_mask=attention_mask,
                         last_gate_score=gate_pred,
                         last_pooled=pooled
                     )
+                    
+                    # Gate prediction for transformed hidden
+                    gate_pred, pooled = raw_model.gate(hidden, attention_mask, pooled, gate_pred)
                     
                     # Reconstruction loss
                     step_targets = targets[:, step_idx, :]

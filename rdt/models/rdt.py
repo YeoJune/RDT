@@ -1011,12 +1011,15 @@ class RDT(nn.Module):
                 
                 # Perform forward_step for all samples (for efficiency)
                 # But we'll only update hidden states for active samples
-                hidden_next, gate_pred_next, pooled_next = self.forward_step(
+                hidden_next, _, _ = self.forward_step(
                     hidden,
                     attention_mask=attention_mask,
                     last_gate_score=gate_pred,
                     last_pooled=pooled
                 )
+                
+                # Gate prediction for transformed hidden
+                gate_pred_next, pooled_next = self.gate(hidden_next, attention_mask, pooled, gate_pred)
                 
                 # Update hidden states only for active samples
                 # This ensures converged samples retain their final state
