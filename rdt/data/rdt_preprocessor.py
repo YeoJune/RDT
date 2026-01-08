@@ -52,8 +52,12 @@ class RDTPreprocessor:
         
         # 2. Random Permutation Logic (GPU Friendly)
         rand_scores = torch.rand(B, L, device=device)
-        # 패딩 토큰은 항상 가장 나중에 복원되도록(또는 마스킹 안되도록) 점수 조작 가능하지만
-        # 여기서는 attention_mask로 처리되므로 단순 랜덤
+        
+        # 패딩 토큰은 아주 큰 값으로 설정하여 항상 마지막 랭크를 받도록
+        # 이렇게 하면 visible_counts 계산이 실제 토큰만 기준으로 정확하게 작동
+        padding_mask = (input_ids == self.pad_token_id)
+        rand_scores = torch.where(padding_mask, torch.tensor(1e9, device=device), rand_scores)
+        
         restore_ranks = rand_scores.argsort(dim=1).argsort(dim=1)
         
         # 3. Init Tensors
