@@ -968,7 +968,7 @@ class RDT(nn.Module):
         return logits
 
     def inference(self, x, context=None, attention_mask=None, context_mask=None,
-                  max_steps=20, threshold=0.02, return_steps=False):
+                max_steps=20, threshold=0.02, return_steps=False):
         """
         Inference with per-sample early stopping using masks.
         Each sample in the batch can stop independently when its gate score falls below threshold.
@@ -1023,16 +1023,13 @@ class RDT(nn.Module):
                     # All samples have converged
                     break
                 
-                # Perform forward pass for all samples (for efficiency)
+                # Perform forward_step for all samples (for efficiency)
                 # But we'll only update hidden states for active samples
-                hidden_next, gate_pred_next, pooled_next = self.forward(
+                hidden_next, gate_pred_next, pooled_next = self.forward_step(
                     hidden,
-                    context=context,
                     attention_mask=attention_mask,
-                    context_mask=context_mask,
                     last_gate_score=gate_pred,
-                    last_pooled=pooled,
-                    is_first_step=False
+                    last_pooled=pooled
                 )
                 
                 # Update hidden states only for active samples
