@@ -1,221 +1,356 @@
-"""Simple RDT Test - Minimal code to verify inference works"""
+"""RDT Overfitting Sanity Check - 100 samples training and test-masking with EM metric"""
 
-import torch
-from transformers import AutoTokenizer
-from rdt.models import RDT
-from rdt.utils import load_config
 import argparse
+import torch
+import numpy as np
+from transformers import AutoTokenizer
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration
+from pathlib import Path
+from tqdm import tqdm
+import json
 
-def test_single_sample(model, tokenizer, device):
-    """Test with a single sample"""
-    print("\n" + "="*80)
-    print("Test 1: Single Sample (Original)")
-    print("="*80)
+from rdt.models import RDT
+from rdt.utils import load_config, merge_configs, set_seed, create_model_from_config
+from rdt.data import WikiTextDataset, RDTPreprocessor
+from rdt.training import RDTTrainer
+from torch.utils.data import DataLoader, Subset
+
+
+def create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids=None):
+    """Create masked input with specified ratio, excluding special tokens"""
+    seq_len = len(tokens)
     
-    # Simple test
-    text = "The quick brown fox jumps over the lazy dog."
-    encoded = tokenizer(text, return_tensors='pt')
-    tokens = encoded['input_ids'].to(device)
-    attention_mask = encoded['attention_mask'].to(device)
-    
-    print(f"Input: {text}")
-    print(f"Tokens: {tokens[0][:10]}")
-    
-    with torch.no_grad():
-        # Direct encode-decode
-        hidden = model.encode_tokens(tokens, attention_mask)
-        logits = model.decode(hidden, attention_mask)
-        pred_direct = logits.argmax(dim=-1)
-        
-        print(f"Direct pred: {pred_direct[0][:10]}")
-        print(f"Direct text: {tokenizer.decode(pred_direct[0], skip_special_tokens=True)}")
-        
-        # Full inference
-        output, steps = model.inference(
-            tokens,
-            attention_mask=attention_mask,
-            max_steps=10,
-            threshold=0.5,
-            return_steps=True
+    # Identify maskable positions (exclude special tokens)
+    if special_token_ids is not None:
+        maskable_positions = torch.tensor(
+            [i for i in range(seq_len) if tokens[i].item() not in special_token_ids],
+            dtype=torch.long
         )
-        
-        print(f"Inference output: {output[0][:10]}")
-        print(f"Inference text: {tokenizer.decode(output[0], skip_special_tokens=True)}")
-        print(f"Steps taken: {steps[0]}")
-
-
-def test_masked_sample(model, tokenizer, device):
-    """Test with masked input"""
-    print("\n" + "="*80)
-    print("Test 2: Masked Input (50% masking)")
-    print("="*80)
+    else:
+        maskable_positions = torch.arange(seq_len)
     
-    text = "The quick brown fox jumps over the lazy dog."
-    encoded = tokenizer(text, return_tensors='pt')
-    tokens = encoded['input_ids'].to(device)
-    attention_mask = encoded['attention_mask'].to(device)
+    num_maskable = len(maskable_positions)
+    if num_maskable == 0:
+        return tokens.clone(), torch.zeros(seq_len, dtype=torch.bool)
     
-    # Mask 50% of tokens (excluding special tokens)
-    mask_token_id = tokenizer.mask_token_id
+    num_mask = int(num_maskable * mask_ratio)
+    
+    if num_mask == 0:
+        return tokens.clone(), torch.zeros(seq_len, dtype=torch.bool)
+    
+    # Random masking positions from maskable positions only
+    mask_positions_indices = torch.randperm(num_maskable)[:num_mask]
+    mask_indices = maskable_positions[mask_positions_indices]
+    
     masked_tokens = tokens.clone()
+    masked_tokens[mask_indices] = mask_token_id
     
-    # Mask positions 2, 4, 6, 8 (skip CLS and SEP)
-    seq_len = tokens.shape[1]
-    for i in range(2, min(seq_len-1, 10), 2):
-        masked_tokens[0, i] = mask_token_id
+    # Create mask for evaluation
+    eval_mask = torch.zeros(seq_len, dtype=torch.bool)
+    eval_mask[mask_indices] = True
     
-    print(f"Original: {tokenizer.decode(tokens[0], skip_special_tokens=True)}")
-    print(f"Masked:   {tokenizer.decode(masked_tokens[0], skip_special_tokens=True)}")
-    print(f"Masked tokens: {masked_tokens[0][:10]}")
-    
-    with torch.no_grad():
-        output, steps = model.inference(
-            masked_tokens,
-            attention_mask=attention_mask,
-            max_steps=10,
-            threshold=0.5,
-            return_steps=True
-        )
-        
-        print(f"Output tokens: {output[0][:10]}")
-        print(f"Reconstructed: {tokenizer.decode(output[0], skip_special_tokens=True)}")
-        print(f"Steps taken: {steps[0]}")
-        
-        # Check if all outputs are 101
-        if (output[0] == 101).all():
-            print("\n⚠️  WARNING: All outputs are 101 (CLS token) - MODEL NOT WORKING!")
-        else:
-            print("\n✓ Model producing varied outputs")
+    return masked_tokens, eval_mask
 
 
-def test_batch(model, tokenizer, device):
-    """Test with batch"""
-    print("\n" + "="*80)
-    print("Test 3: Batch Processing (4 samples)")
-    print("="*80)
+def calculate_exact_match(pred_tokens: torch.Tensor, target_tokens: torch.Tensor, 
+                         eval_mask: torch.Tensor) -> float:
+    """Calculate exact match accuracy on masked positions"""
+    if eval_mask.sum() == 0:
+        return 1.0
     
-    texts = [
-        "The quick brown fox jumps over the lazy dog.",
-        "Hello world, this is a test.",
-        "Machine learning is fascinating.",
-        "Natural language processing works well."
-    ]
+    masked_pred = pred_tokens[eval_mask]
+    masked_target = target_tokens[eval_mask]
     
-    # Tokenize
-    encoded = tokenizer(texts, return_tensors='pt', padding=True, truncation=True)
-    tokens = encoded['input_ids'].to(device)
-    attention_mask = encoded['attention_mask'].to(device)
+    correct = (masked_pred == masked_target).sum().item()
+    total = eval_mask.sum().item()
     
-    print(f"Batch shape: {tokens.shape}")
-    print(f"Sample 1 tokens: {tokens[0][:10]}")
+    return correct / total
+
+
+def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_len, 
+                   max_steps=20, threshold=0.5, batch_size=32):
+    """Test RDT model across different masking levels with EM metric (batched)"""
+    model.eval()
+    mask_token_id = tokenizer.mask_token_id
+    pad_token_id = tokenizer.pad_token_id or 0
     
-    with torch.no_grad():
-        output, steps = model.inference(
-            tokens,
-            attention_mask=attention_mask,
-            max_steps=10,
-            threshold=0.5,
-            return_steps=True
+    # Initialize result storage
+    results = {
+        'exact_match': {ratio: [] for ratio in mask_ratios}
+    }
+    
+    print(f"\nTesting RDT reconstruction capability (max_seq_len={max_seq_len}, batch_size={batch_size})...")
+    
+    # Get special token IDs to exclude from masking
+    special_token_ids = set(tokenizer.all_special_ids)
+    
+    # Tokenize all texts first
+    all_tokens = []
+    
+    for text in tqdm(test_texts, desc="Tokenizing"):
+        encoded = tokenizer(
+            text, 
+            return_tensors='pt', 
+            truncation=True, 
+            max_length=max_seq_len,
+            padding=False
         )
+        tokens = encoded['input_ids'].squeeze(0)
         
-        print(f"\nResults:")
-        for i in range(len(texts)):
-            pred_text = tokenizer.decode(output[i], skip_special_tokens=True)
-            print(f"  [{i}] Steps: {steps[i]}, Output: {pred_text[:50]}...")
+        if len(tokens) >= 10:
+            all_tokens.append(tokens)
+    
+    # Process in batches for each masking ratio
+    for ratio in mask_ratios:
+        print(f"\nProcessing masking ratio: {ratio*100:.0f}%")
         
-        # Check if all outputs are 101
-        all_101 = all((output[i] == 101).sum() > output.shape[1] * 0.9 for i in range(len(texts)))
-        if all_101:
-            print("\n⚠️  WARNING: Most outputs are 101 - BATCH PROCESSING BROKEN!")
+        for i in tqdm(range(0, len(all_tokens), batch_size), desc=f"Batches ({ratio*100:.0f}%)"):
+            batch_tokens = all_tokens[i:i+batch_size]
+            
+            # Prepare batch with dynamic padding
+            batch_input_ids = []
+            batch_eval_masks = []
+            batch_original_tokens = []
+            
+            for tokens in batch_tokens:
+                # Create masked input
+                masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
+                
+                batch_input_ids.append(masked_tokens)
+                batch_eval_masks.append(eval_mask)
+                batch_original_tokens.append(tokens)
+            
+            # Pad to max length in this batch
+            max_len = max(len(t) for t in batch_input_ids)
+            padded_input_ids = []
+            padded_attention_masks = []
+            
+            for masked_tokens in batch_input_ids:
+                pad_len = max_len - len(masked_tokens)
+                if pad_len > 0:
+                    padded_input_ids.append(
+                        torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
+                    )
+                    padded_attention_masks.append(
+                        torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])
+                    )
+                else:
+                    padded_input_ids.append(masked_tokens)
+                    padded_attention_masks.append(torch.ones(len(masked_tokens)))
+            
+            # Stack into batch tensors
+            batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
+            batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
+            
+            # Batch inference
+            with torch.no_grad():
+                output_ids, _ = model.inference(
+                    batch_input_ids_tensor,
+                    attention_mask=batch_attention_masks_tensor,
+                    max_steps=max_steps,
+                    threshold=threshold,
+                    return_steps=True
+                )
+                
+                pred_tokens_batch = output_ids.cpu()
+            
+            # Process each sample in batch
+            for j in range(len(batch_tokens)):
+                original_tokens = batch_original_tokens[j]
+                eval_mask = batch_eval_masks[j]
+                
+                # Extract predictions (remove padding to match original length)
+                orig_len = len(original_tokens)
+                pred_tokens = pred_tokens_batch[j][:orig_len]
+                
+                # Exact Match Accuracy (only on masked positions)
+                accuracy = calculate_exact_match(pred_tokens, original_tokens, eval_mask)
+                results['exact_match'][ratio].append(accuracy)
+    
+    # Aggregate results
+    aggregated = {'exact_match': {}}
+    
+    print("\nCalculating metrics...")
+    for ratio in tqdm(mask_ratios, desc="Aggregating"):
+        if results['exact_match'][ratio]:
+            aggregated['exact_match'][ratio] = np.mean(results['exact_match'][ratio])
         else:
-            print("\n✓ Batch processing working")
+            aggregated['exact_match'][ratio] = 0.0
+    
+    return aggregated
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--device', type=str, default='cuda')
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description='RDT Overfitting Sanity Check')
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to config file')
+    parser.add_argument('--num_samples', type=int, default=100,
+                        help='Number of samples to overfit on (default: 100)')
+    parser.add_argument('--num_epochs', type=int, default=50,
+                        help='Number of training epochs (default: 50)')
+    parser.add_argument('--output_dir', type=str, default='test_outputs',
+                        help='Output directory for checkpoints and results')
     
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    args = parser.parse_args()
     
     # Load config
     config = load_config(args.config)
-    tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
     
-    # Load model
-    print(f"\nLoading model from {args.checkpoint}...")
+    # Override config for overfitting experiment
+    config['training']['num_epochs'] = args.num_epochs
+    config['training']['training_mode'] = 'epoch'
+    config['output']['checkpoint_dir'] = f"{args.output_dir}/checkpoints"
+    config['output']['log_dir'] = f"{args.output_dir}/logs"
+    config['use_wandb'] = False  # Disable wandb for testing
     
-    from pathlib import Path
-    checkpoint_path = Path(args.checkpoint)
+    # Set seed
+    set_seed(config['seed'])
     
-    model = RDT(
-        vocab_size=tokenizer.vocab_size,
-        d_model=config['model']['d_model'],
-        n_heads=config['model']['n_heads'],
-        n_encoder_layers=config['model']['n_encoder_layers'],
-        d_ff=config['model']['d_ff'],
-        dropout=config['model']['dropout'],
-        max_seq_len=config['data']['max_seq_length'],
-        input_processor_layers=config['model'].get('input_processor_layers', 1),
-        output_processor_layers=config['model'].get('output_processor_layers', 1),
-        gate_hidden_dim=config['model']['gate_hidden_dim'],
-        gate_num_layers=config['model']['gate_num_layers'],
-        gate_num_heads=config['model']['gate_num_heads'],
-        gate_dropout=config['model']['gate_dropout'],
-        rope_base=config['model'].get('rope_base', 10000.0),
-        gradient_checkpointing=False
+    # Create accelerator (no wandb)
+    accelerator = Accelerator(
+        log_with=None,
+        project_config=ProjectConfiguration(
+            project_dir=config['output']['log_dir'],
+            logging_dir=config['output']['log_dir']
+        ),
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1)
     )
     
-    # Check if checkpoint is a directory or file
-    if checkpoint_path.is_dir():
-        # Load from accelerator saved directory
-        safetensors_path = checkpoint_path / 'model.safetensors'
-        if safetensors_path.exists():
-            from safetensors.torch import load_file
-            state_dict = load_file(str(safetensors_path))
-            print(f"Loaded from {safetensors_path}")
-        else:
-            raise FileNotFoundError(f"No model.safetensors found in {checkpoint_path}")
-    else:
-        # Load from .pt file
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        state_dict = checkpoint['model_state_dict']
+    print(f"\n{'='*80}")
+    print("RDT Overfitting Sanity Check")
+    print(f"{'='*80}")
+    print(f"Num samples: {args.num_samples}")
+    print(f"Num epochs: {args.num_epochs}")
+    print(f"Output dir: {args.output_dir}")
+    print(f"Device: {accelerator.device}")
+    print(f"{'='*80}\n")
     
-    # Handle _orig_mod prefix
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith('_orig_mod.'):
-            new_key = key[len('_orig_mod.'):]
-            new_state_dict[new_key] = value
-        else:
-            new_state_dict[key] = value
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
+    vocab_size = tokenizer.vocab_size
     
-    model.load_state_dict(new_state_dict, strict=False)
-    model = model.to(device)
+    # =========================================================================
+    # Step 1: Create small dataset (100 samples)
+    # =========================================================================
+    print("Step 1: Creating small dataset...")
     
-    # Force weight tying
-    model.output_projection.weight = model.token_embedding.weight
+    full_dataset = WikiTextDataset(
+        dataset_name=config['data']['dataset_name'],
+        tokenizer_name=config['data']['tokenizer_name'],
+        max_seq_length=config['data']['max_seq_length'],
+        split='train',
+        samples_per_text=1
+    )
     
-    # Verify
-    is_tied = model.output_projection.weight is model.token_embedding.weight
-    print(f"Weight tying: {'✓' if is_tied else '✗'}")
+    # Select first N samples
+    indices = list(range(min(args.num_samples, len(full_dataset))))
+    small_dataset = Subset(full_dataset, indices)
     
-    # Check parameter values
-    print(f"token_embedding[101,:5]: {model.token_embedding.weight[101,:5]}")
-    print(f"output_projection[101,:5]: {model.output_projection.weight[101,:5]}")
+    print(f"Created dataset with {len(small_dataset)} samples")
     
-    model.eval()
+    # Create collator
+    rdt_collator = RDTPreprocessor(tokenizer, config, device='cpu')
     
-    # Run tests
-    test_single_sample(model, tokenizer, device)
-    test_masked_sample(model, tokenizer, device)
-    test_batch(model, tokenizer, device)
+    # Create dataloader
+    train_loader = DataLoader(
+        small_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=True,
+        num_workers=0,  # Use 0 for small dataset
+        pin_memory=True,
+        collate_fn=rdt_collator,
+        drop_last=False
+    )
+    
+    val_loader = train_loader  # Use same data for validation (overfitting check)
+    
+    # =========================================================================
+    # Step 2: Create and train model
+    # =========================================================================
+    print("\nStep 2: Creating model...")
+    
+    model = create_model_from_config(config, vocab_size)
+    
+    print(f"Model parameters: {model.count_parameters()/1e6:.2f}M")
+    
+    # Create trainer
+    trainer = RDTTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=config,
+        accelerator=accelerator
+    )
+    
+    print("\nStep 3: Training model (overfitting)...")
+    trainer.train()
+    
+    print(f"\nTraining completed!")
+    print(f"Checkpoints saved to: {config['output']['checkpoint_dir']}")
+    
+    # =========================================================================
+    # Step 4: Test-masking with different ratios
+    # =========================================================================
+    print("\nStep 4: Testing with different masking ratios...")
+    
+    # Get test texts (same as training data for overfitting check)
+    test_texts = []
+    for idx in indices:
+        sample = full_dataset.data[idx]
+        tokens = sample['input_ids']
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        test_texts.append(text)
+    
+    print(f"Number of test texts: {len(test_texts)}")
+    
+    # Masking ratios from 0% to 100%
+    mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    
+    # Get trained model (unwrap if needed)
+    trained_model = accelerator.unwrap_model(trainer.model)
+    trained_model.eval()
+    
+    # Run test-masking
+    results = test_rdt_model(
+        model=trained_model,
+        tokenizer=tokenizer,
+        test_texts=test_texts,
+        mask_ratios=mask_ratios,
+        device=accelerator.device,
+        max_seq_len=config['data']['max_seq_length'],
+        max_steps=config['training']['total_steps'],
+        threshold=config['model']['threshold'],
+        batch_size=config['training']['batch_size']
+    )
+    
+    # =========================================================================
+    # Step 5: Print and save results
+    # =========================================================================
+    print(f"\n{'='*80}")
+    print("Test Results (Exact Match Accuracy)")
+    print(f"{'='*80}")
+    print(f"{'Mask Ratio':<15} {'EM Accuracy':<15}")
+    print("-" * 80)
+    
+    for ratio in mask_ratios:
+        em = results['exact_match'][ratio]
+        print(f"{ratio*100:>6.0f}%{'':<8} {em:>6.4f}")
+    
+    print(f"{'='*80}\n")
+    
+    # Save results to JSON
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    results_path = output_dir / 'test_results.json'
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"Results saved to: {results_path}")
     
     print("\n" + "="*80)
-    print("Testing Complete")
+    print("Overfitting sanity check completed successfully!")
     print("="*80)
 
 
