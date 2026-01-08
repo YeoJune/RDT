@@ -295,6 +295,26 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                 
                 # Extract predictions (remove padding)
                 pred_tokens = pred_tokens_batch[j][:len(original_tokens)]
+
+                # === CRITICAL DEBUG ===
+                if j == 0 and ratio == 0.5:
+                    print(f"\n=== CRITICAL DEBUG (ratio=0.5) ===")
+                    print(f"original_tokens: {original_tokens[:10]}")
+                    print(f"pred_tokens:     {pred_tokens[:10]}")
+                    print(f"eval_mask:       {eval_mask[:10]}")
+                    print(f"eval_mask.sum(): {eval_mask.sum()}")
+                    
+                    # 마스킹된 위치의 실제 비교
+                    masked_orig = original_tokens[eval_mask][:5]
+                    masked_pred = pred_tokens[eval_mask][:5]
+                    print(f"\nMasked positions (first 5):")
+                    print(f"  Original: {masked_orig}")
+                    print(f"  Predicted: {masked_pred}")
+                    print(f"  Match: {(masked_orig == masked_pred).sum().item()}/{len(masked_orig)}")
+                    
+                    # 전체 정확도
+                    accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
+                    print(f"\nEM: {accuracy:.4f}")
                 num_steps = steps_batch[j].item()
                 
                 # 1. Exact Match Accuracy
