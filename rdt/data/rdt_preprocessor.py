@@ -67,10 +67,15 @@ class RDTPreprocessor:
         gate_targets = torch.zeros((B, max_chain_len_in_batch + 1), dtype=torch.float, device=device)
         attention_mask = (input_ids != self.pad_token_id).long()
         
+        # 실제 토큰 개수 계산 (패딩 제외)
+        # [B] - 각 샘플의 실제 토큰 개수
+        actual_lengths = attention_mask.sum(dim=1).float()
+        
         # 4. Input Generation (s_0)
         input_steps = start_steps
         visible_ratios = 1.0 - (input_steps.float() / self.total_steps)
-        visible_counts = (visible_ratios * L).long()
+        # 실제 토큰 개수 기준으로 visible_counts 계산
+        visible_counts = (visible_ratios.unsqueeze(1) * actual_lengths.unsqueeze(1)).long()
         
         is_masked = restore_ranks >= visible_counts.unsqueeze(1)
         is_masked = is_masked & (attention_mask.bool()) # 패딩은 마스킹 제외
@@ -101,8 +106,12 @@ class RDTPreprocessor:
             target_steps = start_steps - (i + 1)
             
             # Loss Mask 계산 (현재 스텝에서는 안 보였지만 다음 스텝에 보여야 할 구간)
-            curr_visible_counts = ((1.0 - (start_steps - i).float() / self.total_steps) * L).long()
-            target_visible_counts = ((1.0 - target_steps.float() / self.total_steps) * L).long()
+            # 실제 토큰 개수 기준으로 계산
+            curr_visible_ratios = 1.0 - (start_steps - i).float() / self.total_steps
+            target_visible_ratios = 1.0 - target_steps.float() / self.total_steps
+            
+            curr_visible_counts = (curr_visible_ratios.unsqueeze(1) * actual_lengths.unsqueeze(1)).long()
+            target_visible_counts = (target_visible_ratios.unsqueeze(1) * actual_lengths.unsqueeze(1)).long()
             
             lower_bound = curr_visible_counts.unsqueeze(1)
             upper_bound = target_visible_counts.unsqueeze(1)
