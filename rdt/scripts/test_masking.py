@@ -274,7 +274,11 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             # Stack into batch tensors
             batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
             batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
-            
+            # Line 305 이전에 추가
+            if i == 0 and ratio == 0.5:
+                print(f"\n=== Input Check ===")
+                print(f"batch_input_ids_tensor[0][:10]: {batch_input_ids_tensor[0][:10]}")
+                print(f"batch_attention_masks_tensor[0][:10]: {batch_attention_masks_tensor[0][:10]}")
             # Batch inference
             with torch.no_grad():
                 output_ids, steps_taken = model.inference(
