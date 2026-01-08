@@ -280,10 +280,13 @@ class RDTTrainer:
                 break
             
             step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
-            hidden, gate_pred, pooled = raw_model.forward_step(
+            hidden, _, _ = raw_model.forward_step(
                 hidden, attention_mask=attention_mask, last_gate_score=gate_pred,
                 last_pooled=pooled, gt_timestep=step_gt_gate, sampling_prob=sampling_prob
             )
+            
+            # Gate prediction for transformed hidden
+            gate_pred, pooled = raw_model.gate(hidden, attention_mask, pooled, gate_pred)
             
             step_targets = targets[:, step_idx, :]
             step_loss_mask = loss_masks[:, step_idx, :]
