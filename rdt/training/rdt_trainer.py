@@ -592,16 +592,42 @@ class RDTTrainer:
                     
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        # Accelerator의 save_state 사용 (표준화)
-                        save_path = f"{self.checkpoint_dir}/checkpoint-best"
-                        self.accelerator.save_state(save_path)
+                        # torch.save 사용 (torch.compile + accelerator.save_state 문제 해결)
+                        self.accelerator.wait_for_everyone()
+                        if self.accelerator.is_main_process:
+                            unwrapped_model = self.accelerator.unwrap_model(self.model)
+                            # torch.compile으로 인한 _orig_mod prefix 제거
+                            if hasattr(unwrapped_model, '_orig_mod'):
+                                unwrapped_model = unwrapped_model._orig_mod
+                            
+                            torch.save({
+                                'model_state_dict': unwrapped_model.state_dict(),
+                                'optimizer_state_dict': self.optimizer.state_dict(),
+                                'epoch': epoch,
+                                'step': self.global_step,
+                                'best_val_loss': best_val_loss,
+                                'config': self.config
+                            }, f"{self.checkpoint_dir}/best_model.pt")
+                            print(f"Best checkpoint saved at epoch {epoch+1}, step {self.global_step}")
             
             # Checkpoint
             if (epoch + 1) % self.save_every_n_epochs == 0:
                 self.accelerator.wait_for_everyone()
-                save_path = f"{self.checkpoint_dir}/checkpoint-epoch-{epoch+1}"
-                self.accelerator.save_state(save_path)
-                # cleanup_checkpoints는 필요시 별도 구현
+                if self.accelerator.is_main_process:
+                    unwrapped_model = self.accelerator.unwrap_model(self.model)
+                    # torch.compile으로 인한 _orig_mod prefix 제거
+                    if hasattr(unwrapped_model, '_orig_mod'):
+                        unwrapped_model = unwrapped_model._orig_mod
+                    
+                    torch.save({
+                        'model_state_dict': unwrapped_model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'epoch': epoch + 1,
+                        'step': self.global_step,
+                        'config': self.config
+                    }, f"{self.checkpoint_dir}/checkpoint-epoch-{epoch+1}.pt")
+                    print(f"Checkpoint saved: epoch {epoch+1}")
+                    # cleanup_checkpoints는 필요시 별도 구현
         
         if self.accelerator.is_main_process:
             print("\nTraining completed!")
@@ -727,16 +753,42 @@ class RDTTrainer:
                         
                         if val_loss < best_val_loss:
                             best_val_loss = val_loss
-                            # Accelerator의 save_state 사용
-                            save_path = f"{self.checkpoint_dir}/checkpoint-best"
-                            self.accelerator.save_state(save_path)
+                            # torch.save 사용 (torch.compile + accelerator.save_state 문제 해결)
+                            self.accelerator.wait_for_everyone()
+                            if self.accelerator.is_main_process:
+                                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                                # torch.compile으로 인한 _orig_mod prefix 제거
+                                if hasattr(unwrapped_model, '_orig_mod'):
+                                    unwrapped_model = unwrapped_model._orig_mod
+                                
+                                torch.save({
+                                    'model_state_dict': unwrapped_model.state_dict(),
+                                    'optimizer_state_dict': self.optimizer.state_dict(),
+                                    'epoch': epoch,
+                                    'step': step,
+                                    'best_val_loss': best_val_loss,
+                                    'config': self.config
+                                }, f"{self.checkpoint_dir}/best_model.pt")
+                                print(f"Best checkpoint saved at step {step}")
                 
                 # Checkpoint
                 if step % self.save_every_n_steps == 0:
                     self.accelerator.wait_for_everyone()
-                    save_path = f"{self.checkpoint_dir}/checkpoint-step-{step}"
-                    self.accelerator.save_state(save_path)
-                    # cleanup_checkpoints는 필요시 별도 구현
+                    if self.accelerator.is_main_process:
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        # torch.compile으로 인한 _orig_mod prefix 제거
+                        if hasattr(unwrapped_model, '_orig_mod'):
+                            unwrapped_model = unwrapped_model._orig_mod
+                        
+                        torch.save({
+                            'model_state_dict': unwrapped_model.state_dict(),
+                            'optimizer_state_dict': self.optimizer.state_dict(),
+                            'epoch': epoch,
+                            'step': step,
+                            'config': self.config
+                        }, f"{self.checkpoint_dir}/checkpoint-step-{step}.pt")
+                        print(f"Checkpoint saved: step {step}")
+                        # cleanup_checkpoints는 필요시 별도 구현
             
             epoch += 1
         

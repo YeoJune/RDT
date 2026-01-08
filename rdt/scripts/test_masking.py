@@ -1146,13 +1146,17 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             else:
                 new_state_dict[key] = value
         
-        # Load checkpoint
         model.load_state_dict(new_state_dict, strict=False)
         model = model.to(device)
-        
-        # Weight tying is already preserved
+
+        # CRITICAL: Weight tying 복원 (.to() 이후 다시 적용)
+        model.output_projection.weight = model.token_embedding.weight
+
+        # 검증
         is_tied = model.output_projection.weight is model.token_embedding.weight
         print(f"Weight tying verified: {is_tied}")
+
+        model.eval()
         
         model.eval()
         
