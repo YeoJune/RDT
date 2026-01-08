@@ -993,13 +993,8 @@ class RDT(nn.Module):
         
         with torch.no_grad():
             # Initialize
-            hidden, gate_pred, pooled = self.forward(
-                x,
-                context=context,
-                attention_mask=attention_mask,
-                context_mask=context_mask,
-                is_first_step=True
-            )
+            hidden = self.encode_tokens(x, attention_mask)
+            gate_pred, pooled = self.gate(hidden, attention_mask)
             
             # Track which samples are still active
             # active_mask: [B] - True if sample should continue processing
