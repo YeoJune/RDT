@@ -884,41 +884,24 @@ class RDT(nn.Module):
         
         Returns:
             hidden: [B, L, D] next hidden states (after recursive blocks)
-            predicted_gate: [B, 1] gate prediction for current hidden
-            current_pooled: [B, D] current pooled features
+            predicted_gate: None (not used, computed separately after transformation)
+            current_pooled: None (not used, computed separately after transformation)
         """
-        # 1. Gate prediction for current state
-        predicted_gate, current_pooled = self.gate(
-            hidden, attention_mask, last_pooled, last_gate_score
-        )
-        
         # ============================================================
-        # 2. [XLA-Safe] Soft Mixing for Scheduled Sampling
+        # 1. [XLA-Safe] Soft Mixing for Scheduled Sampling
         # ============================================================
-        # Before: Random sampling with torch.rand() -> XLA recompilation
-        # After: Deterministic weighted combination -> Single graph
-        #
-        # Soft mixing formula:
-        #   effective_timestep = sampling_prob * GT + (1 - sampling_prob) * Pred
-        #
-        # Benefits:
-        # - Completely deterministic (no random number generation)
-        # - XLA-friendly (no graph structure changes)
-        # - Differentiable (gradients flow to both GT and Pred)
-        # - sampling_prob can change every step without recompilation
-        # ============================================================
-
-        sampling_prob = 1.0
+        # Use last_gate_score (previous step's prediction) as current noise level
+        # Mix with GT for scheduled sampling
         
         if self.training and gt_timestep is not None:
             # Soft mixing: weighted combination of GT and predicted
             # Both GT and predicted are detached to stop gradient flow into noise_emb
-            current_noise = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * predicted_gate.detach()
+            current_noise = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * last_gate_score.detach()
         else:
             # Inference: always use predicted gate
-            current_noise = predicted_gate.detach()
+            current_noise = last_gate_score.detach() if last_gate_score is not None else gt_timestep.detach()
         
-        # 3. Create noise embedding
+        # 2. Create noise embedding
         noise_vec = self.noise_emb(current_noise)
         
         # 4. Prepare masks
@@ -948,7 +931,7 @@ class RDT(nn.Module):
                     context_key_padding_mask=None
                 )
         
-        return hidden, predicted_gate, current_pooled
+        return hidden, None, None
     
     def decode(self, hidden, attention_mask=None):
         """
