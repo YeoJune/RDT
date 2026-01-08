@@ -40,9 +40,9 @@ model:
 training:
   # Chain & Masking
   max_chain_length: 2 # L: length of training segment
-  total_steps: 10 # N: total denoising steps (100% → 0%)
+  total_steps: 100 # N: total denoising steps (100% → 0%)
   masking_strategy: "shuffle" # 'shuffle' (index-based)
-  visible_loss_ratio: 1.0 # Visible 중에서도 loss 계산할 비율 (안정화)
+  visible_loss_ratio: 0.25 # Visible 중에서도 loss 계산할 비율 (안정화)
 
   # BERT-style masking (for masked tokens)
   bert_masking:
@@ -59,12 +59,12 @@ training:
   aux_temp: 0.5
 
   # Optimization
-  batch_size: 16
-  gradient_accumulation_steps: 16 # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 32
+  gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 15 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
-  learning_rate: 0.0002 # 5e-4
+  learning_rate: 0.0002 # 2e-4
   weight_decay: 0.01
   warmup_ratio: 0.05 # 5% of total steps
 
