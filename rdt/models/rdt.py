@@ -907,6 +907,8 @@ class RDT(nn.Module):
         # - Differentiable (gradients flow to both GT and Pred)
         # - sampling_prob can change every step without recompilation
         # ============================================================
+
+        sampling_prob = 1.0
         
         if self.training and gt_timestep is not None:
             # Soft mixing: weighted combination of GT and predicted
