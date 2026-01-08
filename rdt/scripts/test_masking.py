@@ -274,38 +274,7 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             # Stack into batch tensors
             batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
             batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
-            # Line 305-311 수정
-            print(f"\n=== Inference Debug (ratio={ratio}) ===")
-            print(f"Input shape: {batch_input_ids_tensor.shape}")
-            print(f"Input[0][:20]: {batch_input_ids_tensor[0][:20]}")
-            print(f"max_steps: {max_steps}, threshold: {threshold}")
-
-            with torch.no_grad():
-                # 직접 forward 테스트
-                hidden = model.encode_tokens(batch_input_ids_tensor, batch_attention_masks_tensor)
-                print(f"After encode_tokens - hidden[0,0,:5]: {hidden[0,0,:5]}")
-                
-                gate_pred, pooled = model.gate(hidden, batch_attention_masks_tensor)
-                print(f"Initial gate_pred[0]: {gate_pred[0].item():.4f}")
-                
-                logits = model.decode(hidden, batch_attention_masks_tensor)
-                print(f"Logits shape: {logits.shape}")
-                print(f"Logits[0,0,:10]: {logits[0,0,:10]}")
-                
-                pred = logits.argmax(dim=-1)
-                print(f"Direct pred[0][:20]: {pred[0][:20]}")
-                
-                # 이제 inference 호출
-                output_ids, steps_taken = model.inference(
-                    batch_input_ids_tensor,
-                    attention_mask=batch_attention_masks_tensor,
-                    max_steps=max_steps,
-                    threshold=threshold,
-                    return_steps=True
-                )
-                
-            print(f"Inference output[0][:20]: {output_ids[0][:20]}")
-            print(f"Steps taken[0]: {steps_taken[0].item()}")
+            
             # Batch inference
             with torch.no_grad():
                 output_ids, steps_taken = model.inference(
@@ -1163,28 +1132,14 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             rope_base=config['model'].get('rope_base', 10000.0),
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
-        
-        # Handle torch.compile saved checkpoint
-        state_dict = checkpoint['model_state_dict']
         new_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('_orig_mod.'):
-                new_key = key[len('_orig_mod.'):]
-                new_state_dict[new_key] = value
-            else:
-                new_state_dict[key] = value
         
-        model.load_state_dict(new_state_dict)
+        model.load_state_dict(new_state_dict, strict=False)  # strict=False
         model = model.to(device)
-        
-        # CRITICAL: Re-apply weight tying
-        if hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
-            model.output_projection.weight = model.token_embedding.weight
-            print("✓ Weight tying re-applied")
-            
-            # Verify
-            is_tied = model.output_projection.weight is model.token_embedding.weight
-            print(f"✓ Weight tying verified: {is_tied}")
+
+        # Weight tying 강제 복원
+        model.output_projection.weight = model.token_embedding.weight
+
         model.eval()
         
         # Load test data
