@@ -262,7 +262,7 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                 pad_len = max_len - len(masked_tokens)
                 if pad_len > 0:
                     padded_input_ids.append(
-                        torch.cat([masked_tokens, torch.full((pad_len,), mask_token_id)])
+                        torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
                     )
                     padded_attention_masks.append(
                         torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])

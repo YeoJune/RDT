@@ -503,19 +503,11 @@ class RDTTrainer:
             for batch in train_iter:
                 # Accelerate의 gradient accumulation 자동 처리
                 with self.accelerator.accumulate(self.model):
-                    if self.accelerator.is_main_process:
-                        print(f"[DEBUG] Starting batch, is_tpu={self.is_tpu}")
                     loss, recon, gate, aux = self.train_step(batch)
 
-                    if self.accelerator.is_main_process:
-                        print(f"[DEBUG] train_step done")
-                    
                     # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
                     self.accelerator.backward(loss)
 
-                    if self.accelerator.is_main_process:
-                        print(f"[DEBUG] backward done")
-                    
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
