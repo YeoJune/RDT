@@ -18,12 +18,12 @@ def load_bert_weights_to_rdt(
     BERT Layer Mapping:
     -------------------
     BERT (8 layers) → RDT (1 + 6 + 1 = 8 layers)
-    - BERT Layer 0    → RDT Input Encoder (low-level features)
+    - BERT Layer 0    → RDT Input Processor (low-level features)
     - BERT Layer 1-6  → RDT Main Encoder (semantic features, recursive)
-    - BERT Layer 7    → RDT Output Decoder (high-level features)
+    - BERT Layer 7    → RDT Output Processor (high-level features)
     
     This preserves BERT's hierarchical learning:
-    Syntactic → Semantic → Task-specific
+    Low-level → Semantic → High-level
     
     Args:
         rdt_model: RDT model instance
@@ -63,9 +63,11 @@ def load_bert_weights_to_rdt(
     
     if verbose:
         print(f"BERT: {num_bert_layers} layers, d_model={bert_config.hidden_size}")
-        print(f"RDT: {num_rdt_main} main encoder layers")
+        print(f"RDT: 1 input + {num_rdt_main} main + 1 output = {num_rdt_main + 2} total layers")
         print(f"\nLayer Mapping Strategy:")
-        print(f"  BERT[0-{num_rdt_main-1}]  → RDT Main Encoder (semantic features)")
+        print(f"  BERT[0]         → RDT Input Processor")
+        print(f"  BERT[1-{num_rdt_main}]      → RDT Main Encoder (semantic features)")
+        print(f"  BERT[{num_rdt_main + 1}]        → RDT Output Processor")
         print()
     
     # =========================================================================
@@ -82,13 +84,33 @@ def load_bert_weights_to_rdt(
         print(f"  ✓ Token embedding: {bert.embeddings.word_embeddings.weight.shape}")
     
     # =========================================================================
-    # Step 2: Copy Main Encoder Only (BERT Layers 0 to num_rdt_main-1)
+    # Step 2: Copy Input Processor (BERT Layer 0)
     # =========================================================================
     if verbose:
-        print(f"\n[2/3] Copying main encoder (BERT layers 0-{num_rdt_main-1})...")
+        print(f"\n[2/5] Copying input processor (BERT layer 0)...")
+    
+    input_processor_layers = rdt_model.input_processor.layers
+    if len(input_processor_layers) > 0:
+        # Copy only if shapes match
+        bert_layer = bert.encoder.layer[0]
+        rdt_layer = input_processor_layers[0]
+        
+        try:
+            copy_transformer_encoder_layer(bert_layer, rdt_layer)
+            if verbose:
+                print(f"  ✓ Input processor[0] ← BERT layer[0]")
+        except Exception as e:
+            if verbose:
+                print(f"  ⚠ Skipping input processor (incompatible): {e}")
+    
+    # =========================================================================
+    # Step 3: Copy Main Encoder (BERT Layers 1 to num_rdt_main)
+    # =========================================================================
+    if verbose:
+        print(f"\n[3/5] Copying main encoder (BERT layers 1-{num_rdt_main})...")
     
     for i in range(num_rdt_main):
-        bert_layer_idx = i  # BERT layers 0, 1, 2, 3, 4, 5
+        bert_layer_idx = i + 1  # BERT layers 1, 2, 3, 4, 5, 6
         bert_layer = bert.encoder.layer[bert_layer_idx]
         rdt_layer = rdt_model.encoder_layers[i]
         
@@ -108,14 +130,17 @@ def load_bert_weights_to_rdt(
         
         # Fuse into RDT's qkv_proj
         qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)  # [3*d_model, d_model]
-        qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
-        
         rdt_layer.self_attn.qkv_proj.weight.data.copy_(qkv_weight)
-        rdt_layer.self_attn.qkv_proj.bias.data.copy_(qkv_bias)
+        
+        # Copy bias only if RDT has bias
+        if rdt_layer.self_attn.qkv_proj.bias is not None:
+            qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+            rdt_layer.self_attn.qkv_proj.bias.data.copy_(qkv_bias)
         
         # Copy output projection
         rdt_layer.self_attn.out_proj.weight.data.copy_(bert_attn_output.dense.weight)
-        rdt_layer.self_attn.out_proj.bias.data.copy_(bert_attn_output.dense.bias)
+        if rdt_layer.self_attn.out_proj.bias is not None:
+            rdt_layer.self_attn.out_proj.bias.data.copy_(bert_attn_output.dense.bias)
         
         # Copy FFN
         copy_ffn_weights(bert_layer, rdt_layer.ffn)
@@ -129,6 +154,26 @@ def load_bert_weights_to_rdt(
                 print(f"    (AdaLN projections remain zero-initialized for conditioning)")
     
     # =========================================================================
+    # Step 4: Copy Output Processor (BERT Layer num_rdt_main + 1)
+    # =========================================================================
+    if verbose:
+        print(f"\n[4/5] Copying output processor (BERT layer {num_rdt_main + 1})...")
+    
+    output_processor_layers = rdt_model.output_processor.layers
+    if len(output_processor_layers) > 0 and (num_rdt_main + 1) < num_bert_layers:
+        # Copy only if shapes match and BERT has enough layers
+        bert_layer = bert.encoder.layer[num_rdt_main + 1]
+        rdt_layer = output_processor_layers[0]
+        
+        try:
+            copy_transformer_encoder_layer(bert_layer, rdt_layer)
+            if verbose:
+                print(f"  ✓ Output processor[0] ← BERT layer[{num_rdt_main + 1}]")
+        except Exception as e:
+            if verbose:
+                print(f"  ⚠ Skipping output processor (incompatible): {e}")
+    
+    # =========================================================================
     # Summary
     # =========================================================================
     if verbose:
@@ -137,9 +182,10 @@ def load_bert_weights_to_rdt(
         print(f"{'='*60}")
         print("\nInitialized components:")
         print("  ✓ Token embeddings")
-        print("  ✓ Main encoder (semantic features, recursive)")
+        print("  ✓ Input processor (BERT layer 0)")
+        print("  ✓ Main encoder (BERT layers 1-N, semantic features, recursive)")
+        print("  ✓ Output processor (BERT layer N+1)")
         print("\nRandomly initialized components:")
-        print("  • Input/Output MLP processors")
         print("  • RoPE (applied on top of BERT attention)")
         print("  • AdaLN conditioning projections (zero-init)")
         print("  • Timestep embedder (noise level)")
@@ -148,6 +194,59 @@ def load_bert_weights_to_rdt(
         print()
     
     return rdt_model
+
+
+def copy_transformer_encoder_layer(bert_layer, rdt_layer):
+    """
+    Copy BERT TransformerEncoderLayer to RDT TransformerEncoderLayer.
+    
+    RDT TransformerEncoderLayer has:
+    - self_attn: RoPESelfAttention with qkv_proj
+    - norm1, norm2: LayerNorm
+    - ffn: nn.Sequential([Linear, GELU, Dropout, Linear])
+    
+    BERT Layer has:
+    - attention.self: Q, K, V projections
+    - attention.output: output projection + LayerNorm
+    - intermediate: FFN first linear
+    - output: FFN second linear + LayerNorm
+    """
+    # Self-Attention
+    bert_self_attn = bert_layer.attention.self
+    bert_attn_output = bert_layer.attention.output
+    
+    # Get Q, K, V weights from BERT
+    q_weight = bert_self_attn.query.weight  # [d_model, d_model]
+    k_weight = bert_self_attn.key.weight
+    v_weight = bert_self_attn.value.weight
+    
+    q_bias = bert_self_attn.query.bias
+    k_bias = bert_self_attn.key.bias
+    v_bias = bert_self_attn.value.bias
+    
+    # Fuse into RDT's qkv_proj
+    qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)  # [3*d_model, d_model]
+    rdt_layer.self_attn.qkv_proj.weight.data.copy_(qkv_weight)
+    
+    # Copy bias only if RDT has bias
+    if rdt_layer.self_attn.qkv_proj.bias is not None:
+        qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+        rdt_layer.self_attn.qkv_proj.bias.data.copy_(qkv_bias)
+    
+    # Copy output projection
+    rdt_layer.self_attn.out_proj.weight.data.copy_(bert_attn_output.dense.weight)
+    if rdt_layer.self_attn.out_proj.bias is not None:
+        rdt_layer.self_attn.out_proj.bias.data.copy_(bert_attn_output.dense.bias)
+    
+    # Copy FFN
+    copy_ffn_weights(bert_layer, rdt_layer.ffn)
+    
+    # Copy LayerNorms
+    rdt_layer.norm1.weight.data.copy_(bert_layer.attention.output.LayerNorm.weight)
+    rdt_layer.norm1.bias.data.copy_(bert_layer.attention.output.LayerNorm.bias)
+    
+    rdt_layer.norm2.weight.data.copy_(bert_layer.output.LayerNorm.weight)
+    rdt_layer.norm2.bias.data.copy_(bert_layer.output.LayerNorm.bias)
 
 
 def copy_standard_transformer_layer(bert_layer, rdt_layer):
