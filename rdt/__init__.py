@@ -57,6 +57,5 @@ __all__ = [
     'save_checkpoint',
     'load_checkpoint',
     'load_pretrained_weights',
-    'get_device',
     'count_parameters',
 ]

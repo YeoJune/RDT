@@ -46,7 +46,8 @@ class MLMTrainer:
         self.max_training_steps = config['training'].get('max_training_steps', 100000)
         self.max_grad_norm = config['training']['max_grad_norm']
         self.gradient_accumulation_steps = config['training'].get('gradient_accumulation_steps', 1)
-        print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
+        if self.accelerator.is_main_process:
+            print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -55,14 +56,23 @@ class MLMTrainer:
             weight_decay=config['training']['weight_decay']
         )
         
-        # Scheduler
+        # ============================================================================
+        # Accelerate Prepare - Standard Pattern
+        # ============================================================================
+        # Prepare model, optimizer, and dataloaders first (scheduler comes later)
+        self.model, self.optimizer, self.train_loader, self.val_loader = \
+            self.accelerator.prepare(
+                model, self.optimizer, train_loader, val_loader
+            )
+        
+        # ============================================================================
+        # Scheduler Creation - AFTER prepare() to use prepared DataLoader length
+        # ============================================================================
         self.scheduler = self._create_scheduler()
         
-        # Accelerate Prepare
-        self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = \
-            self.accelerator.prepare(
-                model, self.optimizer, train_loader, val_loader, self.scheduler
-            )
+        # Prepare scheduler separately (standard Accelerate pattern)
+        if self.scheduler:
+            self.scheduler = self.accelerator.prepare(self.scheduler)
         
         # Logging with W&B (Main Process Only)
         self.use_wandb = config.get('use_wandb', True)
@@ -162,22 +172,6 @@ class MLMTrainer:
         # Forward pass (Accelerate handles mixed precision)
         loss, logits = self.model(input_ids, attention_mask, labels)
         
-        # Store original loss for logging
-        original_loss = loss.item()
-        
-        # Accelerate의 accumulate context 사용
-        with self.accelerator.accumulate(self.model):
-            # Backward
-            self.accelerator.backward(loss)
-            
-            # Gradient Clipping
-            if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.scheduler.step()
-        
         # Calculate accuracy (on masked tokens only)
         mask = labels != -100
         if mask.sum() > 0:
@@ -187,11 +181,13 @@ class MLMTrainer:
         else:
             accuracy = torch.tensor(0.0)
         
-        return {
-            'loss': original_loss,
+        metrics = {
+            'loss': loss.item(),
             'accuracy': accuracy.item(),
             'lr': self.scheduler.get_last_lr()[0]
         }
+        
+        return loss, metrics
     
     def _train_step_cmlm(self, batch):
         """CMLM training with on-the-fly uniform masking"""
@@ -214,22 +210,6 @@ class MLMTrainer:
         # Forward pass (Accelerate handles mixed precision)
         loss, logits = self.model(masked_input_ids, attention_mask, labels)
         
-        # Store original loss for logging
-        original_loss = loss.item()
-        
-        # Accelerate의 accumulate context 사용
-        with self.accelerator.accumulate(self.model):
-            # Backward
-            self.accelerator.backward(loss)
-            
-            # Gradient Clipping
-            if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.scheduler.step()
-        
         # Calculate accuracy (on masked tokens only)
         mask = labels != -100
         if mask.sum() > 0:
@@ -238,6 +218,15 @@ class MLMTrainer:
             accuracy = correct.sum().float() / mask.sum().float()
         else:
             accuracy = torch.tensor(0.0)
+        
+        metrics = {
+            'loss': loss.item(),
+            'accuracy': accuracy.item(),
+            'mask_ratio': mask_ratio,
+            'lr': self.scheduler.get_last_lr()[0]
+        }
+        
+        return loss, metrics
         
         return {
             'loss': original_loss,
@@ -271,25 +260,6 @@ class MLMTrainer:
             masked_input_ids, attention_mask, labels, loss_weight
         )
         
-        # Store original loss for logging
-        original_loss = loss.item()
-        
-        # Accelerate의 accumulate context 사용
-        with self.accelerator.accumulate(self.model):
-            # Backward
-            self.accelerator.backward(loss)
-            
-            # Gradient Clipping
-            if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.scheduler.step()
-            
-            self.optimizer.zero_grad()
-            self.scheduler.step()
-        
         # Calculate accuracy (on masked tokens only)
         mask = labels != -100
         if mask.sum() > 0:
@@ -303,14 +273,16 @@ class MLMTrainer:
         avg_t = t.mean().item()
         mask_ratio = (labels != -100).float().sum() / mask.numel()
         
-        return {
-            'loss': original_loss,
+        metrics = {
+            'loss': loss.item(),
             'accuracy': accuracy.item(),
             'avg_time': avg_t,
             'mask_ratio': mask_ratio.item(),
             'avg_loss_weight': loss_weight.mean().item(),
             'lr': self.scheduler.get_last_lr()[0]
         }
+        
+        return loss, metrics
     
     def evaluate(self):
         """Evaluate on validation set with model-specific logic"""
@@ -574,8 +546,23 @@ class MLMTrainer:
         if self.resume_checkpoint:
             if self.accelerator.is_main_process:
                 print(f"Loading checkpoint from {self.resume_checkpoint}")
-            self.accelerator.load_state(self.resume_checkpoint)
-            # TODO: 저장된 epoch/step 정보 복원 로직 추가
+            if not self.resume_checkpoint.endswith('.pt'):
+                raise ValueError(f"Checkpoint must be a .pt file, got: {self.resume_checkpoint}")
+            
+            # Load checkpoint using utils function
+            from ..utils import load_checkpoint
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            checkpoint = load_checkpoint(
+                self.resume_checkpoint,
+                unwrapped_model,
+                self.optimizer,
+                self.scheduler
+            )
+            self.current_epoch = checkpoint.get('epoch', 0)
+            self.global_step = checkpoint.get('step', 0)
+            self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            if self.accelerator.is_main_process:
+                print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
         
         if self.training_mode == 'epoch':
             self._train_by_epoch()
@@ -606,7 +593,24 @@ class MLMTrainer:
                 train_iter = self.train_loader
             
             for batch in train_iter:
-                metrics = self.train_step(batch)
+                # ====================================================================
+                # Training Step with Gradient Accumulation - Standard Pattern
+                # ====================================================================
+                with self.accelerator.accumulate(self.model):
+                    # Get loss tensor from train_step
+                    loss, metrics = self.train_step(batch)
+                    
+                    # Backward
+                    self.accelerator.backward(loss)
+                    
+                    # Gradient Clipping (only when syncing)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
+                
                 self.global_step += 1
                 
                 # Logging (Main Process Only)
@@ -684,7 +688,23 @@ class MLMTrainer:
                 if self.global_step >= self.max_training_steps:
                     break
                 
-                metrics = self.train_step(batch)
+                # ====================================================================
+                # Training Step with Gradient Accumulation - Standard Pattern
+                # ====================================================================
+                with self.accelerator.accumulate(self.model):
+                    loss, metrics = self.train_step(batch)
+                    
+                    # Backward
+                    self.accelerator.backward(loss)
+                    
+                    # Gradient Clipping (only when syncing)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
+                
                 self.global_step += 1
                 if self.use_tqdm:
                     pbar.update(1)

@@ -55,31 +55,41 @@ class RDTTrainer:
         # TPU 환경 감지 (표준 방식)
         self.is_tpu = self.accelerator.state.distributed_type == DistributedType.XLA
         
-        # [1차] Weight tying 설정 (prepare 전 - optimizer 생성을 위해 필요)
+        # ============================================================================
+        # [CRITICAL] Weight Tying - Step 1: Apply BEFORE prepare()
+        # ============================================================================
+        # Weight tying must be done before DDP/FSDP wrapping to ensure proper sharing
         if hasattr(model, 'tie_weights'):
             model.tie_weights()
         elif hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
             model.output_projection.weight = model.token_embedding.weight
         
-        # Accelerate에 모든 것을 위임 (GPU/TPU 구분 없이 표준 방식)
-        # Scheduler는 prepare 후에 생성하므로 여기서는 제외
+        # ============================================================================
+        # Accelerate Prepare - Standard Pattern
+        # ============================================================================
+        # Prepare model, optimizer, and dataloaders together (scheduler comes later)
         self.model, self.optimizer, self.train_loader, self.val_loader = \
             self.accelerator.prepare(
                 model, self.optimizer, train_loader, val_loader
             )
         
-        # [2차] Weight tying 재적용 (prepare 후 - wrapper 내부에서 다시 적용)
-        # DDP/FSDP wrapping으로 인해 weight sharing이 깨질 수 있으므로 다시 설정
+        # ============================================================================
+        # [CRITICAL] Weight Tying - Step 2: Re-apply AFTER prepare()
+        # ============================================================================
+        # DDP/FSDP wrapping can break weight sharing, so we must re-apply
+        # Use unwrap_model to access the underlying model
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         if hasattr(unwrapped_model, 'tie_weights'):
             unwrapped_model.tie_weights()
         elif hasattr(unwrapped_model, 'output_projection') and hasattr(unwrapped_model, 'token_embedding'):
             unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
         
-        # Scheduler는 prepare 후에 생성 (prepare된 DataLoader 길이 사용)
+        # ============================================================================
+        # Scheduler Creation - AFTER prepare() to use prepared DataLoader length
+        # ============================================================================
         self.scheduler = self._create_scheduler()
         
-        # Scheduler도 prepare (선택사항이지만 권장)
+        # Prepare scheduler separately (standard Accelerate pattern)
         if self.scheduler:
             self.scheduler = self.accelerator.prepare(self.scheduler)
         
@@ -133,19 +143,37 @@ class RDTTrainer:
             print(f"Model parameters: {num_params:,}")
             print(f"Model parameters (without context): {num_params_no_context:,}")
             
-            # Weight tying 검증
+            # ========================================================================
+            # [VERIFICATION] Weight Tying Status Check
+            # ========================================================================
             if hasattr(unwrapped_model, 'output_projection') and hasattr(unwrapped_model, 'token_embedding'):
                 is_tied = unwrapped_model.output_projection.weight is unwrapped_model.token_embedding.weight
-                print(f"Weight tying: {'✓ Enabled' if is_tied else '✗ WARNING: Failed!'}")
+                print(f"\nWeight Tying Status: {'✓ ENABLED' if is_tied else '✗ FAILED'}")
+                
                 if not is_tied:
-                    print("WARNING: Weight tying verification failed! Re-applying...")
+                    print("ERROR: Weight tying verification failed!")
+                    print("Attempting to fix...")
+                    
+                    # Try to fix
                     if hasattr(unwrapped_model, 'tie_weights'):
                         unwrapped_model.tie_weights()
                     else:
                         unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
-                    # 재검증
-                    is_tied = unwrapped_model.output_projection.weight is unwrapped_model.token_embedding.weight
-                    print(f"After re-apply: {'✓ Success' if is_tied else '✗ Still Failed'}")
+                    
+                    # Final verification
+                    is_tied_after_fix = unwrapped_model.output_projection.weight is unwrapped_model.token_embedding.weight
+                    if is_tied_after_fix:
+                        print("✓ Weight tying fixed successfully!")
+                    else:
+                        print("✗ CRITICAL: Weight tying could not be fixed!")
+                        print("This may lead to incorrect training behavior.")
+                else:
+                    # Show memory addresses to confirm
+                    emb_addr = id(unwrapped_model.token_embedding.weight)
+                    proj_addr = id(unwrapped_model.output_projection.weight)
+                    print(f"  - Token embedding: {emb_addr}")
+                    print(f"  - Output projection: {proj_addr}")
+                    print(f"  - Same object: {emb_addr == proj_addr}")
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""
@@ -317,18 +345,28 @@ class RDTTrainer:
             total_gate_loss_tensor += gate_loss.detach()
             num_valid_steps += 1.0
         
-        # --- Gradient Accumulation Logic ---
-        
-        # 1. Loss 평균 계산
+        # ============================================================================
+        # Loss Calculation - Accelerate Standard Pattern
+        # ============================================================================
+        # Calculate average loss per recursive step
         final_loss = accumulated_loss / num_valid_steps
         
-        # 2. Gradient Accumulation Scaling
-        # Accelerate의 accumulate()는 자동 스케일링하지 않으므로 수동으로 나눔
-        if self.gradient_accumulation_steps > 1:
-            final_loss = final_loss / self.gradient_accumulation_steps
+        # IMPORTANT: Loss scaling is handled automatically by accelerator.accumulate()
+        # 
+        # How it works:
+        # 1. We pass gradient_accumulation_steps to Accelerator.__init__()
+        # 2. accelerator.accumulate() context manager automatically:
+        #    - Scales gradients by 1/gradient_accumulation_steps
+        #    - Controls when to sync gradients across devices
+        #    - Handles optimizer stepping at the right intervals
+        # 
+        # Reference: https://huggingface.co/docs/accelerate/usage_guides/gradient_accumulation
+        # 
+        # DO NOT manually divide loss by gradient_accumulation_steps here!
+        # That would cause double-scaling and incorrect training.
         
-        # [중요] loss는 detach하지 않고 그대로 반환 (backward 필요)
-        # logging용 텐서들만 detach
+        # Return final_loss for backward pass (not detached)
+        # Return logging tensors (detached)
         return (
             final_loss,
             (total_recon_loss_tensor / num_valid_steps).detach(),
@@ -475,10 +513,21 @@ class RDTTrainer:
         if self.resume_checkpoint:
             if self.accelerator.is_main_process:
                 print(f"Loading checkpoint from {self.resume_checkpoint}")
-            self.accelerator.load_state(self.resume_checkpoint)
-            # TODO: 저장된 epoch/step 정보 복원 로직 추가 필요
-        
-        best_val_loss = float('inf')
+            from ..utils import load_checkpoint
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            checkpoint = load_checkpoint(
+                self.resume_checkpoint,
+                unwrapped_model,
+                self.optimizer,
+                self.scheduler
+            )
+            self.current_epoch = checkpoint.get('epoch', 0)
+            self.global_step = checkpoint.get('step', 0)
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            if self.accelerator.is_main_process:
+                print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+        else:
+            best_val_loss = float('inf')
         
         for epoch in range(self.num_epochs):
             self.current_epoch = epoch
@@ -523,13 +572,13 @@ class RDTTrainer:
                 
                 self.global_step += 1
                 
-                # Logging (표준: 필요한 순간에만 값을 가져온다)
+                # ====================================================================
+                # Logging - Standard Pattern
+                # ====================================================================
                 if self.global_step % self.log_every_n_steps == 0:
-                    # Scaling 복원
-                    scale = self.gradient_accumulation_steps if self.gradient_accumulation_steps > 1 else 1.0
-                    
-                    # [Standard Fix] .item()은 여기서 한 번만 호출
-                    current_loss = loss.item() * scale
+                    # Get scalar values (accumulate() context handles averaging)
+                    # No need to manually scale - the reported loss is already correct
+                    current_loss = loss.item()
                     current_recon = recon.item()
                     current_gate = gate.item()
                     current_aux = aux.item()
@@ -554,7 +603,7 @@ class RDTTrainer:
                             self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
                                       for k, v in log_data.items()}, step=self.global_step)
                         
-                        # tqdm 업데이트 (이미 계산된 값 재사용)
+                        # tqdm update
                         if self.use_tqdm:
                             progress_bar.set_postfix({
                                 'step': self.global_step,
@@ -600,14 +649,18 @@ class RDTTrainer:
                             if hasattr(unwrapped_model, '_orig_mod'):
                                 unwrapped_model = unwrapped_model._orig_mod
                             
-                            torch.save({
-                                'model_state_dict': unwrapped_model.state_dict(),
-                                'optimizer_state_dict': self.optimizer.state_dict(),
-                                'epoch': epoch,
-                                'step': self.global_step,
-                                'best_val_loss': best_val_loss,
-                                'config': self.config
-                            }, f"{self.checkpoint_dir}/best_model.pt")
+                            from ..utils import save_checkpoint
+                            save_checkpoint(
+                                model=unwrapped_model,
+                                optimizer=self.optimizer,
+                                scheduler=self.scheduler,
+                                epoch=epoch,
+                                step=self.global_step,
+                                loss=val_loss,
+                                config=self.config,
+                                checkpoint_dir=self.checkpoint_dir,
+                                filename="best_model.pt"
+                            )
                             print(f"Best checkpoint saved at epoch {epoch+1}, step {self.global_step}")
             
             # Checkpoint
@@ -619,15 +672,19 @@ class RDTTrainer:
                     if hasattr(unwrapped_model, '_orig_mod'):
                         unwrapped_model = unwrapped_model._orig_mod
                     
-                    torch.save({
-                        'model_state_dict': unwrapped_model.state_dict(),
-                        'optimizer_state_dict': self.optimizer.state_dict(),
-                        'epoch': epoch + 1,
-                        'step': self.global_step,
-                        'config': self.config
-                    }, f"{self.checkpoint_dir}/checkpoint-epoch-{epoch+1}.pt")
-                    print(f"Checkpoint saved: epoch {epoch+1}")
-                    # cleanup_checkpoints는 필요시 별도 구현
+                    from ..utils import save_checkpoint, cleanup_checkpoints
+                    save_checkpoint(
+                        model=unwrapped_model,
+                        optimizer=self.optimizer,
+                        scheduler=self.scheduler,
+                        epoch=epoch + 1,
+                        step=self.global_step,
+                        loss=0.0,  # Not applicable for regular checkpoints
+                        config=self.config,
+                        checkpoint_dir=self.checkpoint_dir,
+                        filename=f"checkpoint_epoch_{epoch+1}_step_{self.global_step}.pt"
+                    )
+                    cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
         
         if self.accelerator.is_main_process:
             print("\nTraining completed!")
@@ -641,13 +698,25 @@ class RDTTrainer:
         if self.resume_checkpoint:
             if self.accelerator.is_main_process:
                 print(f"Loading checkpoint from {self.resume_checkpoint}")
-            self.accelerator.load_state(self.resume_checkpoint)
-            # TODO: 저장된 epoch/step 정보 복원 로직 추가 필요
-        
-        best_val_loss = float('inf')
-        
-        step = 0
-        epoch = 0
+            from ..utils import load_checkpoint
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            checkpoint = load_checkpoint(
+                self.resume_checkpoint,
+                unwrapped_model,
+                self.optimizer,
+                self.scheduler
+            )
+            epoch = checkpoint.get('epoch', 0)
+            step = checkpoint.get('step', 0)
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            self.current_epoch = epoch
+            self.global_step = step
+            if self.accelerator.is_main_process:
+                print(f"Resumed from epoch {epoch}, step {step}")
+        else:
+            best_val_loss = float('inf')
+            step = 0
+            epoch = 0
         
         while step < self.max_training_steps:
             self.current_epoch = epoch
@@ -690,10 +759,12 @@ class RDTTrainer:
                 step += 1
                 self.global_step = step
                 
+                # ====================================================================
+                # Logging - Standard Pattern
+                # ====================================================================
                 if step % self.log_every_n_steps == 0 and self.accelerator.is_main_process:
-                    # [핵심] 여기서만 .item() 호출
-                    # loss는 scaling 되었으므로 실제 loss를 보려면 다시 곱해줌
-                    current_loss = loss.item() * self.gradient_accumulation_steps if self.gradient_accumulation_steps > 1 else loss.item()
+                    # Get scalar values (accumulate() context handles averaging)
+                    current_loss = loss.item()
                     current_recon = recon.item()
                     current_gate = gate.item()
                     current_aux = aux.item()
@@ -715,7 +786,7 @@ class RDTTrainer:
                         self.accelerator.log({'train/' + k if not k in ['epoch', 'step'] else k: v 
                                   for k, v in log_data.items()}, step=step)
                     
-                    # tqdm 업데이트 (이미 계산된 값 재사용)
+                    # tqdm update
                     if self.use_tqdm:
                         progress_bar.set_postfix({
                             'step': step,
@@ -761,14 +832,18 @@ class RDTTrainer:
                                 if hasattr(unwrapped_model, '_orig_mod'):
                                     unwrapped_model = unwrapped_model._orig_mod
                                 
-                                torch.save({
-                                    'model_state_dict': unwrapped_model.state_dict(),
-                                    'optimizer_state_dict': self.optimizer.state_dict(),
-                                    'epoch': epoch,
-                                    'step': step,
-                                    'best_val_loss': best_val_loss,
-                                    'config': self.config
-                                }, f"{self.checkpoint_dir}/best_model.pt")
+                                from ..utils import save_checkpoint
+                                save_checkpoint(
+                                    model=unwrapped_model,
+                                    optimizer=self.optimizer,
+                                    scheduler=self.scheduler,
+                                    epoch=epoch,
+                                    step=step,
+                                    loss=val_loss,
+                                    config=self.config,
+                                    checkpoint_dir=self.checkpoint_dir,
+                                    filename="best_model.pt"
+                                )
                                 print(f"Best checkpoint saved at step {step}")
                 
                 # Checkpoint
@@ -780,15 +855,19 @@ class RDTTrainer:
                         if hasattr(unwrapped_model, '_orig_mod'):
                             unwrapped_model = unwrapped_model._orig_mod
                         
-                        torch.save({
-                            'model_state_dict': unwrapped_model.state_dict(),
-                            'optimizer_state_dict': self.optimizer.state_dict(),
-                            'epoch': epoch,
-                            'step': step,
-                            'config': self.config
-                        }, f"{self.checkpoint_dir}/checkpoint-step-{step}.pt")
-                        print(f"Checkpoint saved: step {step}")
-                        # cleanup_checkpoints는 필요시 별도 구현
+                        from ..utils import save_checkpoint, cleanup_checkpoints
+                        save_checkpoint(
+                            model=unwrapped_model,
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            epoch=epoch,
+                            step=step,
+                            loss=0.0,  # Not applicable for regular checkpoints
+                            config=self.config,
+                            checkpoint_dir=self.checkpoint_dir,
+                            filename=f"checkpoint_epoch_{epoch}_step_{step}.pt"
+                        )
+                        cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
             
             epoch += 1
         

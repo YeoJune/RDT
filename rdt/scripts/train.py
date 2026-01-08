@@ -146,15 +146,20 @@ def main():
     if args.checkpoint:
         if accelerator.is_main_process:
             print(f"\nResuming from checkpoint: {args.checkpoint}")
+        if not args.checkpoint.endswith('.pt'):
+            raise ValueError(f"Checkpoint must be a .pt file, got: {args.checkpoint}")
         trainer.resume_checkpoint = args.checkpoint
     
     elif args.pretrained:
         if accelerator.is_main_process:
             print(f"\nLoading pretrained weights: {args.pretrained}")
-            from rdt.utils import load_pretrained_weights
-            # unwrap model before loading
-            unwrapped_model = accelerator.unwrap_model(trainer.model)
-            load_pretrained_weights(args.pretrained, unwrapped_model)
+        if not args.pretrained.endswith('.pt'):
+            raise ValueError(f"Pretrained weights must be a .pt file, got: {args.pretrained}")
+        from rdt.utils import load_pretrained_weights
+        # unwrap model before loading
+        unwrapped_model = accelerator.unwrap_model(trainer.model)
+        load_pretrained_weights(args.pretrained, unwrapped_model)
+        if accelerator.is_main_process:
             print("Starting training from epoch 0, step 0 with pretrained weights")
     
     # Train

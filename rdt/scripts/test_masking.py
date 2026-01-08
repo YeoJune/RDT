@@ -1158,8 +1158,6 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
 
         model.eval()
         
-        model.eval()
-        
         # Load test data
         test_texts = load_test_texts_rdt(config, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")

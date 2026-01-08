@@ -43,6 +43,10 @@ def main():
     
     args = parser.parse_args()
     
+    # Validate checkpoint file extension
+    if not args.checkpoint.endswith('.pt'):
+        raise ValueError(f"Checkpoint must be a .pt file, got: {args.checkpoint}")
+    
     # Load config
     print(f"Loading config from {args.config}")
     config = load_config(args.config)
@@ -76,6 +80,7 @@ def main():
         
         model = create_model_from_config(config, vocab_size)
         checkpoint = load_checkpoint(args.checkpoint, model)
+        print(f"Model loaded from epoch {checkpoint.get('epoch', 'N/A')}, step {checkpoint.get('step', 'N/A')}")
         
         # Create preprocessor
         preprocessor = RDTPreprocessor(tokenizer, config).to(device)
@@ -101,6 +106,7 @@ def main():
         model_name = config['model']['name']
         model = MLM(model_name=model_name)
         checkpoint = load_checkpoint(args.checkpoint, model)
+        print(f"Model loaded from epoch {checkpoint.get('epoch', 'N/A')}, step {checkpoint.get('step', 'N/A')}")
         
         # Create dataloader
         print(f"\nPreparing MLM {args.split} data...")
@@ -110,6 +116,7 @@ def main():
         # Load CMLM model
         model = CMLM.from_config(config)
         checkpoint = load_checkpoint(args.checkpoint, model)
+        print(f"Model loaded from epoch {checkpoint.get('epoch', 'N/A')}, step {checkpoint.get('step', 'N/A')}")
         
         # Create dataloader
         print(f"\nPreparing CMLM {args.split} data...")
@@ -119,6 +126,7 @@ def main():
         # Load MDLM model
         model = MDLM.from_config(config)
         checkpoint = load_checkpoint(args.checkpoint, model)
+        print(f"Model loaded from epoch {checkpoint.get('epoch', 'N/A')}, step {checkpoint.get('step', 'N/A')}")
         
         # Create dataloader
         print(f"\nPreparing MDLM {args.split} data...")

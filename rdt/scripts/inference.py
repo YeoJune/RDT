@@ -354,6 +354,10 @@ def main():
     
     args = parser.parse_args()
     
+    # Validate checkpoint file extension
+    if not args.checkpoint.endswith('.pt'):
+        raise ValueError(f"Checkpoint must be a .pt file, got: {args.checkpoint}")
+    
     # Load checkpoint
     print(f"Loading checkpoint from {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
@@ -365,7 +369,12 @@ def main():
         config = checkpoint['config']
     
     # Get device
-    device = get_device(args.device)
+    if args.device == 'cuda' and torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif args.device == 'cpu':
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     # Determine model type

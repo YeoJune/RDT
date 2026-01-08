@@ -126,10 +126,21 @@ def save_checkpoint(
     checkpoint_dir: str,
     filename: str = None
 ):
-    """Save training checkpoint
+    """Save training checkpoint in .pt format
     
     Note: 'model' should be already unwrapped by accelerator.unwrap_model()
     to avoid DDP 'module.' prefix in state dict keys.
+    
+    Args:
+        model: Unwrapped model (without DDP wrapper)
+        optimizer: Optimizer instance
+        scheduler: Learning rate scheduler
+        epoch: Current epoch number
+        step: Current global step
+        loss: Current loss value
+        config: Training configuration dictionary
+        checkpoint_dir: Directory to save checkpoint
+        filename: Checkpoint filename (default: checkpoint_epoch_{epoch}_step_{step}.pt)
     """
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -139,15 +150,24 @@ def save_checkpoint(
     
     checkpoint_path = checkpoint_dir / filename
     
-    torch.save({
+    checkpoint_data = {
         'epoch': epoch,
         'step': step,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'loss': loss,
         'config': config
-    }, checkpoint_path)
+    }
+    
+    # Add scheduler state if available
+    if scheduler is not None:
+        checkpoint_data['scheduler_state_dict'] = scheduler.state_dict()
+    
+    # Add best_val_loss if it's a best model checkpoint
+    if 'best' in filename:
+        checkpoint_data['best_val_loss'] = loss
+    
+    torch.save(checkpoint_data, checkpoint_path)
     
     print(f"Checkpoint saved: {checkpoint_path}")
     return checkpoint_path
@@ -159,10 +179,22 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer = None,
     scheduler: Any = None
 ) -> Dict:
-    """Load training checkpoint with DDP support
+    """Load training checkpoint from .pt file with DDP support
     
     Automatically handles 'module.' prefix from DDP-saved models.
+    
+    Args:
+        checkpoint_path: Path to .pt checkpoint file
+        model: Model instance to load weights into
+        optimizer: Optional optimizer to load state into
+        scheduler: Optional scheduler to load state into
+        
+    Returns:
+        Dictionary containing checkpoint metadata (epoch, step, loss, config, etc.)
     """
+    if not checkpoint_path.endswith('.pt'):
+        raise ValueError(f"Checkpoint must be a .pt file, got: {checkpoint_path}")
+    
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
     # Handle DDP 'module.' prefix if present
@@ -188,6 +220,8 @@ def load_checkpoint(
             print(f"Warning: Could not load scheduler state (skipping): {e}")
     
     print(f"Checkpoint loaded: {checkpoint_path}")
+    print(f"  Epoch: {checkpoint.get('epoch', 'N/A')}, Step: {checkpoint.get('step', 'N/A')}")
+    
     return checkpoint
 
 
@@ -195,10 +229,18 @@ def load_pretrained_weights(
     checkpoint_path: str,
     model: torch.nn.Module
 ) -> None:
-    """Load only model weights from checkpoint without optimizer/scheduler state
+    """Load only model weights from .pt checkpoint without optimizer/scheduler state
     
     Automatically handles 'module.' prefix from DDP-saved models.
+    Use this for transfer learning or initializing from pretrained weights.
+    
+    Args:
+        checkpoint_path: Path to .pt checkpoint file
+        model: Model instance to load weights into
     """
+    if not checkpoint_path.endswith('.pt'):
+        raise ValueError(f"Checkpoint must be a .pt file, got: {checkpoint_path}")
+    
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
     # Handle DDP 'module.' prefix if present
@@ -216,13 +258,19 @@ def load_pretrained_weights(
 
 
 def cleanup_checkpoints(checkpoint_dir: str, keep_last_n: int = 3):
-    """Keep only the last N checkpoints"""
+    """Keep only the last N checkpoints (.pt files)
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoint files
+        keep_last_n: Number of most recent checkpoints to keep
+    """
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():
         return
     
+    # Find all checkpoint .pt files (excluding best_model.pt)
     checkpoints = sorted(
-        checkpoint_dir.glob("checkpoint_epoch_*.pt"),
+        [f for f in checkpoint_dir.glob("checkpoint_*.pt") if f.name != "best_model.pt"],
         key=lambda x: x.stat().st_mtime
     )
     
