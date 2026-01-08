@@ -129,9 +129,13 @@ class RDTPreprocessor:
             step_loss_mask = step_loss_mask & attention_mask.bool()
             
             # Target Tokens
-            step_targets = input_ids.clone()
+            # 아직 마스킹되어야 할 토큰은 [MASK]로, 복원된 토큰은 원본 유지
             still_masked = restore_ranks >= upper_bound
-            step_targets[still_masked] = self.mask_token_id
+            step_targets = torch.where(
+                still_masked,
+                torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
+                input_ids
+            )
             
             # Assign
             targets[:, i, :] = step_targets
