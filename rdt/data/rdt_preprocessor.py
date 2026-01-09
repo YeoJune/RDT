@@ -98,32 +98,45 @@ class RDTPreprocessor:
             visible_positions = order[:num_visible]  # [num_visible]
             masked_positions = order[num_visible:]   # [actual_length - num_visible]
             
-            # Input 생성: visible은 원본, masked는 마스킹
-            inputs[b] = input_ids[b].clone()
+            # Input 생성: pad_token으로 초기화
+            sample_input = torch.full((L,), self.pad_token_id, dtype=torch.long, device=device)
             
-            if self.bert_masking_enabled:
-                # BERT-style masking: 80% [MASK], 10% random, 10% keep
-                num_masked = len(masked_positions)
-                rand = torch.rand(num_masked, device=device)
-                
-                # 80% [MASK]
-                mask_indices = masked_positions[rand < 0.8]
-                inputs[b, mask_indices] = self.mask_token_id
-                
-                # 10% random token
-                random_indices = masked_positions[(rand >= 0.8) & (rand < 0.9)]
-                if len(random_indices) > 0:
-                    random_tokens = torch.randint(
-                        self.cls_token_id + 1, 
-                        self.vocab_size, 
-                        (len(random_indices),), 
-                        device=device
-                    )
-                    inputs[b, random_indices] = random_tokens
-                
-                # 10% keep original (do nothing)
-            else:
-                inputs[b, masked_positions] = self.mask_token_id
+            # 보이는 위치에 원본 토큰 배치
+            if len(visible_positions) > 0:
+                sample_input[visible_positions] = input_ids[b, visible_positions]
+            
+            # 마스킹된 위치 처리
+            if len(masked_positions) > 0:
+                if self.bert_masking_enabled:
+                    # BERT-style masking: 80% [MASK], 10% random, 10% keep
+                    num_masked = len(masked_positions)
+                    rand = torch.rand(num_masked, device=device)
+                    
+                    # 80% [MASK]
+                    mask_indices = masked_positions[rand < 0.8]
+                    if len(mask_indices) > 0:
+                        sample_input[mask_indices] = self.mask_token_id
+                    
+                    # 10% random token
+                    random_indices = masked_positions[(rand >= 0.8) & (rand < 0.9)]
+                    if len(random_indices) > 0:
+                        random_tokens = torch.randint(
+                            self.cls_token_id + 1, 
+                            self.vocab_size, 
+                            (len(random_indices),), 
+                            device=device
+                        )
+                        sample_input[random_indices] = random_tokens
+                    
+                    # 10% keep original
+                    keep_indices = masked_positions[rand >= 0.9]
+                    if len(keep_indices) > 0:
+                        sample_input[keep_indices] = input_ids[b, keep_indices]
+                else:
+                    # 단순 masking: 전부 [MASK]
+                    sample_input[masked_positions] = self.mask_token_id
+            
+            inputs[b] = sample_input
             
             # Gate target
             gate_targets[b, 0] = (start_steps[b].float() / self.total_steps) * 20.0
@@ -151,13 +164,15 @@ class RDTPreprocessor:
                 curr_num_visible = int(curr_visible_ratio * actual_length)
                 target_num_visible = int(target_visible_ratio * actual_length)
                 
-                # 이번 step에서 새로 복원할 토큰들
-                # order[curr_num_visible : target_num_visible]
-                newly_visible_positions = order[curr_num_visible:target_num_visible]
-                
-                # Loss mask: 새로 복원되는 위치들
+                # ============================================================
+                # Loss Mask 생성
+                # ============================================================
                 step_loss_mask = torch.zeros(L, dtype=torch.bool, device=device)
-                step_loss_mask[newly_visible_positions] = True
+                
+                # 이번 step에서 새로 복원할 토큰들
+                newly_visible_positions = order[curr_num_visible:target_num_visible]
+                if len(newly_visible_positions) > 0:
+                    step_loss_mask[newly_visible_positions] = True
                 
                 # Rehearsal: 이미 보이는 토큰 중 일부도 loss 계산
                 if self.visible_loss_ratio > 0 and curr_num_visible > 0:
@@ -169,12 +184,27 @@ class RDTPreprocessor:
                         rehearsal_positions = already_visible_positions[rehearsal_indices]
                         step_loss_mask[rehearsal_positions] = True
                 
-                # Target: 다음 step에서 보일 상태
-                step_target = input_ids[b].clone()
-                still_masked_positions = order[target_num_visible:]  # 아직 마스킹된 위치들
-                step_target[still_masked_positions] = self.mask_token_id
+                # ============================================================
+                # Target 생성
+                # ============================================================
+                # 초기화: 전부 패딩
+                step_target = torch.full((L,), self.pad_token_id, dtype=torch.long, device=device)
                 
+                # 다음 step에서 보일 위치: 원본 토큰
+                visible_until_target = order[:target_num_visible]
+                if len(visible_until_target) > 0:
+                    step_target[visible_until_target] = input_ids[b, visible_until_target]
+                
+                # 아직 마스킹된 위치: [MASK]
+                still_masked = order[target_num_visible:]
+                if len(still_masked) > 0:
+                    step_target[still_masked] = self.mask_token_id
+                
+                # 패딩 위치는 초기값 그대로 (pad_token_id)
+                
+                # ============================================================
                 # 할당
+                # ============================================================
                 targets[b, step_idx] = step_target
                 loss_masks[b, step_idx] = step_loss_mask
                 gate_targets[b, step_idx + 1] = (target_step.float() / self.total_steps) * 20.0
