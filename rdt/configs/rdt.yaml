@@ -7,7 +7,7 @@ model_type: "rdt" # 'rdt' or 'mlm'
 model:
   d_model: 512 # Hidden dimension (auto-set from BERT if use_bert_init=true)
   n_heads: 8 # Attention heads (d_model / 64)
-  n_encoder_layers: 4 # Main encoder depth (recursive)
+  n_encoder_layers: 6 # Main encoder depth (recursive)
   d_ff: 2048 # FFN dimension (4x d_model)
   dropout: 0.1
 
@@ -59,12 +59,12 @@ training:
   aux_temp: 0.5
 
   # Optimization
-  batch_size: 32
-  gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 16
+  gradient_accumulation_steps: 1 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 15 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
-  learning_rate: 0.001 # 2e-4
+  learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.05 # 5% of total steps
 
