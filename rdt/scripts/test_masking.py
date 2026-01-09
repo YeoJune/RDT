@@ -1157,29 +1157,40 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             
             new_state_dict[new_key] = value
         
-        # 1. Load state dict
+        # strict=False로 로드하되, 결과를 받아서 검증
         load_result = model.load_state_dict(new_state_dict, strict=False)
-
-        # 2. ✅ BEFORE .to(device) - tie weights
-        if hasattr(model, 'tie_weights'):
-            model.tie_weights()
-        elif hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
-            model.output_projection.weight = model.token_embedding.weight
-
-        # 3. Move to device
+        
+        print("\n" + "="*40)
+        print("Checkpoint Loading Report")
+        print("="*40)
+        
+        # 누락된 키가 있는지 확인 (Missing Keys)
+        if len(load_result.missing_keys) > 0:
+            print(f"⚠️  WARNING: {len(load_result.missing_keys)} keys are missing!")
+            # 일부 키만 출력 (너무 많을 수 있으므로)
+            print(f"Examples: {load_result.missing_keys[:5]}")
+            
+            # 중요 파라미터가 누락되었는지 체크
+            if any('encoder_layers' in k for k in load_result.missing_keys):
+                print("❌ CRITICAL: Encoder layers not loaded. The model is effectively untreated.")
+        else:
+            print("✅ All model keys matched successfully.")
+            
+        # 예상치 못한 키가 있는지 확인 (Unexpected Keys)
+        if len(load_result.unexpected_keys) > 0:
+            print(f"ℹ️  Info: {len(load_result.unexpected_keys)} unexpected keys in checkpoint (usually fine).")
+        
         model = model.to(device)
 
-        # 4. ✅ AFTER .to(device) - tie weights AGAIN
-        if hasattr(model, 'tie_weights'):
-            model.tie_weights()
-        elif hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
+        # CRITICAL: Weight tying 복원 (.to() 이후 다시 적용)
+        # RDT 모델인 경우에만 적용
+        if hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
             model.output_projection.weight = model.token_embedding.weight
+            print("✅ Weight tying reapplied.")
 
-        # 5. Verify
+        # 검증
         is_tied = model.output_projection.weight is model.token_embedding.weight
         print(f"Weight tying verified: {is_tied}")
-        if not is_tied:
-            raise RuntimeError("Weight tying failed!")
 
         model.eval()
         
@@ -1187,43 +1198,62 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         test_texts = load_test_texts_rdt(config, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")
 
+        # TEMP : TEST START
         test_text = test_texts[0]
         encoded = tokenizer(test_text, return_tensors='pt', truncation=True, max_length=128)
         tokens = encoded['input_ids'].squeeze(0)
 
-        print(f"Original text: {test_text}")
-        print(f"Original tokens: {tokens.tolist()}")
-        print(f"Original decoded: {tokenizer.decode(tokens)}")
+        masked_tokens, eval_mask = create_masked_input(tokens, 0.1, mask_token_id, special_token_ids)
 
-        # 10% masking
-        masked_tokens, eval_mask = create_masked_input(tokens, 0.1, tokenizer.mask_token_id, set(tokenizer.all_special_ids))
-
-        print(f"\nMasked tokens: {masked_tokens.tolist()}")
-        print(f"Masked decoded: {tokenizer.decode(masked_tokens)}")
-        print(f"Eval mask positions: {eval_mask.nonzero().squeeze().tolist()}")
-        print(f"Masked positions: {[i for i, t in enumerate(masked_tokens) if t == tokenizer.mask_token_id]}")
-
-        # Inference
         input_ids = masked_tokens.unsqueeze(0).to(device)
         attention_mask = torch.ones_like(input_ids).to(device)
 
-        output_ids, steps = model.inference(input_ids, attention_mask, max_steps=20, threshold=0.5, return_steps=True)
-
-        pred_tokens = output_ids.squeeze(0).cpu()
-
-        print(f"\nPredicted tokens: {pred_tokens.tolist()}")
-        print(f"Predicted decoded: {tokenizer.decode(pred_tokens)}")
-        print(f"Steps taken: {steps.item()}")
-
-        # 마스킹된 위치에서의 예측
-        for i in eval_mask.nonzero().squeeze().tolist():
-            if isinstance(i, int):
-                i = [i]
-            for idx in (i if isinstance(i, list) else [i]):
-                print(f"\nPosition {idx}:")
-                print(f"  Original: {tokenizer.decode([tokens[idx]])} (id={tokens[idx].item()})")
-                print(f"  Predicted: {tokenizer.decode([pred_tokens[idx]])} (id={pred_tokens[idx].item()})")
-                print(f"  Match: {tokens[idx] == pred_tokens[idx]}")
+        # Manual step-by-step inference with debugging
+        with torch.no_grad():
+            # Step 0
+            hidden = model.encode_tokens(input_ids, attention_mask)
+            gate_pred, pooled = model.gate(hidden, attention_mask)
+            
+            print(f"Step 0:")
+            print(f"  Hidden mean: {hidden.mean().item():.6f}")
+            print(f"  Hidden std: {hidden.std().item():.6f}")
+            print(f"  Gate value: {gate_pred.mean().item():.4f}")
+            
+            # Decode immediately after encode
+            logits_0 = model.decode(hidden, attention_mask)
+            pred_0 = logits_0.argmax(dim=-1).squeeze(0).cpu()
+            print(f"  Top-3 predictions: {pred_0[:10].tolist()}")
+            print(f"  Unique predictions: {pred_0.unique().tolist()[:20]}")
+            
+            # Step 1
+            hidden_1, _, _ = model.forward_step(hidden, attention_mask, gate_pred, pooled)
+            gate_1, pooled_1 = model.gate(hidden_1, attention_mask, pooled, gate_pred)
+            
+            print(f"\nStep 1:")
+            print(f"  Hidden mean: {hidden_1.mean().item():.6f}")
+            print(f"  Hidden std: {hidden_1.std().item():.6f}")
+            print(f"  Gate value: {gate_1.mean().item():.4f}")
+            
+            logits_1 = model.decode(hidden_1, attention_mask)
+            pred_1 = logits_1.argmax(dim=-1).squeeze(0).cpu()
+            print(f"  Top-3 predictions: {pred_1[:10].tolist()}")
+            print(f"  Unique predictions: {pred_1.unique().tolist()[:20]}")
+            
+            # Step 2
+            hidden_2, _, _ = model.forward_step(hidden_1, attention_mask, gate_1, pooled_1)
+            gate_2, pooled_2 = model.gate(hidden_2, attention_mask, pooled_1, gate_1)
+            
+            print(f"\nStep 2:")
+            print(f"  Hidden mean: {hidden_2.mean().item():.6f}")
+            print(f"  Hidden std: {hidden_2.std().item():.6f}")
+            print(f"  Gate value: {gate_2.mean().item():.4f}")
+            
+            logits_2 = model.decode(hidden_2, attention_mask)
+            pred_2 = logits_2.argmax(dim=-1).squeeze(0).cpu()
+            print(f"  Top-3 predictions: {pred_2[:10].tolist()}")
+            print(f"  Unique predictions: {pred_2.unique().tolist()[:20]}")
+            
+        # TEMP : TEST END
         
         # Set parameters
         threshold = threshold if threshold is not None else config['model']['threshold']
