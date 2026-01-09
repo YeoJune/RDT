@@ -1203,7 +1203,9 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         encoded = tokenizer(test_text, return_tensors='pt', truncation=True, max_length=128)
         tokens = encoded['input_ids'].squeeze(0)
 
-        masked_tokens, eval_mask = create_masked_input(tokens, 0.1, mask_token_id, special_token_ids)
+        special_token_ids = set(tokenizer.all_special_ids)
+
+        masked_tokens, eval_mask = create_masked_input(tokens, 0.1, tokenizer.mask_token_id, special_token_ids)
 
         input_ids = masked_tokens.unsqueeze(0).to(device)
         attention_mask = torch.ones_like(input_ids).to(device)
