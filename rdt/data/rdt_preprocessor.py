@@ -5,8 +5,7 @@ from typing import Dict, List
 class RDTPreprocessor:
     """
     RDT 데이터 생성 로직을 수행하는 Collator.
-    DataLoader의 collate_fn으로 사용되어 배치 단위로 전처리를 수행.
-    TPU 최적화: CPU에서 동작하며 고정 크기 텐서를 생성.
+    명확성을 위해 최적화보다 정확성과 해석 가능성에 집중.
     """
     def __init__(self, tokenizer, config, device='cpu'):
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -28,126 +27,158 @@ class RDTPreprocessor:
     @torch.no_grad()
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         """
-        Collator function that processes a batch of samples.
+        명확하고 해석 가능한 데이터 생성 로직.
         
-        Args:
-            batch: List of dicts with 'input_ids' key
-        Returns:
-            processed_batch: Dict - RDT 모델 입력 형태
+        핵심 아이디어:
+        1. 실제 토큰들만 추출
+        2. 복원 순서 배열 생성 (0-indexed, dense)
+        3. 순서 배열 기반으로 마스킹 및 타겟 생성
         """
-        # Stack input_ids from batch
         input_ids = torch.stack([item['input_ids'] for item in batch])
         device = self.device
         input_ids = input_ids.to(device)
         
         B, L = input_ids.shape
+        attention_mask = (input_ids != self.pad_token_id).long()
         
-        # 1. Chain Length & Start Step
+        # ================================================================
+        # Step 1: Chain length & Start step 결정
+        # ================================================================
         chain_lengths = torch.randint(1, self.max_chain_length + 1, (B,), device=device)
-        max_chain_len_in_batch = self.max_chain_length #chain_lengths.max().item()
         
         min_starts = chain_lengths
         ranges = self.total_steps - min_starts + 1
-
-        max_start = 5  # 이 값 조정
-        ranges = torch.clamp(ranges, max=max_start - min_starts + 1)
-
         start_steps = min_starts + torch.rand(B, device=device).mul(ranges).long()
         
-        # 2. Random Permutation Logic (GPU Friendly)
-        rand_scores = torch.rand(B, L, device=device)
+        # ================================================================
+        # Step 2: 각 샘플별로 복원 순서 배열 생성
+        # ================================================================
+        # restore_order[b, i] = i번째로 복원될 실제 토큰의 position
+        # 예: restore_order[0] = [5, 2, 8, 1, ...] 
+        #     → Position 5가 가장 먼저, Position 2가 두 번째, ...
         
-        # 패딩 토큰은 아주 큰 값으로 설정하여 항상 마지막 랭크를 받도록
-        # 이렇게 하면 visible_counts 계산이 실제 토큰만 기준으로 정확하게 작동
-        padding_mask = (input_ids == self.pad_token_id)
-        rand_scores = torch.where(padding_mask, torch.tensor(1e9, device=device), rand_scores)
+        restore_order = []  # List of tensors, each [actual_length]
+        actual_lengths = []  # List of ints
         
-        restore_ranks = rand_scores.argsort(dim=1).argsort(dim=1)
+        for b in range(B):
+            # 실제 토큰 위치들
+            real_positions = attention_mask[b].nonzero(as_tuple=True)[0]  # [actual_length]
+            actual_length = len(real_positions)
+            actual_lengths.append(actual_length)
+            
+            # 랜덤 순서 생성
+            perm = torch.randperm(actual_length, device=device)
+            
+            # restore_order: i번째로 복원될 position
+            order = real_positions[perm]  # [actual_length]
+            restore_order.append(order)
         
-        # 3. Init Tensors
+        # ================================================================
+        # Step 3: 텐서 초기화
+        # ================================================================
+        max_chain_len = self.max_chain_length
+        
         inputs = torch.full((B, L), self.pad_token_id, dtype=torch.long, device=device)
-        targets = torch.full((B, max_chain_len_in_batch, L), self.pad_token_id, dtype=torch.long, device=device)
-        loss_masks = torch.zeros((B, max_chain_len_in_batch, L), dtype=torch.bool, device=device)
-        gate_targets = torch.zeros((B, max_chain_len_in_batch + 1), dtype=torch.float, device=device)
-        attention_mask = (input_ids != self.pad_token_id).long()
+        targets = torch.full((B, max_chain_len, L), self.pad_token_id, dtype=torch.long, device=device)
+        loss_masks = torch.zeros((B, max_chain_len, L), dtype=torch.bool, device=device)
+        gate_targets = torch.zeros((B, max_chain_len + 1), dtype=torch.float, device=device)
         
-        # 실제 토큰 개수 계산 (패딩 제외)
-        # [B] - 각 샘플의 실제 토큰 개수
-        actual_lengths = attention_mask.sum(dim=1).float()
-        
-        # 4. Input Generation (s_0)
-        input_steps = start_steps
-        visible_ratios = 1.0 - (input_steps.float() / self.total_steps)
-        # 실제 토큰 개수 기준으로 visible_counts 계산 [B]
-        visible_counts = (visible_ratios * actual_lengths).long()
-        
-        is_masked = restore_ranks >= visible_counts.unsqueeze(1)
-        is_masked = is_masked & (attention_mask.bool()) # 패딩은 마스킹 제외
-        
-        inputs = input_ids.clone()
-        if self.bert_masking_enabled:
-            mask_token_mask = (torch.rand(B, L, device=device) < self.mask_prob) & is_masked
-            random_token_mask = (torch.rand(B, L, device=device) < (self.mask_prob + self.random_prob)) & is_masked & ~mask_token_mask
+        # ================================================================
+        # Step 4: 각 샘플별로 Input 생성 (Step 0)
+        # ================================================================
+        for b in range(B):
+            actual_length = actual_lengths[b]
+            order = restore_order[b]  # [actual_length]
             
-            # TPU 최적화: Boolean indexing 대신 torch.where 사용 (Shape 고정)
-            inputs = torch.where(mask_token_mask, torch.tensor(self.mask_token_id, device=device), inputs)
+            # 현재 step에서 보이는 토큰 개수
+            visible_ratio = 1.0 - (start_steps[b].float() / self.total_steps)
+            num_visible = int(visible_ratio * actual_length)
             
-            # Random 토큰 적용: 전체 크기 텐서를 미리 생성하여 dynamic shape 방지
-            random_tokens_full = torch.randint(self.cls_token_id + 1, self.vocab_size, (B, L), device=device)
-            inputs = torch.where(random_token_mask, random_tokens_full, inputs)
-        else:
-            inputs = torch.where(is_masked, torch.tensor(self.mask_token_id, device=device), inputs)
+            # 가장 먼저 복원되는 num_visible개 토큰들
+            visible_positions = order[:num_visible]  # [num_visible]
+            masked_positions = order[num_visible:]   # [actual_length - num_visible]
             
-        gate_targets[:, 0] = (input_steps.float() / self.total_steps) * 20.0
-        
-        # 5. Chain Generation
-        # TPU 최적화: break 없이 고정 횟수 루프 실행
-        # valid_samples가 False인 경우 loss_masks가 0이 되어 학습에 영향 없음
-        for i in range(max_chain_len_in_batch):
-            valid_samples = chain_lengths > i
+            # Input 생성: visible은 원본, masked는 마스킹
+            inputs[b] = input_ids[b].clone()
+            
+            if self.bert_masking_enabled:
+                # BERT-style masking: 80% [MASK], 10% random, 10% keep
+                num_masked = len(masked_positions)
+                rand = torch.rand(num_masked, device=device)
                 
-            # 타겟 스텝 계산
-            target_steps = start_steps - (i + 1)
+                # 80% [MASK]
+                mask_indices = masked_positions[rand < 0.8]
+                inputs[b, mask_indices] = self.mask_token_id
+                
+                # 10% random token
+                random_indices = masked_positions[(rand >= 0.8) & (rand < 0.9)]
+                if len(random_indices) > 0:
+                    random_tokens = torch.randint(
+                        self.cls_token_id + 1, 
+                        self.vocab_size, 
+                        (len(random_indices),), 
+                        device=device
+                    )
+                    inputs[b, random_indices] = random_tokens
+                
+                # 10% keep original (do nothing)
+            else:
+                inputs[b, masked_positions] = self.mask_token_id
             
-            # Loss Mask 계산 (현재 스텝에서는 안 보였지만 다음 스텝에 보여야 할 구간)
-            # 실제 토큰 개수 기준으로 계산
-            curr_visible_ratios = 1.0 - (start_steps - i).float() / self.total_steps
-            target_visible_ratios = 1.0 - target_steps.float() / self.total_steps
-            
-            # [B] shape - 각 샘플별 visible 토큰 개수
-            curr_visible_counts = (curr_visible_ratios * actual_lengths).long()
-            target_visible_counts = (target_visible_ratios * actual_lengths).long()
-            
-            # [B, 1] shape로 확장하여 [B, L]과 비교 가능하도록
-            lower_bound = curr_visible_counts.unsqueeze(1)
-            upper_bound = target_visible_counts.unsqueeze(1)
-            
-            # 기본 복원 구간
-            step_loss_mask = (restore_ranks >= lower_bound) & (restore_ranks < upper_bound)
-            
-            # Rehearsal (Visible Loss)
-            if self.visible_loss_ratio > 0:
-                already_visible = restore_ranks < lower_bound
-                rehearsal_mask = (torch.rand(B, L, device=device) < self.visible_loss_ratio) & already_visible
-                step_loss_mask = step_loss_mask | rehearsal_mask
-            
-            # 패딩 부분은 Loss 마스크 제외
-            step_loss_mask = step_loss_mask & attention_mask.bool()
-            
-            # Target Tokens
-            # 아직 마스킹되어야 할 토큰은 [MASK]로, 복원된 토큰은 원본 유지
-            still_masked = restore_ranks >= upper_bound
-            step_targets = torch.where(
-                still_masked,
-                torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
-                input_ids
-            )
-            
-            # Assign
-            targets[:, i, :] = step_targets
-            loss_masks[:, i, :] = step_loss_mask & valid_samples.unsqueeze(1)
-            gate_targets[:, i + 1] = (target_steps.float() / self.total_steps) * 20.0
-            
+            # Gate target
+            gate_targets[b, 0] = (start_steps[b].float() / self.total_steps) * 20.0
+        
+        # ================================================================
+        # Step 5: Chain 생성
+        # ================================================================
+        for step_idx in range(max_chain_len):
+            for b in range(B):
+                # 이 샘플의 chain이 step_idx까지 유효한지
+                if chain_lengths[b] <= step_idx:
+                    continue
+                
+                actual_length = actual_lengths[b]
+                order = restore_order[b]
+                
+                # 현재 step과 타겟 step
+                current_step = start_steps[b] - step_idx
+                target_step = start_steps[b] - (step_idx + 1)
+                
+                # 현재 보이는 개수와 다음에 보일 개수
+                curr_visible_ratio = 1.0 - (current_step.float() / self.total_steps)
+                target_visible_ratio = 1.0 - (target_step.float() / self.total_steps)
+                
+                curr_num_visible = int(curr_visible_ratio * actual_length)
+                target_num_visible = int(target_visible_ratio * actual_length)
+                
+                # 이번 step에서 새로 복원할 토큰들
+                # order[curr_num_visible : target_num_visible]
+                newly_visible_positions = order[curr_num_visible:target_num_visible]
+                
+                # Loss mask: 새로 복원되는 위치들
+                step_loss_mask = torch.zeros(L, dtype=torch.bool, device=device)
+                step_loss_mask[newly_visible_positions] = True
+                
+                # Rehearsal: 이미 보이는 토큰 중 일부도 loss 계산
+                if self.visible_loss_ratio > 0 and curr_num_visible > 0:
+                    already_visible_positions = order[:curr_num_visible]
+                    num_rehearsal = int(self.visible_loss_ratio * len(already_visible_positions))
+                    
+                    if num_rehearsal > 0:
+                        rehearsal_indices = torch.randperm(len(already_visible_positions), device=device)[:num_rehearsal]
+                        rehearsal_positions = already_visible_positions[rehearsal_indices]
+                        step_loss_mask[rehearsal_positions] = True
+                
+                # Target: 다음 step에서 보일 상태
+                step_target = input_ids[b].clone()
+                still_masked_positions = order[target_num_visible:]  # 아직 마스킹된 위치들
+                step_target[still_masked_positions] = self.mask_token_id
+                
+                # 할당
+                targets[b, step_idx] = step_target
+                loss_masks[b, step_idx] = step_loss_mask
+                gate_targets[b, step_idx + 1] = (target_step.float() / self.total_steps) * 20.0
+        
         return {
             'input': inputs,
             'targets': targets,
