@@ -591,7 +591,7 @@ class RDTTrainer:
             for batch in train_iter:
                 # Accelerate의 gradient accumulation 자동 처리
                 with self.accelerator.accumulate(self.model):
-                    loss, recon, gate, aux = self.train_step(batch)
+                    loss, recon, gate, aux, acc = self.train_step(batch)
 
                     # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
                     self.accelerator.backward(loss)
