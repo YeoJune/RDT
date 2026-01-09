@@ -1207,7 +1207,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         print(f"Original decoded: {tokenizer.decode(tokens)}")
 
         # 10% masking
-        masked_tokens, eval_mask = create_masked_input(tokens, 0.1, tokenizer.mask_token_id, tokenizer.special_token_ids)
+        masked_tokens, eval_mask = create_masked_input(tokens, 0.1, tokenizer.mask_token_id, set(tokenizer.all_special_ids))
 
         print(f"\nMasked tokens: {masked_tokens.tolist()}")
         print(f"Masked decoded: {tokenizer.decode(masked_tokens)}")
