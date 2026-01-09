@@ -55,21 +55,33 @@ def main():
     print("DATA COMPARISON: Training (RDTPreprocessor) vs Test (create_masked_input)")
     print("="*80)
     
-    # Load dataset
+    # Load dataset - get more samples to find longer sequences
     dataset = WikiTextDataset(
         dataset_name=config['data']['dataset_name'],
         split='validation',
         tokenizer_name=config['data']['tokenizer_name'],
         max_seq_length=config['data']['max_seq_length'],
         samples_per_text=1,
-        max_val_samples=10
+        max_val_samples=100  # Get more samples
     )
     
-    # Get one sample
-    sample = dataset[0]
-    tokens = sample['input_ids']
+    # Find a sample with sufficient length
+    sample = None
+    for i in range(len(dataset)):
+        s = dataset[i]
+        tokens = s['input_ids']
+        non_pad = (tokens != tokenizer.pad_token_id).sum().item()
+        if non_pad >= 50:  # At least 50 real tokens
+            sample = s
+            tokens = sample['input_ids']
+            print(f"\nUsing sample {i} with {non_pad} non-padding tokens")
+            break
     
-    print(f"\nOriginal tokens shape: {tokens.shape}")
+    if sample is None:
+        print("ERROR: Could not find sample with sufficient length")
+        return
+    
+    print(f"Original tokens shape: {tokens.shape}")
     print(f"Original text: {tokenizer.decode(tokens, skip_special_tokens=True)[:100]}...")
     
     # Create RDT training data
@@ -99,20 +111,21 @@ def main():
     print(f"Masked count: {masked_count}")
     print(f"Masking ratio: {training_masking_ratio:.2%}")
     
-    print(f"\nInput text: {tokenizer.decode(training_input, skip_special_tokens=False)[:150]}...")
+    print(f"\nInput text (first 200 chars): {tokenizer.decode(training_input, skip_special_tokens=False)[:200]}...")
     
     # Show step-by-step targets
     for step in range(min(3, chain_length)):
         step_target = training_targets[step]
         step_loss_mask = training_loss_masks[step]
-        loss_positions = step_loss_mask.nonzero().squeeze().tolist()
-        if not isinstance(loss_positions, list):
-            loss_positions = [loss_positions]
+        loss_positions = step_loss_mask.nonzero().squeeze()
+        if loss_positions.dim() == 0:
+            loss_positions = [loss_positions.item()]
+        else:
+            loss_positions = loss_positions.tolist()
         
         print(f"\nStep {step}:")
         print(f"  Loss mask positions (first 10): {loss_positions[:10]}")
         print(f"  Loss mask count: {step_loss_mask.sum().item()}")
-        print(f"  Target text (first 100 chars): {tokenizer.decode(step_target, skip_special_tokens=False)[:100]}...")
     
     # Create test data with similar masking ratio
     print("\n" + "="*80)
@@ -135,13 +148,15 @@ def main():
     print(f"Requested masking ratio: {test_masking_ratio:.2%}")
     print(f"Actual masking ratio: {actual_test_ratio:.2%}")
     
-    eval_positions = test_eval_mask.nonzero().squeeze().tolist()
-    if not isinstance(eval_positions, list):
-        eval_positions = [eval_positions]
+    eval_positions = test_eval_mask.nonzero().squeeze()
+    if eval_positions.dim() == 0:
+        eval_positions = [eval_positions.item()]
+    else:
+        eval_positions = eval_positions.tolist()
     
     print(f"\nEval mask positions (first 10): {eval_positions[:10]}")
     print(f"Eval mask count: {test_eval_mask.sum().item()}")
-    print(f"\nMasked text: {tokenizer.decode(test_masked_tokens, skip_special_tokens=False)[:150]}...")
+    print(f"\nMasked text (first 200 chars): {tokenizer.decode(test_masked_tokens, skip_special_tokens=False)[:200]}...")
     
     # Comparison
     print("\n" + "="*80)
@@ -152,23 +167,14 @@ def main():
     print(f"Test masking ratio: {actual_test_ratio:.2%}")
     print(f"\nTraining: Uses [MASK] token? {(training_input == mask_token_id).any().item()}")
     print(f"Test: Uses [MASK] token? {(test_masked_tokens == mask_token_id).any().item()}")
-    print(f"\nTraining: Mask token ID = {mask_token_id}")
-    print(f"Test: Mask token ID = {mask_token_id}")
     
-    # Check if positions match for similar ratio
-    print("\n" + "="*80)
-    print("POSITION ANALYSIS")
-    print("="*80)
+    # Total loss mask count across all steps
+    total_loss_mask_count = training_loss_masks.sum().item()
+    total_loss_ratio = total_loss_mask_count / (real_length * chain_length)
     
-    # Training step 0 loss mask
-    step0_loss_mask = training_loss_masks[0]
-    step0_loss_positions = step0_loss_mask.nonzero().squeeze().tolist()
-    if not isinstance(step0_loss_positions, list):
-        step0_loss_positions = [step0_loss_positions]
-    
-    print(f"\nTraining step 0 loss positions (first 20): {step0_loss_positions[:20]}")
-    print(f"Test eval positions (first 20): {eval_positions[:20]}")
-    print(f"\nAre they using the same masking strategy? No - different random seeds and methods")
+    print(f"\nTraining: Total loss mask count across {chain_length} steps: {total_loss_mask_count}")
+    print(f"Training: Average loss ratio per step: {total_loss_ratio:.2%}")
+    print(f"Test: Eval mask count: {test_eval_mask.sum().item()}")
     
 
 if __name__ == '__main__':
