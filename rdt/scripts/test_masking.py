@@ -1157,40 +1157,29 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             
             new_state_dict[new_key] = value
         
-        # strict=False로 로드하되, 결과를 받아서 검증
+        # 1. Load state dict
         load_result = model.load_state_dict(new_state_dict, strict=False)
-        
-        print("\n" + "="*40)
-        print("Checkpoint Loading Report")
-        print("="*40)
-        
-        # 누락된 키가 있는지 확인 (Missing Keys)
-        if len(load_result.missing_keys) > 0:
-            print(f"⚠️  WARNING: {len(load_result.missing_keys)} keys are missing!")
-            # 일부 키만 출력 (너무 많을 수 있으므로)
-            print(f"Examples: {load_result.missing_keys[:5]}")
-            
-            # 중요 파라미터가 누락되었는지 체크
-            if any('encoder_layers' in k for k in load_result.missing_keys):
-                print("❌ CRITICAL: Encoder layers not loaded. The model is effectively untreated.")
-        else:
-            print("✅ All model keys matched successfully.")
-            
-        # 예상치 못한 키가 있는지 확인 (Unexpected Keys)
-        if len(load_result.unexpected_keys) > 0:
-            print(f"ℹ️  Info: {len(load_result.unexpected_keys)} unexpected keys in checkpoint (usually fine).")
-        
+
+        # 2. ✅ BEFORE .to(device) - tie weights
+        if hasattr(model, 'tie_weights'):
+            model.tie_weights()
+        elif hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
+            model.output_projection.weight = model.token_embedding.weight
+
+        # 3. Move to device
         model = model.to(device)
 
-        # CRITICAL: Weight tying 복원 (.to() 이후 다시 적용)
-        # RDT 모델인 경우에만 적용
-        if hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
+        # 4. ✅ AFTER .to(device) - tie weights AGAIN
+        if hasattr(model, 'tie_weights'):
+            model.tie_weights()
+        elif hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
             model.output_projection.weight = model.token_embedding.weight
-            print("✅ Weight tying reapplied.")
 
-        # 검증
+        # 5. Verify
         is_tied = model.output_projection.weight is model.token_embedding.weight
         print(f"Weight tying verified: {is_tied}")
+        if not is_tied:
+            raise RuntimeError("Weight tying failed!")
 
         model.eval()
         
