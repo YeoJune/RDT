@@ -1141,24 +1141,10 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
         
-        # [수정된 강력한 로딩 로직]
         state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
         
-        # 키 매핑을 위한 임시 딕셔너리 생성
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            new_key = key
-            # 1. _orig_mod. 제거 (torch.compile)
-            if new_key.startswith('_orig_mod.'):
-                new_key = new_key.replace('_orig_mod.', '')
-            # 2. module. 제거 (DDP/DataParallel)
-            if new_key.startswith('module.'):
-                new_key = new_key.replace('module.', '')
-            
-            new_state_dict[new_key] = value
-        
         # strict=False로 로드하되, 결과를 받아서 검증
-        load_result = model.load_state_dict(new_state_dict, strict=False)
+        load_result = model.load_state_dict(state_dict, strict=False)
         
         print("\n" + "="*40)
         print("Checkpoint Loading Report")
