@@ -1197,65 +1197,6 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         # Load test data
         test_texts = load_test_texts_rdt(config, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")
-
-        # TEMP : TEST START
-        test_text = test_texts[0]
-        encoded = tokenizer(test_text, return_tensors='pt', truncation=True, max_length=128)
-        tokens = encoded['input_ids'].squeeze(0)
-
-        special_token_ids = set(tokenizer.all_special_ids)
-
-        masked_tokens, eval_mask = create_masked_input(tokens, 0.1, tokenizer.mask_token_id, special_token_ids)
-
-        input_ids = masked_tokens.unsqueeze(0).to(device)
-        attention_mask = torch.ones_like(input_ids).to(device)
-
-        # Manual step-by-step inference with debugging
-        with torch.no_grad():
-            # Step 0
-            hidden = model.encode_tokens(input_ids, attention_mask)
-            gate_pred, pooled = model.gate(hidden, attention_mask)
-            
-            print(f"Step 0:")
-            print(f"  Hidden mean: {hidden.mean().item():.6f}")
-            print(f"  Hidden std: {hidden.std().item():.6f}")
-            print(f"  Gate value: {gate_pred.mean().item():.4f}")
-            
-            # Decode immediately after encode
-            logits_0 = model.decode(hidden, attention_mask)
-            pred_0 = logits_0.argmax(dim=-1).squeeze(0).cpu()
-            print(f"  Top-3 predictions: {pred_0[:10].tolist()}")
-            print(f"  Unique predictions: {pred_0.unique().tolist()[:20]}")
-            
-            # Step 1
-            hidden_1, _, _ = model.forward_step(hidden, attention_mask, gate_pred, pooled)
-            gate_1, pooled_1 = model.gate(hidden_1, attention_mask, pooled, gate_pred)
-            
-            print(f"\nStep 1:")
-            print(f"  Hidden mean: {hidden_1.mean().item():.6f}")
-            print(f"  Hidden std: {hidden_1.std().item():.6f}")
-            print(f"  Gate value: {gate_1.mean().item():.4f}")
-            
-            logits_1 = model.decode(hidden_1, attention_mask)
-            pred_1 = logits_1.argmax(dim=-1).squeeze(0).cpu()
-            print(f"  Top-3 predictions: {pred_1[:10].tolist()}")
-            print(f"  Unique predictions: {pred_1.unique().tolist()[:20]}")
-            
-            # Step 2
-            hidden_2, _, _ = model.forward_step(hidden_1, attention_mask, gate_1, pooled_1)
-            gate_2, pooled_2 = model.gate(hidden_2, attention_mask, pooled_1, gate_1)
-            
-            print(f"\nStep 2:")
-            print(f"  Hidden mean: {hidden_2.mean().item():.6f}")
-            print(f"  Hidden std: {hidden_2.std().item():.6f}")
-            print(f"  Gate value: {gate_2.mean().item():.4f}")
-            
-            logits_2 = model.decode(hidden_2, attention_mask)
-            pred_2 = logits_2.argmax(dim=-1).squeeze(0).cpu()
-            print(f"  Top-3 predictions: {pred_2[:10].tolist()}")
-            print(f"  Unique predictions: {pred_2.unique().tolist()[:20]}")
-            
-        # TEMP : TEST END
         
         # Set parameters
         threshold = threshold if threshold is not None else config['model']['threshold']

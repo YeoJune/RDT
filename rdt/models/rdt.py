@@ -955,64 +955,129 @@ class RDT(nn.Module):
 
     def inference(self, x, context=None, attention_mask=None, context_mask=None,
                 max_steps=20, threshold=0.02, return_steps=False):
+        """
+        Inference with per-sample processing - ZERO ambiguity version.
+        Each sample is processed independently in a loop, then batched for output.
+        
+        This ensures EXACT correspondence with training logic:
+        - Step 0: encode_tokens + initial gate
+        - Step 1~N: forward_step + gate + convergence check
+        - Final: decode
+        
+        Args:
+            x: [B, L] - input tokens
+            context: Optional context for cross-attention (not used currently)
+            attention_mask: [B, L] - attention mask (1=valid, 0=padding)
+            context_mask: [B, L_ctx] - context mask (not used currently)
+            max_steps: Maximum recursive steps
+            threshold: Stop when gate score < threshold (per sample)
+            return_steps: If True, return per-sample step counts
+        
+        Returns:
+            output_tokens: [B, L] - predicted tokens
+            steps_taken: [B] or float - number of steps taken
+        """
         self.eval()
         batch_size = x.size(0)
         device = x.device
         
+        # Storage for results
+        all_output_tokens = []
+        all_steps_taken = []
+        
         with torch.no_grad():
-            # Initialize
-            hidden = self.encode_tokens(x, attention_mask)
-            gate_pred, pooled = self.gate(hidden, attention_mask)
-            
-            active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
-            steps_taken = torch.ones(batch_size, dtype=torch.long, device=device)
-            
-            step = 1
-            
-            while step < max_steps and active_mask.any():
-                gate_scores = gate_pred.squeeze(-1)
-                should_continue = gate_scores > threshold
-                active_mask = active_mask & should_continue
+            # Process each sample independently
+            for sample_idx in range(batch_size):
+                # ================================================================
+                # Extract single sample
+                # ================================================================
+                sample_tokens = x[sample_idx:sample_idx+1]  # [1, L]
+                sample_mask = attention_mask[sample_idx:sample_idx+1] if attention_mask is not None else None  # [1, L]
                 
-                if not active_mask.any():
-                    break
+                # ================================================================
+                # STEP 0: Initialization (exactly as in training)
+                # ================================================================
+                # h_0 = encode_tokens(x)
+                hidden = self.encode_tokens(sample_tokens, sample_mask)  # [1, L, D]
                 
-                # ✅ Extract only active samples
-                active_indices = active_mask.nonzero(as_tuple=True)[0]
+                # gate_0, pooled_0 = gate(h_0, mask, None, None)
+                gate_pred, pooled = self.gate(
+                    hidden,           # x: [1, L, D]
+                    sample_mask,      # mask: [1, L]
+                    None,            # prev_pooled: None at step 0
+                    None             # prev_gate: None at step 0
+                )  # gate_pred: [1, 1], pooled: [1, D]
                 
-                hidden_active = hidden[active_indices]
-                gate_active = gate_pred[active_indices]
-                pooled_active = pooled[active_indices]
-                mask_active = attention_mask[active_indices] if attention_mask is not None else None
+                # ================================================================
+                # Track convergence for this sample
+                # ================================================================
+                converged = False
+                steps_taken = 1  # We count step 0 as 1 step
                 
-                # Forward only active samples
-                hidden_next_active, _, _ = self.forward_step(
-                    hidden_active,
-                    attention_mask=mask_active,
-                    last_gate_score=gate_active,
-                    last_pooled=pooled_active
-                )
+                # ================================================================
+                # STEP 1 to max_steps: Recursive steps (exactly as in training)
+                # ================================================================
+                for step in range(1, max_steps):
+                    # ------------------------------------------------------------
+                    # Check convergence BEFORE transformation
+                    # (In training, we always do max_steps; here we check early stop)
+                    # ------------------------------------------------------------
+                    gate_score = gate_pred.squeeze(-1).item()  # [1, 1] -> scalar
+                    
+                    if gate_score < threshold:
+                        converged = True
+                        break
+                    
+                    # ------------------------------------------------------------
+                    # h_i, _, _ = forward_step(h_{i-1}, mask, gate_{i-1}, pooled_{i-1})
+                    # ------------------------------------------------------------
+                    hidden, _, _ = self.forward_step(
+                        hidden,                    # h_{i-1}: [1, L, D]
+                        attention_mask=sample_mask,  # mask: [1, L]
+                        last_gate_score=gate_pred,   # gate_{i-1}: [1, 1]
+                        last_pooled=pooled,          # pooled_{i-1}: [1, D]
+                        gt_timestep=None,           # No GT in inference
+                        sampling_prob=0.0           # No sampling in inference
+                    )  # hidden: [1, L, D] (h_i after transformation)
+                    
+                    # ------------------------------------------------------------
+                    # gate_i, pooled_i = gate(h_i, mask, pooled_{i-1}, gate_{i-1})
+                    # ------------------------------------------------------------
+                    gate_pred, pooled = self.gate(
+                        hidden,        # x: [1, L, D] (transformed h_i)
+                        sample_mask,   # mask: [1, L]
+                        pooled,        # prev_pooled: pooled_{i-1}
+                        gate_pred      # prev_gate: gate_{i-1}
+                    )  # gate_pred: [1, 1] (gate_i), pooled: [1, D] (pooled_i)
+                    
+                    steps_taken += 1
                 
-                gate_next_active, pooled_next_active = self.gate(
-                    hidden_next_active, mask_active, pooled_active, gate_active
-                )
+                # ================================================================
+                # FINAL: Decode (exactly as in training, but only last step)
+                # ================================================================
+                # logits = decode(h_final, mask)
+                logits = self.decode(hidden, sample_mask)  # [1, L, vocab_size]
                 
-                # ✅ Update only active positions
-                hidden[active_indices] = hidden_next_active
-                gate_pred[active_indices] = gate_next_active
-                pooled[active_indices] = pooled_next_active
+                # output_tokens = argmax(logits)
+                sample_output = logits.argmax(dim=-1)  # [1, L]
                 
-                steps_taken[active_mask] += 1
-                step += 1
-            
-            logits = self.decode(hidden, attention_mask)
-            output_tokens = logits.argmax(dim=-1)
+                # ================================================================
+                # Store results
+                # ================================================================
+                all_output_tokens.append(sample_output)
+                all_steps_taken.append(steps_taken)
+        
+        # ================================================================
+        # Batch results
+        # ================================================================
+        output_tokens = torch.cat(all_output_tokens, dim=0)  # [B, L]
+        steps_taken_tensor = torch.tensor(all_steps_taken, device=device)  # [B]
         
         if return_steps:
-            return output_tokens, steps_taken
+            return output_tokens, steps_taken_tensor
         else:
-            return output_tokens, steps_taken.mean().item()
-            
+            return output_tokens, steps_taken_tensor.float().mean().item()
+        
     def tie_weights(self):
         """Tie output projection weights with token embedding"""
         self.output_projection.weight = self.token_embedding.weight
