@@ -1197,6 +1197,44 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         # Load test data
         test_texts = load_test_texts_rdt(config, num_samples=num_samples)
         print(f"Loaded {len(test_texts)} test texts")
+
+        test_text = test_texts[0]
+        encoded = tokenizer(test_text, return_tensors='pt', truncation=True, max_length=128)
+        tokens = encoded['input_ids'].squeeze(0)
+
+        print(f"Original text: {test_text}")
+        print(f"Original tokens: {tokens.tolist()}")
+        print(f"Original decoded: {tokenizer.decode(tokens)}")
+
+        # 10% masking
+        masked_tokens, eval_mask = create_masked_input(tokens, 0.1, tokenizer.mask_token_id, tokenizer.special_token_ids)
+
+        print(f"\nMasked tokens: {masked_tokens.tolist()}")
+        print(f"Masked decoded: {tokenizer.decode(masked_tokens)}")
+        print(f"Eval mask positions: {eval_mask.nonzero().squeeze().tolist()}")
+        print(f"Masked positions: {[i for i, t in enumerate(masked_tokens) if t == tokenizer.mask_token_id]}")
+
+        # Inference
+        input_ids = masked_tokens.unsqueeze(0).to(device)
+        attention_mask = torch.ones_like(input_ids).to(device)
+
+        output_ids, steps = model.inference(input_ids, attention_mask, max_steps=20, threshold=0.5, return_steps=True)
+
+        pred_tokens = output_ids.squeeze(0).cpu()
+
+        print(f"\nPredicted tokens: {pred_tokens.tolist()}")
+        print(f"Predicted decoded: {tokenizer.decode(pred_tokens)}")
+        print(f"Steps taken: {steps.item()}")
+
+        # 마스킹된 위치에서의 예측
+        for i in eval_mask.nonzero().squeeze().tolist():
+            if isinstance(i, int):
+                i = [i]
+            for idx in (i if isinstance(i, list) else [i]):
+                print(f"\nPosition {idx}:")
+                print(f"  Original: {tokenizer.decode([tokens[idx]])} (id={tokens[idx].item()})")
+                print(f"  Predicted: {tokenizer.decode([pred_tokens[idx]])} (id={pred_tokens[idx].item()})")
+                print(f"  Match: {tokens[idx] == pred_tokens[idx]}")
         
         # Set parameters
         threshold = threshold if threshold is not None else config['model']['threshold']
