@@ -955,24 +955,6 @@ class RDT(nn.Module):
 
     def inference(self, x, context=None, attention_mask=None, context_mask=None,
                 max_steps=20, threshold=0.02, return_steps=False):
-        """
-        Inference with per-sample early stopping using masks.
-        Each sample in the batch can stop independently when its gate score falls below threshold.
-        
-        Args:
-            x: [B, L] - input tokens
-            context: Optional context for cross-attention
-            attention_mask: [B, L] - attention mask (1=valid, 0=padding)
-            context_mask: [B, L_ctx] - context mask
-            max_steps: Maximum recursive steps
-            threshold: Stop when gate score < threshold (per sample)
-            return_steps: If True, return per-sample step counts
-        
-        Returns:
-            output_tokens: [B, L] - predicted tokens
-            steps_taken: [B] - number of steps taken per sample (if return_steps=True)
-                        or int - max steps taken (if return_steps=False)
-        """
         self.eval()
         batch_size = x.size(0)
         device = x.device
@@ -982,74 +964,55 @@ class RDT(nn.Module):
             hidden = self.encode_tokens(x, attention_mask)
             gate_pred, pooled = self.gate(hidden, attention_mask)
             
-            # Track which samples are still active
-            # active_mask: [B] - True if sample should continue processing
             active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
-            
-            # Track steps taken per sample
             steps_taken = torch.ones(batch_size, dtype=torch.long, device=device)
-            
-            # Store final hidden states for each sample
-            # We'll update this only for active samples at each step
-            final_hidden = hidden.clone()
             
             step = 1
             
-            # Continue until all samples converge or max_steps reached
             while step < max_steps and active_mask.any():
-                # Check which samples should continue
-                # gate_pred: [B, 1] -> [B]
                 gate_scores = gate_pred.squeeze(-1)
                 should_continue = gate_scores > threshold
-                
-                # Update active mask: only continue if both previously active AND score above threshold
                 active_mask = active_mask & should_continue
                 
                 if not active_mask.any():
-                    # All samples have converged
                     break
                 
-                # Perform forward_step for all samples (for efficiency)
-                # But we'll only update hidden states for active samples
-                hidden_next, _, _ = self.forward_step(
-                    hidden,
-                    attention_mask=attention_mask,
-                    last_gate_score=gate_pred,
-                    last_pooled=pooled
+                # ✅ Extract only active samples
+                active_indices = active_mask.nonzero(as_tuple=True)[0]
+                
+                hidden_active = hidden[active_indices]
+                gate_active = gate_pred[active_indices]
+                pooled_active = pooled[active_indices]
+                mask_active = attention_mask[active_indices] if attention_mask is not None else None
+                
+                # Forward only active samples
+                hidden_next_active, _, _ = self.forward_step(
+                    hidden_active,
+                    attention_mask=mask_active,
+                    last_gate_score=gate_active,
+                    last_pooled=pooled_active
                 )
                 
-                # Gate prediction for transformed hidden
-                gate_pred_next, pooled_next = self.gate(hidden_next, attention_mask, pooled, gate_pred)
-                
-                # Update hidden states only for active samples
-                # This ensures converged samples retain their final state
-                active_mask_expanded = active_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1]
-                final_hidden = torch.where(
-                    active_mask_expanded,
-                    hidden_next,
-                    final_hidden
+                gate_next_active, pooled_next_active = self.gate(
+                    hidden_next_active, mask_active, pooled_active, gate_active
                 )
                 
-                # Update gate_pred and pooled for next iteration
-                # (we process all samples for vectorization efficiency)
-                hidden = hidden_next
-                gate_pred = gate_pred_next
-                pooled = pooled_next
+                # ✅ Update only active positions
+                hidden[active_indices] = hidden_next_active
+                gate_pred[active_indices] = gate_next_active
+                pooled[active_indices] = pooled_next_active
                 
-                # Increment step counter for active samples only
                 steps_taken[active_mask] += 1
                 step += 1
             
-            # Decode final hidden states (once at the end)
-            logits = self.decode(final_hidden, attention_mask)
+            logits = self.decode(hidden, attention_mask)
             output_tokens = logits.argmax(dim=-1)
         
         if return_steps:
             return output_tokens, steps_taken
         else:
-            # Return mean steps for backward compatibility
             return output_tokens, steps_taken.mean().item()
-    
+            
     def tie_weights(self):
         """Tie output projection weights with token embedding"""
         self.output_projection.weight = self.token_embedding.weight
