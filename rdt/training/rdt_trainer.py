@@ -843,17 +843,18 @@ class RDTTrainer:
                 
                 # Validation at regular step intervals
                 if step % self.eval_every_n_steps == 0:
-                    val_loss, val_recon, val_gate = self.validate()
+                    val_loss, val_recon, val_gate, val_acc = self.validate()
                     
                     if self.accelerator.is_main_process:
-                        print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
+                        print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}, Acc: {val_acc:.3f}")
                         
                         val_data = {
                             'epoch': epoch,
                             'step': step,
                             'val_loss': val_loss,
                             'val_recon': val_recon,
-                            'val_gate': val_gate
+                            'val_gate': val_gate,
+                            'val_accuracy': val_acc
                         }
                         self.csv_logger.log(val_data)
                         
@@ -862,6 +863,7 @@ class RDTTrainer:
                                 'val/loss': val_loss,
                                 'val/recon_loss': val_recon,
                                 'val/gate_loss': val_gate,
+                                'val/accuracy': val_acc,
                                 'step': step
                             }, step=step)
                         
