@@ -198,7 +198,7 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
     """Test RDT model across different masking levels with multiple metrics (batched)"""
     model.eval()
     mask_token_id = tokenizer.mask_token_id
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    pad_token_id = tokenizer.pad_token_id or 0
     
     # Initialize result storage
     results = {
@@ -211,11 +211,8 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
     
     print(f"\nTesting RDT reconstruction capability (max_seq_len={max_seq_len}, batch_size={batch_size})...")
     
-    # [수정됨] 통제 실험을 위한 변경 사항
-    # 기존: special_token_ids = set(tokenizer.all_special_ids)  <-- 모든 특수 토큰 제외 (CLS, SEP 포함)
-    # 변경: 오직 PAD 토큰만 제외하고, CLS/SEP는 마스킹 후보에 포함시킴 (학습 환경 재현)
-    special_token_ids = {pad_token_id} 
-    print(f"⚠️  [Control Experiment] Masking candidates include [CLS] and [SEP]. Excluding only [PAD] (ID: {pad_token_id}).")
+    # Get special token IDs to exclude from masking
+    special_token_ids = set(tokenizer.all_special_ids)
     
     # Tokenize all texts first
     all_tokens = []
@@ -249,7 +246,7 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             batch_original_tokens = []
             
             for tokens in batch_tokens:
-                # Create masked input (이제 CLS, SEP도 마스킹 될 수 있음)
+                # Create masked input
                 masked_tokens, eval_mask = create_masked_input(tokens, ratio, mask_token_id, special_token_ids)
                 
                 batch_input_ids.append(masked_tokens)
@@ -296,21 +293,27 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                 original_tokens = batch_original_tokens[j]
                 eval_mask = batch_eval_masks[j]
                 
-                # Extract predictions
+                # Extract predictions (remove padding to match original length)
+                # This is critical: pred_tokens must have same length as original_tokens
                 orig_len = len(original_tokens)
                 pred_tokens = pred_tokens_batch[j][:orig_len]
                 
+                # Verify length consistency
+                assert len(pred_tokens) == len(original_tokens) == len(eval_mask), \
+                    f"Length mismatch: pred={len(pred_tokens)}, orig={len(original_tokens)}, mask={len(eval_mask)}"
                 num_steps = steps_batch[j].item()
                 
                 # 1. Exact Match Accuracy (only on masked positions)
-                # 만약 CLS/SEP가 마스킹되었다면, 모델은 이를 매우 쉽게 복원할 것이므로 accuracy 상승 예상
                 accuracy = metric_calc.calculate_exact_match(pred_tokens, original_tokens, eval_mask)
                 results['exact_match'][ratio].append(accuracy)
                 
-                # 2. Reconstruct full text
+                # 2. Reconstruct full text for other metrics
+                # Strategy: Use original tokens for unmasked positions,
+                #           use predicted tokens for masked positions
                 reconstructed_tokens = original_tokens.clone()
                 reconstructed_tokens[eval_mask] = pred_tokens[eval_mask]
                 
+                # Decode for text-based metrics
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                 original_text = batch_texts[j]
                 
@@ -334,12 +337,13 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
     
     print("\nCalculating metrics...")
     for ratio in tqdm(mask_ratios, desc="Aggregating"):
-        # Metrics aggregation (Same as before)
+        # Exact Match
         if results['exact_match'][ratio]:
             aggregated['exact_match'][ratio] = np.mean(results['exact_match'][ratio])
         else:
             aggregated['exact_match'][ratio] = 0.0
-            
+        
+        # BERTScore
         if results['bertscore'][ratio]['refs']:
             aggregated['bertscore'][ratio] = metric_calc.calculate_bertscore(
                 results['bertscore'][ratio]['refs'],
@@ -347,14 +351,16 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             )
         else:
             aggregated['bertscore'][ratio] = 0.0
-            
+        
+        # Perplexity
         if results['perplexity'][ratio]:
             aggregated['perplexity'][ratio] = metric_calc.calculate_perplexity_batch(
                 results['perplexity'][ratio]
             )
         else:
             aggregated['perplexity'][ratio] = float('inf')
-            
+        
+        # BLEU-4
         if results['bleu4'][ratio]['refs']:
             aggregated['bleu4'][ratio] = metric_calc.calculate_bleu4(
                 results['bleu4'][ratio]['refs'],
@@ -362,7 +368,8 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             )
         else:
             aggregated['bleu4'][ratio] = 0.0
-            
+        
+        # Steps
         if results['steps'][ratio]:
             aggregated['steps'][ratio] = np.mean(results['steps'][ratio])
         else:
