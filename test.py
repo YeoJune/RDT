@@ -5,6 +5,9 @@ Precision Debugging: Training Validate vs Test Masking
 두 상황을 완전히 동일하게 재현:
 1. Train 시의 Validate (trainer.validate())
 2. Test Masking (test_masking.py의 test_rdt_model())
+
+사용법:
+    python test.py
 """
 
 import torch
@@ -12,14 +15,12 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 from pathlib import Path
 import numpy as np
-from tqdm import tqdm
 from typing import Dict, List, Tuple
-import yaml
 
-# Import using rdt module pattern (same as train.py and test_masking.py)
+# Import from rdt package (test_masking.py와 동일한 패턴)
 from rdt.models import RDT
 from rdt.utils import load_config
-from rdt.data.preprocessing import RDTPreprocessor
+from rdt.data.rdt_preprocessor import RDTPreprocessor
 
 
 def create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids=None):
