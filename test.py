@@ -440,6 +440,8 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
         
         print(f"  Hidden shape: {h_0.shape}")
         print(f"  Gate pred: {gate_pred_0.item():.4f}")
+        print(f"  Hidden stats: mean={h_0.mean().item():.4f}, std={h_0.std().item():.4f}")
+        print(f"  Pooled stats: mean={pooled_0.mean().item():.4f}, std={pooled_0.std().item():.4f}")
         
         # First forward_step
         print(f"\n--- Step 1: First Forward Step ---")
@@ -452,15 +454,28 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
             sampling_prob=0.0
         )
         
+        print(f"  Hidden after transform: mean={hidden.mean().item():.4f}, std={hidden.std().item():.4f}")
+        
         gate_pred, pooled = model.gate(hidden, sample_mask, pooled_0, gate_pred_0)
         print(f"  Gate pred after transform: {gate_pred.item():.4f}")
+        print(f"  Pooled after gate: mean={pooled.mean().item():.4f}, std={pooled.std().item():.4f}")
+        
+        # CRITICAL: Check if gate network is broken
+        if gate_pred.item() == 0.0:
+            print(f"  ⚠️  WARNING: Gate immediately dropped to 0.0!")
+            print(f"  This suggests gate network may not be properly trained")
+            print(f"  Previous gate: {gate_pred_0.item():.4f}")
+            print(f"  Gate delta: {gate_pred.item() - gate_pred_0.item():.4f}")
         
         # Decode and check predictions
         logits = model.decode(hidden, sample_mask)
         pred_tokens = logits.argmax(dim=-1).squeeze(0)
         pred_probs = torch.softmax(logits.squeeze(0), dim=-1)
         
+        print(f"  Logits stats: mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
         print(f"  Predictions at masked positions:")
+        
+        unique_preds = set()
         for idx in eval_mask.nonzero(as_tuple=True)[0][:5]:
             if idx < len(pred_tokens):
                 pred_token_id = pred_tokens[idx].item()
@@ -470,8 +485,13 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
                 pred_token_str = tokenizer.decode([pred_token_id])
                 true_token_str = tokenizer.decode([true_token_id])
                 
+                unique_preds.add(pred_token_id)
                 match = "✓" if pred_token_id == true_token_id else "✗"
                 print(f"    Pos {idx}: pred='{pred_token_str}' ({pred_token_id}), true='{true_token_str}' ({true_token_id}), prob={pred_prob:.4f} {match}")
+        
+        if len(unique_preds) == 1:
+            print(f"  ⚠️  WARNING: All masked positions predict the SAME token!")
+            print(f"  This suggests model is not attending to position-specific context")
         
         steps_taken = 1
         
@@ -524,10 +544,17 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
         final_logits = model.decode(hidden, sample_mask)
         final_pred = final_logits.argmax(dim=-1).squeeze(0)
         
+        # eval_mask는 원본 길이, final_pred는 padded 길이일 수 있음
+        # 원본 길이만큼만 사용
+        orig_len = len(original_tokens)
+        final_pred_trimmed = final_pred[:orig_len]
+        
         if eval_mask.sum() > 0:
-            correct = (final_pred[eval_mask] == original_tokens[eval_mask]).sum().item()
+            correct = (final_pred_trimmed[eval_mask] == original_tokens[eval_mask]).sum().item()
             total = eval_mask.sum().item()
             print(f"Final accuracy: {correct}/{total} = {correct/total:.4f}")
+        else:
+            print(f"No masked positions to evaluate")
         
     # ========================================================================
     # Run full batch inference (using original method)
