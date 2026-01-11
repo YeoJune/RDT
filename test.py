@@ -1,5 +1,6 @@
 """
 Precision Debugging: Training Validate vs Test Masking
+상세 디버깅 버전
 """
 
 import torch
@@ -15,7 +16,7 @@ from rdt.data.rdt_preprocessor import RDTPreprocessor
 
 
 def create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids=None):
-    """Create masked input - exact copy from test_masking.py"""
+    """Create masked input"""
     seq_len = len(tokens)
     
     if special_token_ids is not None:
@@ -109,9 +110,7 @@ def prepare_test_data(num_samples: int = 100):
 
 
 def run_train_validate(model, tokenizer, config, test_texts, device):
-    """
-    Scenario 1: EXACT replica of RDTTrainer.validate()
-    """
+    """Scenario 1: Training Validate with detailed debugging"""
     print("\n" + "="*80)
     print("SCENARIO 1: Training Validate (RDTTrainer.validate())")
     print("="*80)
@@ -138,7 +137,7 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
         if isinstance(v, torch.Tensor):
             batch[k] = v.to(device)
     
-    print("\nBatch shapes:")
+    print("\n[BATCH INFO]")
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
             print(f"  {k}: {v.shape}")
@@ -153,6 +152,23 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
     
     actual_max_length = chain_lengths.max().item()
     
+    # Detailed analysis
+    print("\n[PREPROCESSING ANALYSIS]")
+    print(f"  Chain lengths: min={chain_lengths.min().item()}, max={chain_lengths.max().item()}, mean={chain_lengths.float().mean().item():.2f}")
+    print(f"  Gate targets range: [{gate_targets.min().item():.2f}, {gate_targets.max().item():.2f}]")
+    
+    total_tokens = (attention_mask == 1).sum().item()
+    total_masked_in_input = (input_tokens == tokenizer.mask_token_id).sum().item()
+    print(f"  Total valid tokens: {total_tokens}")
+    print(f"  Masked tokens in input: {total_masked_in_input} ({100*total_masked_in_input/total_tokens:.1f}%)")
+    
+    # Loss mask analysis
+    for step_idx in range(actual_max_length):
+        step_loss_mask = loss_masks[:, step_idx, :]
+        num_masked = step_loss_mask.sum().item()
+        if num_masked > 0:
+            print(f"  Step {step_idx}: {num_masked} positions to predict")
+    
     # Metrics
     recon_criterion = nn.CrossEntropyLoss()
     gate_criterion = nn.MSELoss()
@@ -163,10 +179,18 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
     batch_target_tokens = torch.tensor(0.0, device=device)
     num_valid = 0
     
+    step_details = []
+    
     with torch.no_grad():
         # Step 0: Initial encoding
+        print("\n[FORWARD PASS]")
         h_0 = model.encode_tokens(input_tokens)
         gate_pred_0, pooled_0 = model.gate(h_0, attention_mask, None, None)
+        
+        print(f"Step 0 (Encoding):")
+        print(f"  Hidden shape: {h_0.shape}")
+        print(f"  Gate prediction: mean={gate_pred_0.mean().item():.4f}, std={gate_pred_0.std().item():.4f}")
+        print(f"  Gate target: mean={gate_targets[:, 0].mean().item():.4f}")
         
         # Gate loss for h_0
         gate_target_0 = gate_targets[:, 0].unsqueeze(1)
@@ -192,12 +216,18 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
                 last_pooled=pooled
             )
             
-            # Gate prediction for transformed hidden
+            # Gate prediction
             gate_pred, pooled = model.gate(hidden, attention_mask, pooled, gate_pred)
             
-            # Reconstruction loss & Accuracy
+            # Reconstruction & Accuracy
             step_targets = targets[:, step_idx, :]
             step_loss_mask = loss_masks[:, step_idx, :]
+            
+            step_info = {
+                'step': step_idx + 1,
+                'valid_samples': valid_mask.sum().item(),
+                'positions_to_predict': step_loss_mask.sum().item(),
+            }
             
             if step_loss_mask.sum() > 0:
                 logits = model.decode(hidden, attention_mask)
@@ -210,8 +240,29 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
                 correct = (pred_tokens[step_loss_mask] == step_targets[step_loss_mask]).float().sum()
                 batch_correct_tokens += correct
                 batch_target_tokens += step_loss_mask.sum().float()
+                
+                step_info['recon_loss'] = recon_loss.item()
+                step_info['accuracy'] = (correct / step_loss_mask.sum().float()).item()
+                step_info['correct'] = correct.item()
+                
+                # Prediction confidence
+                pred_probs = torch.softmax(sel_logits, dim=-1)
+                max_probs, _ = pred_probs.max(dim=-1)
+                step_info['confidence'] = max_probs.mean().item()
+                
+                # Top-5 accuracy
+                _, top5_preds = pred_probs.topk(5, dim=-1)
+                top5_correct = (top5_preds == sel_targ.unsqueeze(-1)).any(dim=-1).float().sum()
+                step_info['top5_accuracy'] = (top5_correct / step_loss_mask.sum().float()).item()
             else:
                 recon_loss = torch.tensor(0.0, device=device)
+                step_info.update({
+                    'recon_loss': 0.0,
+                    'accuracy': 0.0,
+                    'correct': 0,
+                    'confidence': 0.0,
+                    'top5_accuracy': 0.0
+                })
             
             # Gate loss
             step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)
@@ -219,11 +270,28 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
             gate_target_valid = step_gate_targets[valid_mask]
             gate_loss = gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=device)
             
+            step_info['gate_loss'] = gate_loss.item()
+            step_info['gate_pred_mean'] = gate_pred.mean().item()
+            step_info['gate_target_mean'] = step_gate_targets.mean().item()
+            
             batch_recon_tensor += recon_loss
             batch_gate_tensor += gate_loss
             num_valid += 1
+            
+            step_details.append(step_info)
+            
+            print(f"\nStep {step_idx + 1} (Recursive):")
+            print(f"  Valid samples: {step_info['valid_samples']}/{len(chain_lengths)}")
+            print(f"  Positions to predict: {step_info['positions_to_predict']}")
+            if step_info['positions_to_predict'] > 0:
+                print(f"  Recon loss: {step_info['recon_loss']:.4f}")
+                print(f"  Accuracy: {step_info['accuracy']:.4f} ({step_info['correct']:.0f}/{step_info['positions_to_predict']})")
+                print(f"  Top-5 Accuracy: {step_info['top5_accuracy']:.4f}")
+                print(f"  Confidence: {step_info['confidence']:.4f}")
+            print(f"  Gate loss: {step_info['gate_loss']:.4f}")
+            print(f"  Gate pred: {step_info['gate_pred_mean']:.4f}, target: {step_info['gate_target_mean']:.4f}")
     
-    # Calculate final metrics
+    # Final metrics
     if num_valid > 0:
         avg_recon = (batch_recon_tensor / num_valid).item()
         avg_gate = (batch_gate_tensor / num_valid).item()
@@ -231,7 +299,7 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
     else:
         avg_recon = avg_gate = batch_acc = 0.0
     
-    print("\nTraining Validate Results:")
+    print("\n[FINAL RESULTS]")
     print(f"  Reconstruction Loss: {avg_recon:.4f}")
     print(f"  Gate Loss: {avg_gate:.4f}")
     print(f"  Accuracy (masked positions): {batch_acc:.4f}")
@@ -242,14 +310,13 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
         'recon_loss': avg_recon,
         'gate_loss': avg_gate,
         'accuracy': batch_acc,
-        'total_masked': batch_target_tokens.item()
+        'total_masked': batch_target_tokens.item(),
+        'step_details': step_details
     }
 
 
 def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.3):
-    """
-    Scenario 2: EXACT replica of test_masking.py test_rdt_model()
-    """
+    """Scenario 2: Test Masking with detailed debugging"""
     print("\n" + "="*80)
     print(f"SCENARIO 2: Test Masking (test_masking.py, mask_ratio={mask_ratio})")
     print("="*80)
@@ -263,7 +330,6 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
     max_seq_len = config['data']['max_seq_length']
     max_steps = 20
     threshold = 0.5
-    batch_size = 32
     
     # Tokenize
     all_tokens = []
@@ -283,9 +349,9 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
             all_tokens.append(tokens)
             all_texts.append(tokenizer.decode(tokens, skip_special_tokens=True))
     
-    # Results
-    exact_match_scores = []
-    steps_taken_list = []
+    print(f"\n[TOKENIZATION]")
+    print(f"  Num samples: {len(all_tokens)}")
+    print(f"  Sequence lengths: min={min(len(t) for t in all_tokens)}, max={max(len(t) for t in all_tokens)}, mean={np.mean([len(t) for t in all_tokens]):.1f}")
     
     # Process batch
     batch_tokens = all_tokens
@@ -293,12 +359,25 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
     batch_eval_masks = []
     batch_original_tokens = []
     
+    total_maskable = 0
+    total_masked = 0
+    
     for tokens in batch_tokens:
         masked_tokens, eval_mask = create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids)
         
         batch_input_ids.append(masked_tokens)
         batch_eval_masks.append(eval_mask)
         batch_original_tokens.append(tokens)
+        
+        # Count maskable vs actually masked
+        maskable = sum(1 for t in tokens if t.item() not in special_token_ids)
+        total_maskable += maskable
+        total_masked += eval_mask.sum().item()
+    
+    print(f"\n[MASKING STATISTICS]")
+    print(f"  Total maskable tokens: {total_maskable}")
+    print(f"  Total masked tokens: {total_masked}")
+    print(f"  Actual mask ratio: {total_masked/total_maskable:.4f}")
     
     # Pad to max length in batch
     max_len = max(len(t) for t in batch_input_ids)
@@ -322,11 +401,16 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
     batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
     batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
     
-    print(f"\nBatch info:")
+    print(f"\n[BATCH INFO]")
     print(f"  Input shape: {batch_input_ids_tensor.shape}")
-    print(f"  Total masked positions: {sum(m.sum().item() for m in batch_eval_masks)}")
+    print(f"  Attention mask shape: {batch_attention_masks_tensor.shape}")
+    print(f"  Valid tokens: {batch_attention_masks_tensor.sum().item()}")
     
     # Inference
+    print(f"\n[INFERENCE]")
+    print(f"  Max steps: {max_steps}")
+    print(f"  Threshold: {threshold}")
+    
     with torch.no_grad():
         output_ids, steps_taken = model.inference(
             batch_input_ids_tensor,
@@ -339,43 +423,68 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
         pred_tokens_batch = output_ids.cpu()
         steps_batch = steps_taken.cpu()
     
+    print(f"\n[INFERENCE RESULTS]")
+    print(f"  Steps taken: min={steps_batch.min().item()}, max={steps_batch.max().item()}, mean={steps_batch.float().mean().item():.2f}")
+    
     # Calculate metrics per sample
+    exact_match_scores = []
+    top5_scores = []
+    sample_details = []
+    
     for j in range(len(batch_tokens)):
         original_tokens = batch_original_tokens[j]
         eval_mask = batch_eval_masks[j]
         
-        # Extract predictions (remove padding)
+        # Extract predictions
         orig_len = len(original_tokens)
         pred_tokens = pred_tokens_batch[j][:orig_len]
         num_steps = steps_batch[j].item()
         
-        # Exact Match Accuracy
+        # Exact Match
         if eval_mask.sum() > 0:
             correct = (pred_tokens[eval_mask] == original_tokens[eval_mask]).sum().item()
             total = eval_mask.sum().item()
             accuracy = correct / total
         else:
             accuracy = 1.0
+            correct = 0
+            total = 0
         
         exact_match_scores.append(accuracy)
-        steps_taken_list.append(num_steps)
+        
+        sample_details.append({
+            'sample_idx': j,
+            'seq_len': orig_len,
+            'num_masked': eval_mask.sum().item(),
+            'correct': correct,
+            'total': total,
+            'accuracy': accuracy,
+            'steps': num_steps
+        })
+    
+    # Show first few samples
+    print(f"\n[SAMPLE DETAILS (first 5)]")
+    for detail in sample_details[:5]:
+        print(f"  Sample {detail['sample_idx']}: len={detail['seq_len']}, masked={detail['num_masked']}, "
+              f"correct={detail['correct']}/{detail['total']}, acc={detail['accuracy']:.4f}, steps={detail['steps']}")
     
     # Aggregate
     avg_accuracy = np.mean(exact_match_scores)
-    avg_steps = np.mean(steps_taken_list)
+    avg_steps = np.mean(steps_batch.numpy())
     
-    print(f"\nTest Masking Results:")
+    print(f"\n[FINAL RESULTS]")
     print(f"  Accuracy (masked positions): {avg_accuracy:.4f}")
     print(f"  Average steps: {avg_steps:.2f}")
     
     return {
         'accuracy': avg_accuracy,
-        'avg_steps': avg_steps
+        'avg_steps': avg_steps,
+        'sample_details': sample_details
     }
 
 
 def detailed_comparison(results1, results2):
-    """Comparison"""
+    """Detailed comparison"""
     print("\n" + "="*80)
     print("DETAILED COMPARISON")
     print("="*80)
@@ -388,6 +497,19 @@ def detailed_comparison(results1, results2):
     print(f"{'Accuracy':<30} {results1['accuracy']:<20.4f} {results2['accuracy']:<20.4f} {acc_diff:+.4f} ({acc_diff_pct:+.1f}%)")
     
     print("\n" + "="*80)
+    
+    print("\n[KEY DIFFERENCES IDENTIFIED]")
+    print("1. Different masking strategies:")
+    print("   - Training: Chain-based progressive denoising")
+    print("   - Testing: Fixed-ratio random masking")
+    
+    print("\n2. Different forward modes:")
+    print("   - Training: forward_step() with gate guidance")
+    print("   - Testing: inference() with per-sample convergence")
+    
+    print("\n3. Different masking amounts:")
+    print(f"   - Training: {results1['total_masked']:.0f} positions across chain")
+    print(f"   - Testing: varies per sample")
 
 
 def main():
