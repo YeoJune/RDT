@@ -67,27 +67,27 @@ def load_model_and_tokenizer(config_path: str, checkpoint_path: str, device: str
     tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
     vocab_size = tokenizer.vocab_size
     
-    # Create model - exact parameters from provided RDT code
+    # Create model - exact parameters from config
     model = RDT(
         vocab_size=vocab_size,
         d_model=config['model']['d_model'],
-        n_heads=config['model']['num_heads'],
-        n_encoder_layers=config['model']['num_layers'],
+        n_heads=config['model']['n_heads'],
+        n_encoder_layers=config['model']['n_encoder_layers'],
         d_ff=config['model']['d_ff'],
         dropout=config['model']['dropout'],
-        max_seq_len=config['model']['max_seq_length'],
+        max_seq_len=config['data']['max_seq_length'],
         # Transformer I/O Configuration
-        input_processor_layers=config['model'].get('input_processor_layers', 1),
-        output_processor_layers=config['model'].get('output_processor_layers', 1),
+        input_processor_layers=config['model']['input_processor_layers'],
+        output_processor_layers=config['model']['output_processor_layers'],
         # Gate Configuration
-        gate_hidden_dim=config['model'].get('gate_hidden_dim', 512),
-        gate_num_layers=config['model'].get('gate_num_layers', 3),
-        gate_num_heads=config['model'].get('gate_num_heads', 8),
-        gate_dropout=config['model'].get('gate_dropout', 0.3),
+        gate_hidden_dim=config['model']['gate_hidden_dim'],
+        gate_num_layers=config['model']['gate_num_layers'],
+        gate_num_heads=config['model']['gate_num_heads'],
+        gate_dropout=config['model']['gate_dropout'],
         # RoPE Configuration
-        rope_base=config['model'].get('rope_base', 10000.0),
+        rope_base=config['model']['rope_base'],
         # Training
-        gradient_checkpointing=False  # Disabled for inference
+        gradient_checkpointing=config['model']['gradient_checkpointing']
     )
     
     # Load checkpoint
