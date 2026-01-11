@@ -1144,7 +1144,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
         
         # strict=False로 로드하되, 결과를 받아서 검증
-        load_result = model.load_state_dict(state_dict, strict=False)
+        load_result = model.load_state_dict(state_dict, strict=True)
         
         print("\n" + "="*40)
         print("Checkpoint Loading Report")
