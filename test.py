@@ -542,10 +542,9 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
         
         # Final accuracy for this sample
         final_logits = model.decode(hidden, sample_mask)
-        final_pred = final_logits.argmax(dim=-1).squeeze(0)
+        final_pred = final_logits.argmax(dim=-1).squeeze(0).cpu()  # CPU로 이동
         
         # eval_mask는 원본 길이, final_pred는 padded 길이일 수 있음
-        # 원본 길이만큼만 사용
         orig_len = len(original_tokens)
         final_pred_trimmed = final_pred[:orig_len]
         
