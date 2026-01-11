@@ -282,6 +282,9 @@ class RDTTrainer:
                 break
             
             step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
+            gt_noise = torch.rand_like(gate_pred) * 0.1 # Small noise for stability
+            step_gt_gate = step_gt_gate + gt_noise
+
             hidden, _, _ = raw_model.forward_step(
                 hidden, attention_mask=attention_mask, last_gate_score=gate_pred,
                 last_pooled=pooled, gt_timestep=step_gt_gate, sampling_prob=sampling_prob
