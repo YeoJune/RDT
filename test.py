@@ -315,6 +315,187 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
     }
 
 
+def run_test_masking_with_gt_gate(model, tokenizer, config, test_texts, device, mask_ratio=0.3):
+    """
+    Scenario 3: Test Masking with GT GATE (Control Experiment)
+    
+    This uses the same masking as test_masking but forces GT gate values
+    to isolate whether the problem is:
+    1. Gate collapse issue, OR
+    2. Fundamental model capability issue
+    """
+    print("\n" + "="*80)
+    print(f"SCENARIO 3: Test Masking with GT GATE (mask_ratio={mask_ratio})")
+    print("="*80)
+    
+    model.eval()
+    
+    mask_token_id = tokenizer.mask_token_id
+    pad_token_id = tokenizer.pad_token_id or 0
+    special_token_ids = set(tokenizer.all_special_ids)
+    
+    max_seq_len = config['data']['max_seq_length']
+    
+    # Use GT gate schedule (30% masking ≈ 70% visible ≈ step 3 out of 10)
+    # gate = (step / total_steps) * 20.0
+    total_steps = config['training']['total_steps']
+    
+    # For 30% masking, we're at approximately:
+    # visible_ratio = 0.7 → step_ratio = 0.3 → step = 3
+    # gate = 3/10 * 20 = 6.0
+    estimated_step = int(total_steps * (1 - 0.7))  # step when 70% visible
+    gt_gate_start = (estimated_step / total_steps) * 20.0
+    
+    print(f"\n[GT GATE SETUP]")
+    print(f"  Estimated denoising step for 30% masking: {estimated_step}/{total_steps}")
+    print(f"  GT gate value: {gt_gate_start:.4f}")
+    
+    # Tokenize
+    all_tokens = []
+    
+    for text in test_texts[:32]:
+        encoded = tokenizer(
+            text,
+            return_tensors='pt',
+            truncation=True,
+            max_length=max_seq_len,
+            padding=False
+        )
+        tokens = encoded['input_ids'].squeeze(0)
+        
+        if len(tokens) >= 10:
+            all_tokens.append(tokens)
+    
+    # Process batch
+    batch_input_ids = []
+    batch_eval_masks = []
+    batch_original_tokens = []
+    
+    for tokens in all_tokens:
+        masked_tokens, eval_mask = create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids)
+        batch_input_ids.append(masked_tokens)
+        batch_eval_masks.append(eval_mask)
+        batch_original_tokens.append(tokens)
+    
+    # Pad
+    max_len = max(len(t) for t in batch_input_ids)
+    padded_input_ids = []
+    padded_attention_masks = []
+    
+    for masked_tokens in batch_input_ids:
+        pad_len = max_len - len(masked_tokens)
+        if pad_len > 0:
+            padded_input_ids.append(
+                torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
+            )
+            padded_attention_masks.append(
+                torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])
+            )
+        else:
+            padded_input_ids.append(masked_tokens)
+            padded_attention_masks.append(torch.ones(len(masked_tokens)))
+    
+    batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
+    batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
+    
+    print(f"\n[INFERENCE WITH GT GATE]")
+    print(f"  Using fixed GT gate schedule")
+    
+    # Manual inference with GT gate
+    all_output_tokens = []
+    
+    with torch.no_grad():
+        for sample_idx in range(len(all_tokens)):
+            sample_tokens = batch_input_ids_tensor[sample_idx:sample_idx+1]
+            sample_mask = batch_attention_masks_tensor[sample_idx:sample_idx+1]
+            
+            # Step 0: Initial encoding
+            h_0 = model.encode_tokens(sample_tokens, sample_mask)
+            gate_pred_0, pooled_0 = model.gate(h_0, sample_mask, None, None)
+            
+            # Use GT gate instead of predicted
+            gt_gate_0 = torch.tensor([[gt_gate_start]], device=device)
+            
+            # First forward_step with GT gate
+            hidden, _, _ = model.forward_step(
+                h_0,
+                attention_mask=sample_mask,
+                last_gate_score=gt_gate_0,  # GT gate
+                last_pooled=pooled_0,
+                gt_timestep=None,
+                sampling_prob=0.0
+            )
+            
+            # Subsequent step with decremented GT gate
+            gt_gate_1 = torch.tensor([[max(0.0, gt_gate_start - 1.0)]], device=device)
+            gate_pred, pooled = model.gate(hidden, sample_mask, pooled_0, gt_gate_0)
+            
+            # Second forward_step with GT gate
+            hidden, _, _ = model.forward_step(
+                hidden,
+                attention_mask=sample_mask,
+                last_gate_score=gt_gate_1,  # GT gate
+                last_pooled=pooled,
+                gt_timestep=None,
+                sampling_prob=0.0
+            )
+            
+            # Final decode
+            logits = model.decode(hidden, sample_mask)
+            sample_output = logits.argmax(dim=-1)
+            
+            all_output_tokens.append(sample_output)
+    
+    output_tokens = torch.cat(all_output_tokens, dim=0).cpu()
+    
+    # Calculate metrics
+    exact_match_scores = []
+    sample_details = []
+    
+    for j in range(len(all_tokens)):
+        original_tokens = batch_original_tokens[j]
+        eval_mask = batch_eval_masks[j]
+        
+        orig_len = len(original_tokens)
+        pred_tokens = output_tokens[j][:orig_len]
+        
+        if eval_mask.sum() > 0:
+            correct = (pred_tokens[eval_mask] == original_tokens[eval_mask]).sum().item()
+            total = eval_mask.sum().item()
+            accuracy = correct / total
+        else:
+            accuracy = 1.0
+            correct = 0
+            total = 0
+        
+        exact_match_scores.append(accuracy)
+        
+        sample_details.append({
+            'sample_idx': j,
+            'seq_len': orig_len,
+            'num_masked': eval_mask.sum().item(),
+            'correct': correct,
+            'total': total,
+            'accuracy': accuracy
+        })
+    
+    print(f"\n[SAMPLE DETAILS (first 5)]")
+    for detail in sample_details[:5]:
+        print(f"  Sample {detail['sample_idx']}: len={detail['seq_len']}, masked={detail['num_masked']}, "
+              f"correct={detail['correct']}/{detail['total']}, acc={detail['accuracy']:.4f}")
+    
+    # Aggregate
+    avg_accuracy = np.mean(exact_match_scores)
+    
+    print(f"\n[FINAL RESULTS]")
+    print(f"  Accuracy (masked positions): {avg_accuracy:.4f}")
+    
+    return {
+        'accuracy': avg_accuracy,
+        'sample_details': sample_details
+    }
+
+
 def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.3):
     """Scenario 2: Test Masking with DETAILED inference debugging"""
     print("\n" + "="*80)
@@ -626,33 +807,50 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
     }
 
 
-def detailed_comparison(results1, results2):
-    """Detailed comparison"""
+def detailed_comparison(results1, results2, results3):
+    """Detailed comparison including GT gate control"""
     print("\n" + "="*80)
     print("DETAILED COMPARISON")
     print("="*80)
     
-    print(f"\n{'Metric':<30} {'Train Validate':<20} {'Test Masking':<20} {'Difference':<20}")
-    print("-"*90)
+    print(f"\n{'Metric':<30} {'Train Validate':<20} {'Test (Pred Gate)':<20} {'Test (GT Gate)':<20}")
+    print("-"*100)
     
-    acc_diff = results2['accuracy'] - results1['accuracy']
-    acc_diff_pct = (acc_diff / results1['accuracy']) * 100 if results1['accuracy'] > 0 else 0
-    print(f"{'Accuracy':<30} {results1['accuracy']:<20.4f} {results2['accuracy']:<20.4f} {acc_diff:+.4f} ({acc_diff_pct:+.1f}%)")
+    print(f"{'Accuracy':<30} {results1['accuracy']:<20.4f} {results2['accuracy']:<20.4f} {results3['accuracy']:<20.4f}")
     
-    print("\n" + "="*80)
+    print("\n" + "="*100)
     
-    print("\n[KEY DIFFERENCES IDENTIFIED]")
-    print("1. Different masking strategies:")
-    print("   - Training: Chain-based progressive denoising")
-    print("   - Testing: Fixed-ratio random masking")
+    print("\n[KEY FINDINGS]")
     
-    print("\n2. Different forward modes:")
-    print("   - Training: forward_step() with gate guidance")
-    print("   - Testing: inference() with per-sample convergence")
+    # Compare predicted gate vs GT gate
+    pred_gate_acc = results2['accuracy']
+    gt_gate_acc = results3['accuracy']
     
-    print("\n3. Different masking amounts:")
-    print(f"   - Training: {results1['total_masked']:.0f} positions across chain")
-    print(f"   - Testing: varies per sample")
+    if pred_gate_acc == 0.0 and gt_gate_acc > 0.0:
+        print("✓ CONFIRMED: Gate collapse is the PRIMARY issue")
+        print(f"  - With predicted gate: {pred_gate_acc:.4f} (model stops too early)")
+        print(f"  - With GT gate: {gt_gate_acc:.4f} (model can denoise)")
+        print("  → Gate network is NOT properly trained for inference")
+    elif gt_gate_acc == 0.0:
+        print("✗ PROBLEM: Even with GT gate, accuracy is 0%")
+        print("  → Fundamental model capability issue, not just gate")
+    elif pred_gate_acc > 0.0 and gt_gate_acc > pred_gate_acc:
+        print("⚠️  PARTIAL: Gate helps but both have issues")
+        print(f"  - Improvement with GT gate: {(gt_gate_acc - pred_gate_acc):.4f}")
+    
+    print("\n[COMPARISON WITH TRAINING]")
+    train_acc = results1['accuracy']
+    
+    if gt_gate_acc < train_acc:
+        gap = train_acc - gt_gate_acc
+        print(f"Gap between training and GT gate test: {gap:.4f} ({gap/train_acc*100:.1f}%)")
+        print("Possible reasons:")
+        print("  1. Different masking distributions (chain-based vs fixed-ratio)")
+        print("  2. Different data (preprocessed vs raw)")
+        print("  3. Training uses GT timestep in forward_step, test doesn't")
+    else:
+        print(f"GT gate test matches or exceeds training performance")
+        print("The model works - gate is the only issue")
 
 
 def main():
@@ -678,8 +876,9 @@ def main():
     
     results1 = run_train_validate(model, tokenizer, config, test_texts, device)
     results2 = run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.3)
+    results3 = run_test_masking_with_gt_gate(model, tokenizer, config, test_texts, device, mask_ratio=0.3)
     
-    detailed_comparison(results1, results2)
+    detailed_comparison(results1, results2, results3)
     
     print("\n" + "="*80)
     print("DEBUGGING COMPLETE")
