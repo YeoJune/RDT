@@ -242,7 +242,7 @@ class TimestepEmbedder(nn.Module):
     Embeds scalar timesteps into vector representations.
     Classic DDPM Style: Sinusoidal -> Linear -> SiLU -> Linear
     """
-    def __init__(self, hidden_dim, frequency_embedding_size=256):
+    def __init__(self, hidden_dim, frequency_embedding_size=256, scale_factor = 20.0):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_dim),
@@ -250,6 +250,8 @@ class TimestepEmbedder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.frequency_embedding_size = frequency_embedding_size
+        self.gate_scale = 20.0
+        self.scale_factor = scale_factor
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
@@ -275,7 +277,7 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t * 50, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t * self.scale_factor / self.gate_scale, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb.unsqueeze(1)
 
@@ -673,10 +675,12 @@ class RDT(nn.Module):
         # RoPE Configuration
         rope_base: float = 10000.0,
         # Training
+        total_steps: int = 20,
         gradient_checkpointing: bool = False
     ):
         super().__init__()
         self.d_model = d_model
+        self.total_steps = total_steps
         self.gradient_checkpointing = gradient_checkpointing
         
         # Token Embedding
@@ -705,7 +709,7 @@ class RDT(nn.Module):
         self.input_norm = nn.LayerNorm(d_model)
         
         # Noise Level Embedding
-        self.noise_emb = TimestepEmbedder(d_model, frequency_embedding_size=d_model)
+        self.noise_emb = TimestepEmbedder(d_model, frequency_embedding_size=d_model, scale_factor=total_steps)
         
         # Recursive Encoder (AdaLN Blocks with RoPE)
         self.encoder_layers = nn.ModuleList([

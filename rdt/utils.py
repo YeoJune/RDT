@@ -344,6 +344,7 @@ def create_model_from_config(config: Dict, vocab_size: int):
             gate_num_heads=model_config['gate_num_heads'],
             gate_dropout=model_config.get('gate_dropout', 0.1),
             rope_base=model_config.get('rope_base', 10000.0),
+            total_steps=config.get("training", {}).get('total_steps', 20),
             gradient_checkpointing=model_config.get('gradient_checkpointing', False),
             verbose=True
         )
@@ -364,6 +365,7 @@ def create_model_from_config(config: Dict, vocab_size: int):
             gate_num_heads=model_config['gate_num_heads'],
             gate_dropout=model_config.get('gate_dropout', 0.1),
             rope_base=model_config.get('rope_base', 10000.0),
+            total_steps=config.get("training", {}).get('total_steps', 20),
             gradient_checkpointing=model_config.get('gradient_checkpointing', False)
         )
     

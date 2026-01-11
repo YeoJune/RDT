@@ -224,7 +224,7 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             return_tensors='pt', 
             truncation=True, 
             max_length=max_seq_len,
-            padding=False
+            padding='max_length'
         )
         tokens = encoded['input_ids'].squeeze(0)
         
@@ -409,7 +409,7 @@ def test_cmlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_l
             return_tensors='pt', 
             truncation=True, 
             max_length=max_seq_len,
-            padding=False
+            padding='max_length'
         )
         tokens = encoded['input_ids'].squeeze(0)
         
@@ -555,7 +555,7 @@ def test_mdlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_l
             return_tensors='pt', 
             truncation=True, 
             max_length=max_seq_len,
-            padding=False
+            padding='max_length'
         )
         tokens = encoded['input_ids'].squeeze(0)
         
@@ -702,7 +702,7 @@ def test_mlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
             return_tensors='pt', 
             truncation=True, 
             max_length=max_seq_len,
-            padding=False
+            padding='max_length'
         )
         tokens = encoded['input_ids'].squeeze(0)
         
@@ -1138,6 +1138,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             gate_num_heads=config['model']['gate_num_heads'],
             gate_dropout=config['model']['gate_dropout'],
             rope_base=config['model'].get('rope_base', 10000.0),
+            total_steps=config['training']['total_steps'],
             gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
         )
         

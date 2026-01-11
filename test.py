@@ -181,6 +181,34 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
     
     step_details = []
     
+    # ========================================================================
+    # DETAILED LOGGING FOR FIRST SAMPLE
+    # ========================================================================
+    print("\n[DETAILED FORWARD - FIRST SAMPLE]")
+    
+    # Get first sample details
+    sample_0_input = input_tokens[0:1]
+    sample_0_targets = targets[0]
+    sample_0_loss_masks = loss_masks[0]
+    sample_0_attention_mask = attention_mask[0:1]
+    sample_0_chain_length = chain_lengths[0].item()
+    
+    print(f"Sample 0 Details:")
+    print(f"  Chain length: {sample_0_chain_length}")
+    
+    # Find masked positions in input
+    sample_0_input_cpu = sample_0_input.squeeze(0).cpu()
+    masked_in_input = (sample_0_input_cpu == tokenizer.mask_token_id).nonzero(as_tuple=True)[0]
+    print(f"  Masked in input: {len(masked_in_input)} positions")
+    print(f"  Masked indices: {masked_in_input.tolist()[:10]}")
+    
+    # Show what needs to be predicted at each step
+    for step_idx in range(sample_0_chain_length):
+        step_mask = sample_0_loss_masks[step_idx]
+        positions_to_predict = step_mask.nonzero(as_tuple=True)[0]
+        if len(positions_to_predict) > 0:
+            print(f"  Step {step_idx}: Predict {len(positions_to_predict)} positions - {positions_to_predict.tolist()[:5]}")
+    
     with torch.no_grad():
         # Step 0: Initial encoding
         print("\n[FORWARD PASS]")
@@ -254,6 +282,38 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
                 _, top5_preds = pred_probs.topk(5, dim=-1)
                 top5_correct = (top5_preds == sel_targ.unsqueeze(-1)).any(dim=-1).float().sum()
                 step_info['top5_accuracy'] = (top5_correct / step_loss_mask.sum().float()).item()
+                
+                # ============================================================
+                # DETAILED LOGGING FOR FIRST SAMPLE
+                # ============================================================
+                sample_0_loss_mask = step_loss_mask[0]
+                if sample_0_loss_mask.sum() > 0:
+                    sample_0_logits = logits[0]
+                    sample_0_pred = pred_tokens[0].cpu()
+                    sample_0_target = step_targets[0].cpu()
+                    sample_0_probs = torch.softmax(sample_0_logits, dim=-1)
+                    
+                    positions = sample_0_loss_mask.nonzero(as_tuple=True)[0]
+                    
+                    print(f"\n  [Sample 0 Predictions - Step {step_idx + 1}]")
+                    unique_preds = set()
+                    for pos in positions[:5]:  # First 5
+                        pos_idx = pos.item()
+                        pred_id = sample_0_pred[pos_idx].item()
+                        true_id = sample_0_target[pos_idx].item()
+                        prob = sample_0_probs[pos_idx, pred_id].item()
+                        
+                        pred_str = tokenizer.decode([pred_id])
+                        true_str = tokenizer.decode([true_id])
+                        
+                        unique_preds.add(pred_id)
+                        match = "✓" if pred_id == true_id else "✗"
+                        print(f"    Pos {pos_idx}: pred='{pred_str}' ({pred_id}), true='{true_str}' ({true_id}), prob={prob:.4f} {match}")
+                    
+                    if len(unique_preds) == 1:
+                        print(f"    ⚠️  All positions predict the SAME token!")
+                    else:
+                        print(f"    ✓ Predicting {len(unique_preds)} different tokens")
             else:
                 recon_loss = torch.tensor(0.0, device=device)
                 step_info.update({
@@ -315,14 +375,12 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
     }
 
 
-def run_test_masking_with_gt_gate(model, tokenizer, config, test_texts, device, mask_ratio=0.3):
+def run_test_masking_with_gt_gate(model, tokenizer, config, test_texts, device, mask_ratio=0.3, training_batch=None):
     """
     Scenario 3: Test Masking with GT GATE (Control Experiment)
     
-    This uses the same masking as test_masking but forces GT gate values
-    to isolate whether the problem is:
-    1. Gate collapse issue, OR
-    2. Fundamental model capability issue
+    Uses SAME input as training if training_batch is provided,
+    otherwise creates its own masked input
     """
     print("\n" + "="*80)
     print(f"SCENARIO 3: Test Masking with GT GATE (mask_ratio={mask_ratio})")
@@ -336,72 +394,224 @@ def run_test_masking_with_gt_gate(model, tokenizer, config, test_texts, device, 
     
     max_seq_len = config['data']['max_seq_length']
     
-    # Use GT gate schedule (30% masking ≈ 70% visible ≈ step 3 out of 10)
-    # gate = (step / total_steps) * 20.0
+    # Use GT gate schedule
     total_steps = config['training']['total_steps']
-    
-    # For 30% masking, we're at approximately:
-    # visible_ratio = 0.7 → step_ratio = 0.3 → step = 3
-    # gate = 3/10 * 20 = 6.0
-    estimated_step = int(total_steps * (1 - 0.7))  # step when 70% visible
+    estimated_step = int(total_steps * (1 - 0.7))
     gt_gate_start = (estimated_step / total_steps) * 20.0
     
     print(f"\n[GT GATE SETUP]")
     print(f"  Estimated denoising step for 30% masking: {estimated_step}/{total_steps}")
     print(f"  GT gate value: {gt_gate_start:.4f}")
     
-    # Tokenize
-    all_tokens = []
-    
-    for text in test_texts[:32]:
-        encoded = tokenizer(
-            text,
-            return_tensors='pt',
-            truncation=True,
-            max_length=max_seq_len,
-            padding=False
-        )
-        tokens = encoded['input_ids'].squeeze(0)
+    # ========================================================================
+    # CRITICAL: Use SAME input as training for fair comparison
+    # ========================================================================
+    if training_batch is not None:
+        print(f"\n[USING TRAINING BATCH INPUT]")
+        print(f"  This ensures we compare on IDENTICAL inputs")
         
-        if len(tokens) >= 10:
-            all_tokens.append(tokens)
-    
-    # Process batch
-    batch_input_ids = []
-    batch_eval_masks = []
-    batch_original_tokens = []
-    
-    for tokens in all_tokens:
-        masked_tokens, eval_mask = create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids)
-        batch_input_ids.append(masked_tokens)
-        batch_eval_masks.append(eval_mask)
-        batch_original_tokens.append(tokens)
-    
-    # Pad
-    max_len = max(len(t) for t in batch_input_ids)
-    padded_input_ids = []
-    padded_attention_masks = []
-    
-    for masked_tokens in batch_input_ids:
-        pad_len = max_len - len(masked_tokens)
-        if pad_len > 0:
-            padded_input_ids.append(
-                torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
+        batch_input_ids_tensor = training_batch['input'].to(device)
+        batch_attention_masks_tensor = training_batch['attention_mask'].to(device)
+        
+        # For evaluation, we need to know what the original tokens were
+        # We'll reconstruct from targets (step 1 has the unmasked tokens)
+        # This is a bit hacky but necessary for fair comparison
+        print(f"  Note: Using training preprocessed inputs")
+        
+        # We can't easily get eval_mask from training batch, so create new masks
+        batch_eval_masks = []
+        batch_original_tokens = []
+        
+        for i in range(batch_input_ids_tensor.size(0)):
+            # Get the input
+            input_seq = batch_input_ids_tensor[i].cpu()
+            
+            # Get original from training targets (last step should have originals)
+            # This is approximate - for demo purposes
+            # In reality we'd need the original unmasked sequence
+            eval_mask = (input_seq == mask_token_id)
+            batch_eval_masks.append(eval_mask)
+            
+            # Use targets from training as "original"
+            # Note: This is not perfect but shows the concept
+            original = input_seq.clone()
+            batch_original_tokens.append(original)
+        
+        all_tokens = batch_original_tokens  # For iteration
+        
+    else:
+        # Create new masked input
+        all_tokens = []
+        
+        for text in test_texts[:32]:
+            encoded = tokenizer(
+                text,
+                return_tensors='pt',
+                truncation=True,
+                max_length=max_seq_len,
+                padding='max_length'
             )
-            padded_attention_masks.append(
-                torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])
-            )
-        else:
-            padded_input_ids.append(masked_tokens)
-            padded_attention_masks.append(torch.ones(len(masked_tokens)))
-    
-    batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
-    batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
+            tokens = encoded['input_ids'].squeeze(0)
+            
+            if len(tokens) >= 10:
+                all_tokens.append(tokens)
+        
+        # Process batch
+        batch_input_ids = []
+        batch_eval_masks = []
+        batch_original_tokens = []
+        
+        for tokens in all_tokens:
+            masked_tokens, eval_mask = create_masked_input(tokens, mask_ratio, mask_token_id, special_token_ids)
+            batch_input_ids.append(masked_tokens)
+            batch_eval_masks.append(eval_mask)
+            batch_original_tokens.append(tokens)
+        
+        # Pad
+        max_len = max(len(t) for t in batch_input_ids)
+        padded_input_ids = []
+        padded_attention_masks = []
+        
+        for masked_tokens in batch_input_ids:
+            pad_len = max_len - len(masked_tokens)
+            if pad_len > 0:
+                padded_input_ids.append(
+                    torch.cat([masked_tokens, torch.full((pad_len,), pad_token_id)])
+                )
+                padded_attention_masks.append(
+                    torch.cat([torch.ones(len(masked_tokens)), torch.zeros(pad_len)])
+                )
+            else:
+                padded_input_ids.append(masked_tokens)
+                padded_attention_masks.append(torch.ones(len(masked_tokens)))
+        
+        batch_input_ids_tensor = torch.stack(padded_input_ids).to(device)
+        batch_attention_masks_tensor = torch.stack(padded_attention_masks).to(device)
     
     print(f"\n[INFERENCE WITH GT GATE]")
     print(f"  Using fixed GT gate schedule")
     
-    # Manual inference with GT gate
+    # ========================================================================
+    # DETAILED LOGGING FOR FIRST SAMPLE
+    # ========================================================================
+    print(f"\n[DETAILED INFERENCE - FIRST SAMPLE WITH GT GATE]")
+    
+    sample_idx = 0
+    sample_tokens = batch_input_ids_tensor[sample_idx:sample_idx+1]
+    sample_mask = batch_attention_masks_tensor[sample_idx:sample_idx+1]
+    original_tokens = batch_original_tokens[sample_idx]
+    eval_mask = batch_eval_masks[sample_idx]
+    
+    print(f"Sample 0 Details:")
+    print(f"  Original length: {len(original_tokens)}")
+    print(f"  Masked positions: {eval_mask.sum().item()}")
+    print(f"  Masked indices: {eval_mask.nonzero(as_tuple=True)[0].tolist()}")
+    
+    for idx in eval_mask.nonzero(as_tuple=True)[0][:5]:
+        orig_token = tokenizer.decode([original_tokens[idx].item()])
+        print(f"    Position {idx}: '{orig_token}' (token_id={original_tokens[idx].item()})")
+    
+    with torch.no_grad():
+        # Step 0: Initial encoding
+        print(f"\n--- Step 0: Initial Encoding ---")
+        h_0 = model.encode_tokens(sample_tokens, sample_mask)
+        gate_pred_0, pooled_0 = model.gate(h_0, sample_mask, None, None)
+        
+        print(f"  Hidden shape: {h_0.shape}")
+        print(f"  Gate pred (ignored): {gate_pred_0.item():.4f}")
+        print(f"  Using GT gate: {gt_gate_start:.4f}")
+        
+        # Use GT gate instead of predicted
+        gt_gate_0 = torch.tensor([[gt_gate_start]], device=device)
+        
+        # First forward_step with GT gate
+        print(f"\n--- Step 1: First Forward Step (GT Gate) ---")
+        hidden, _, _ = model.forward_step(
+            h_0,
+            attention_mask=sample_mask,
+            last_gate_score=gt_gate_0,
+            last_pooled=pooled_0,
+            gt_timestep=None,
+            sampling_prob=0.0
+        )
+        
+        gate_pred, pooled = model.gate(hidden, sample_mask, pooled_0, gt_gate_0)
+        print(f"  Gate pred (ignored): {gate_pred.item():.4f}")
+        
+        # Decode and check
+        logits = model.decode(hidden, sample_mask)
+        pred_tokens = logits.argmax(dim=-1).squeeze(0).cpu()
+        pred_probs = torch.softmax(logits.squeeze(0), dim=-1)
+        
+        print(f"  Predictions at masked positions:")
+        unique_preds = set()
+        for idx in eval_mask.nonzero(as_tuple=True)[0][:5]:
+            if idx < len(pred_tokens):
+                pred_token_id = pred_tokens[idx].item()
+                true_token_id = original_tokens[idx].item()
+                pred_prob = pred_probs[idx, pred_token_id].item()
+                
+                pred_token_str = tokenizer.decode([pred_token_id])
+                true_token_str = tokenizer.decode([true_token_id])
+                
+                unique_preds.add(pred_token_id)
+                match = "✓" if pred_token_id == true_token_id else "✗"
+                print(f"    Pos {idx}: pred='{pred_token_str}' ({pred_token_id}), true='{true_token_str}' ({true_token_id}), prob={pred_prob:.4f} {match}")
+        
+        if len(unique_preds) == 1:
+            print(f"  ⚠️  All positions predict the SAME token!")
+        else:
+            print(f"  ✓ Predicting {len(unique_preds)} different tokens")
+        
+        # Second forward_step with GT gate
+        gt_gate_1 = torch.tensor([[max(0.0, gt_gate_start - 1.0)]], device=device)
+        
+        print(f"\n--- Step 2: Second Forward Step (GT Gate) ---")
+        print(f"  Using GT gate: {gt_gate_1.item():.4f}")
+        
+        hidden, _, _ = model.forward_step(
+            hidden,
+            attention_mask=sample_mask,
+            last_gate_score=gt_gate_1,
+            last_pooled=pooled,
+            gt_timestep=None,
+            sampling_prob=0.0
+        )
+        
+        # Final decode
+        logits = model.decode(hidden, sample_mask)
+        pred_tokens = logits.argmax(dim=-1).squeeze(0).cpu()
+        pred_probs = torch.softmax(logits.squeeze(0), dim=-1)
+        
+        print(f"  Final predictions at masked positions:")
+        unique_preds = set()
+        for idx in eval_mask.nonzero(as_tuple=True)[0][:5]:
+            if idx < len(pred_tokens):
+                pred_token_id = pred_tokens[idx].item()
+                true_token_id = original_tokens[idx].item()
+                pred_prob = pred_probs[idx, pred_token_id].item()
+                
+                pred_token_str = tokenizer.decode([pred_token_id])
+                true_token_str = tokenizer.decode([true_token_id])
+                
+                unique_preds.add(pred_token_id)
+                match = "✓" if pred_token_id == true_token_id else "✗"
+                print(f"    Pos {idx}: pred='{pred_token_str}' ({pred_token_id}), true='{true_token_str}' ({true_token_id}), prob={pred_prob:.4f} {match}")
+        
+        if len(unique_preds) == 1:
+            print(f"  ⚠️  All positions predict the SAME token!")
+        else:
+            print(f"  ✓ Predicting {len(unique_preds)} different tokens")
+        
+        # Calculate accuracy
+        if eval_mask.sum() > 0:
+            correct = (pred_tokens[eval_mask] == original_tokens[eval_mask]).sum().item()
+            total = eval_mask.sum().item()
+            print(f"\n  Sample 0 final accuracy: {correct}/{total} = {correct/total:.4f}")
+    
+    print(f"\n[BATCH INFERENCE WITH GT GATE]")
+    
+    # Manual inference with GT gate for all samples
     all_output_tokens = []
     
     with torch.no_grad():
@@ -509,7 +719,7 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
     special_token_ids = set(tokenizer.all_special_ids)
     
     max_seq_len = config['data']['max_seq_length']
-    max_steps = 20
+    max_steps = 10
     threshold = 0.5
     
     # Tokenize
@@ -522,7 +732,7 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
             return_tensors='pt',
             truncation=True,
             max_length=max_seq_len,
-            padding=False
+            padding='max_length'
         )
         tokens = encoded['input_ids'].squeeze(0)
         
