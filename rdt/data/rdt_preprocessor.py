@@ -49,9 +49,6 @@ class RDTPreprocessor:
         min_starts = chain_lengths
         ranges = self.total_steps - min_starts + 1
 
-        max_start = 5  # 이 값 조정
-        ranges = torch.clamp(ranges, max=max_start - min_starts + 1)
-
         start_steps = min_starts + torch.rand(B, device=device).mul(ranges).long()
         
         # 2. Random Permutation Logic (GPU Friendly)
