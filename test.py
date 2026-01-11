@@ -316,7 +316,7 @@ def run_train_validate(model, tokenizer, config, test_texts, device):
 
 
 def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.3):
-    """Scenario 2: Test Masking with detailed debugging"""
+    """Scenario 2: Test Masking with DETAILED inference debugging"""
     print("\n" + "="*80)
     print(f"SCENARIO 2: Test Masking (test_masking.py, mask_ratio={mask_ratio})")
     print("="*80)
@@ -369,7 +369,6 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
         batch_eval_masks.append(eval_mask)
         batch_original_tokens.append(tokens)
         
-        # Count maskable vs actually masked
         maskable = sum(1 for t in tokens if t.item() not in special_token_ids)
         total_maskable += maskable
         total_masked += eval_mask.sum().item()
@@ -406,11 +405,134 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
     print(f"  Attention mask shape: {batch_attention_masks_tensor.shape}")
     print(f"  Valid tokens: {batch_attention_masks_tensor.sum().item()}")
     
-    # Inference
-    print(f"\n[INFERENCE]")
+    # ========================================================================
+    # MANUAL INFERENCE with DETAILED LOGGING (first sample only for clarity)
+    # ========================================================================
+    print(f"\n[DETAILED INFERENCE - FIRST SAMPLE]")
     print(f"  Max steps: {max_steps}")
     print(f"  Threshold: {threshold}")
     
+    sample_idx = 0
+    x = batch_input_ids_tensor
+    attention_mask = batch_attention_masks_tensor
+    
+    with torch.no_grad():
+        # Get first sample for detailed logging
+        sample_tokens = x[sample_idx:sample_idx+1]
+        sample_mask = attention_mask[sample_idx:sample_idx+1]
+        original_tokens = batch_original_tokens[sample_idx]
+        eval_mask = batch_eval_masks[sample_idx]
+        
+        print(f"\nSample 0 Details:")
+        print(f"  Original length: {len(original_tokens)}")
+        print(f"  Masked positions: {eval_mask.sum().item()}")
+        print(f"  Masked indices: {eval_mask.nonzero(as_tuple=True)[0].tolist()}")
+        
+        # Show what's masked
+        for idx in eval_mask.nonzero(as_tuple=True)[0][:5]:  # First 5
+            orig_token = tokenizer.decode([original_tokens[idx].item()])
+            print(f"    Position {idx}: '{orig_token}' (token_id={original_tokens[idx].item()})")
+        
+        # Step 0: Initial encoding
+        print(f"\n--- Step 0: Initial Encoding ---")
+        h_0 = model.encode_tokens(sample_tokens, sample_mask)
+        gate_pred_0, pooled_0 = model.gate(h_0, sample_mask, None, None)
+        
+        print(f"  Hidden shape: {h_0.shape}")
+        print(f"  Gate pred: {gate_pred_0.item():.4f}")
+        
+        # First forward_step
+        print(f"\n--- Step 1: First Forward Step ---")
+        hidden, _, _ = model.forward_step(
+            h_0,
+            attention_mask=sample_mask,
+            last_gate_score=gate_pred_0,
+            last_pooled=pooled_0,
+            gt_timestep=None,
+            sampling_prob=0.0
+        )
+        
+        gate_pred, pooled = model.gate(hidden, sample_mask, pooled_0, gate_pred_0)
+        print(f"  Gate pred after transform: {gate_pred.item():.4f}")
+        
+        # Decode and check predictions
+        logits = model.decode(hidden, sample_mask)
+        pred_tokens = logits.argmax(dim=-1).squeeze(0)
+        pred_probs = torch.softmax(logits.squeeze(0), dim=-1)
+        
+        print(f"  Predictions at masked positions:")
+        for idx in eval_mask.nonzero(as_tuple=True)[0][:5]:
+            if idx < len(pred_tokens):
+                pred_token_id = pred_tokens[idx].item()
+                true_token_id = original_tokens[idx].item()
+                pred_prob = pred_probs[idx, pred_token_id].item()
+                
+                pred_token_str = tokenizer.decode([pred_token_id])
+                true_token_str = tokenizer.decode([true_token_id])
+                
+                match = "✓" if pred_token_id == true_token_id else "✗"
+                print(f"    Pos {idx}: pred='{pred_token_str}' ({pred_token_id}), true='{true_token_str}' ({true_token_id}), prob={pred_prob:.4f} {match}")
+        
+        steps_taken = 1
+        
+        # Continue iterations
+        for step in range(1, max_steps):
+            gate_score = gate_pred.squeeze(-1).item()
+            
+            print(f"\n--- Step {step + 1}: Iteration ---")
+            print(f"  Gate score: {gate_score:.4f}")
+            
+            if gate_score < threshold:
+                print(f"  → Converged (gate < threshold)")
+                break
+            
+            hidden, _, _ = model.forward_step(
+                hidden,
+                attention_mask=sample_mask,
+                last_gate_score=gate_pred,
+                last_pooled=pooled,
+                gt_timestep=None,
+                sampling_prob=0.0
+            )
+            
+            gate_pred, pooled = model.gate(hidden, sample_mask, pooled, gate_pred)
+            
+            # Decode and check
+            logits = model.decode(hidden, sample_mask)
+            pred_tokens = logits.argmax(dim=-1).squeeze(0)
+            pred_probs = torch.softmax(logits.squeeze(0), dim=-1)
+            
+            print(f"  Gate pred after transform: {gate_pred.item():.4f}")
+            print(f"  Predictions at masked positions:")
+            for idx in eval_mask.nonzero(as_tuple=True)[0][:5]:
+                if idx < len(pred_tokens):
+                    pred_token_id = pred_tokens[idx].item()
+                    true_token_id = original_tokens[idx].item()
+                    pred_prob = pred_probs[idx, pred_token_id].item()
+                    
+                    pred_token_str = tokenizer.decode([pred_token_id])
+                    true_token_str = tokenizer.decode([true_token_id])
+                    
+                    match = "✓" if pred_token_id == true_token_id else "✗"
+                    print(f"    Pos {idx}: pred='{pred_token_str}' ({pred_token_id}), true='{true_token_str}' ({true_token_id}), prob={pred_prob:.4f} {match}")
+            
+            steps_taken += 1
+        
+        print(f"\nFinal step count: {steps_taken}")
+        
+        # Final accuracy for this sample
+        final_logits = model.decode(hidden, sample_mask)
+        final_pred = final_logits.argmax(dim=-1).squeeze(0)
+        
+        if eval_mask.sum() > 0:
+            correct = (final_pred[eval_mask] == original_tokens[eval_mask]).sum().item()
+            total = eval_mask.sum().item()
+            print(f"Final accuracy: {correct}/{total} = {correct/total:.4f}")
+        
+    # ========================================================================
+    # Run full batch inference (using original method)
+    # ========================================================================
+    print(f"\n[BATCH INFERENCE]")
     with torch.no_grad():
         output_ids, steps_taken = model.inference(
             batch_input_ids_tensor,
@@ -423,24 +545,20 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
         pred_tokens_batch = output_ids.cpu()
         steps_batch = steps_taken.cpu()
     
-    print(f"\n[INFERENCE RESULTS]")
     print(f"  Steps taken: min={steps_batch.min().item()}, max={steps_batch.max().item()}, mean={steps_batch.float().mean().item():.2f}")
     
     # Calculate metrics per sample
     exact_match_scores = []
-    top5_scores = []
     sample_details = []
     
     for j in range(len(batch_tokens)):
         original_tokens = batch_original_tokens[j]
         eval_mask = batch_eval_masks[j]
         
-        # Extract predictions
         orig_len = len(original_tokens)
         pred_tokens = pred_tokens_batch[j][:orig_len]
         num_steps = steps_batch[j].item()
         
-        # Exact Match
         if eval_mask.sum() > 0:
             correct = (pred_tokens[eval_mask] == original_tokens[eval_mask]).sum().item()
             total = eval_mask.sum().item()
@@ -462,7 +580,6 @@ def run_test_masking(model, tokenizer, config, test_texts, device, mask_ratio=0.
             'steps': num_steps
         })
     
-    # Show first few samples
     print(f"\n[SAMPLE DETAILS (first 5)]")
     for detail in sample_details[:5]:
         print(f"  Sample {detail['sample_idx']}: len={detail['seq_len']}, masked={detail['num_masked']}, "
