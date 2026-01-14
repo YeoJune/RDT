@@ -7,7 +7,7 @@ model_type: "rdt" # 'rdt' or 'mlm'
 model:
   d_model: 512 # Hidden dimension (auto-set from BERT if use_bert_init=true)
   n_heads: 8 # Attention heads (d_model / 64)
-  n_encoder_layers: 6 # Main encoder depth (recursive)
+  n_encoder_layers: 4 # Main encoder depth (recursive)
   d_ff: 2048 # FFN dimension (4x d_model)
   dropout: 0.1
 
@@ -64,10 +64,10 @@ training:
   aux_temp: 0.5
 
   # Optimization
-  batch_size: 32
-  gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 64
+  gradient_accumulation_steps: 4 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
-  num_epochs: 2 # Used when training_mode is 'epoch'
+  num_epochs: 10 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
   learning_rate: 0.0002 # 2e-4
   weight_decay: 0.01
@@ -86,7 +86,7 @@ training:
 
 # Data
 data:
-  dataset_name: "wikitext-103" # 'wikitext-2' or 'wikitext-103'
+  dataset_name: "wikitext-2" # 'wikitext-2' or 'wikitext-103'
   streaming: false # true: buffer-based on-the-fly loading, false: download all at once
   max_seq_length: 128 # Maximum sequence length
   mask_token: "[MASK]"
