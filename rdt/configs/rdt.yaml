@@ -67,7 +67,7 @@ training:
   batch_size: 64
   gradient_accumulation_steps: 4 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
-  num_epochs: 5 # Used when training_mode is 'epoch'
+  num_epochs: 10 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
   learning_rate: 0.0002 # 2e-4
   weight_decay: 0.01
