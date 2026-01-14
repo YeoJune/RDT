@@ -39,28 +39,33 @@ class RDTPreprocessor:
         
         Args:
             progress: Training progress in [0.0, 1.0]
-                     0.0 = beginning (easy tasks)
-                     1.0 = end (full difficulty)
         
         Returns:
             (min_step, max_step): Allowed range for start_step sampling
         
-        Examples (total_steps=20, start_step=5):
-            progress=0.0 → (5, 5)    # Fixed at start_step
-            progress=0.5 → (3, 12)   # Expanding range
-            progress=1.0 → (1, 20)   # Full range (uniform distribution)
+        Examples (total_steps=20, start_step=5, max_chain_length=2):
+            progress=0.0 → (2, 5)    # Narrow range (20~25% mask)
+            progress=0.5 → (2, 12)   # Expanding range (10~90% mask)
+            progress=1.0 → (2, 20)   # Full range (0~90% mask)
+        
+        Critical: start_step MUST be >= max_chain_length for curriculum to work!
         """
         if not self.curriculum_enabled:
-            return (1, self.total_steps)
+            return (self.max_chain_length, self.total_steps)
         
-        # Linearly interpolate both min and max
-        # Min: start_step → 1
-        # Max: start_step → total_steps
-        min_step = self.curriculum_start_step - progress * (self.curriculum_start_step - 1)
-        max_step = self.curriculum_start_step + progress * (self.total_steps - self.curriculum_start_step)
+        # Min: Always fixed at max_chain_length
+        min_step = self.max_chain_length
         
-        return (int(min_step), int(max_step))
-    
+        # Max: Linear interpolation from start_step to total_steps
+        max_step = self.curriculum_start_step + progress * (
+            self.total_steps - self.curriculum_start_step
+        )
+        
+        # Clamp max_step to be at least min_step
+        max_step = max(min_step, int(max_step))
+        
+        return (min_step, max_step)
+
     @torch.no_grad()
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         input_ids = torch.stack([item['input_ids'] for item in batch])
