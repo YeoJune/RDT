@@ -541,11 +541,30 @@ class RDTTrainer:
             (total_accuracy_tensor / num_batches_tensor).item()
         )
 
+    def get_curriculum_progress(self) -> float:
+        """
+        Calculate current curriculum progress.
+        
+        Returns:
+            progress: Float in [0.0, 1.0]
+                     0.0 = training start
+                     1.0 = training end
+        """
+        if self.training_mode == 'epoch':
+            if self.num_epochs <= 1:
+                return 1.0
+            return min(1.0, self.current_epoch / (self.num_epochs - 1))
+        else:  # step mode
+            if self.max_training_steps <= 1:
+                return 1.0
+            return min(1.0, self.global_step / self.max_training_steps)
+        
     def train(self):
         if self.training_mode == 'epoch':
             self._train_by_epoch()
         else:
             self._train_by_step()
+    
     
     def _train_by_epoch(self):
         if self.accelerator.is_main_process:
@@ -575,10 +594,21 @@ class RDTTrainer:
             self.current_epoch = epoch
             sampling_prob = self.get_sampling_prob(epoch=epoch)
             
-            if self.accelerator.is_main_process:
-                print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
+            # Update curriculum progress
+            curriculum_progress = self.get_curriculum_progress()
+            self.train_loader.collate_fn.current_progress = curriculum_progress
             
-            # [Standard Fix] 에폭 단위 누적 변수 제거 (TPU 그래프 폭발 방지)
+            if self.accelerator.is_main_process:
+                log_msg = f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}"
+                
+                # Add curriculum info if enabled
+                if self.train_loader.collate_fn.curriculum_enabled:
+                    min_step, max_step = self.train_loader.collate_fn.get_start_step_range(curriculum_progress)
+                    avg_start_step = (min_step + max_step) / 2
+                    avg_mask_ratio = avg_start_step / self.train_loader.collate_fn.total_steps
+                    log_msg += f" | Curriculum: [{min_step}, {max_step}] (~{avg_mask_ratio:.1%} mask)"
+                
+                print(log_msg)
             
             # Accelerate가 준비한 DataLoader 그대로 사용
             train_iter = self.train_loader
@@ -736,6 +766,7 @@ class RDTTrainer:
             print("\nTraining completed!")
             self.csv_logger.close()
     
+    
     def _train_by_step(self):
         if self.accelerator.is_main_process:
             print(f"\nStarting step-based training for {self.max_training_steps} steps...")
@@ -768,9 +799,22 @@ class RDTTrainer:
             self.current_epoch = epoch
             sampling_prob = self.get_sampling_prob(step=step)
             
-            if self.accelerator.is_main_process:
-                print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
+            # Update curriculum progress
+            curriculum_progress = self.get_curriculum_progress()
+            self.train_loader.collate_fn.current_progress = curriculum_progress
             
+            if self.accelerator.is_main_process:
+                log_msg = f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}"
+                
+                # Add curriculum info if enabled
+                if self.train_loader.collate_fn.curriculum_enabled:
+                    min_step, max_step = self.train_loader.collate_fn.get_start_step_range(curriculum_progress)
+                    avg_start_step = (min_step + max_step) / 2
+                    avg_mask_ratio = avg_start_step / self.train_loader.collate_fn.total_steps
+                    log_msg += f" | Curriculum: [{min_step}, {max_step}] (~{avg_mask_ratio:.1%} mask)"
+                
+                print(log_msg)
+                
             # Accelerate가 준비한 DataLoader 그대로 사용
             train_iter = self.train_loader
             
