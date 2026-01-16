@@ -611,6 +611,8 @@ class RDT(nn.Module):
         gate_num_layers: int = 3,
         gate_num_heads: int = 8,
         gate_dropout: float = 0.3,
+        # RoPE Configuration
+        rope_base: float = 10000.0,
         # Training
         total_steps: int = 20,
         gradient_checkpointing: bool = False
