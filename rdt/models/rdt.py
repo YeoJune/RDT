@@ -1,4 +1,4 @@
-"""RDT Model Architecture (Refactored with RoPE & Transformer I/O)"""
+"""RDT Model Architecture (Refactored with APE & Transformer I/O)"""
 
 import torch
 import torch.nn as nn
@@ -6,100 +6,203 @@ import torch.nn.functional as F
 import math
 from typing import List, Optional
 
+
 # ============================================================================
-# Rotary Position Embedding (RoPE)
+# Absolute Position Embedding (APE)
 # ============================================================================
 
-class RotaryPositionalEmbedding(nn.Module):
+class AbsolutePositionalEmbedding(nn.Module):
     """
-    Rotary Position Embedding (RoPE) as described in RoFormer paper.
-    Reference: https://arxiv.org/abs/2104.09864
+    Absolute Positional Embedding using sinusoidal functions.
+    Reference: "Attention is All You Need" (Vaswani et al., 2017)
     
-    RoPE encodes position by rotating query/key vectors in pairs.
-    This implementation caches sin/cos values for efficiency.
+    This implementation uses fixed sinusoidal embeddings that are added
+    to token embeddings once at the input layer.
     """
-    def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
+    def __init__(self, d_model: int, max_seq_len: int = 2048):
         super().__init__()
-        self.dim = dim
+        self.d_model = d_model
         self.max_seq_len = max_seq_len
-        self.base = base
         
-        # Precompute frequencies: theta_i = base^(-2i/d) for i in [0, d/2)
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        # Create positional encoding matrix [max_seq_len, d_model]
+        pe = torch.zeros(max_seq_len, d_model)
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
         
-        # Cache for sin/cos values
-        self._seq_len_cached = 0
-        self._cos_cached = None
-        self._sin_cached = None
+        # Compute division term: 10000^(2i/d_model)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
         
-        # Build initial cache
-        self._build_cache(max_seq_len)
+        # Apply sin to even indices, cos to odd indices
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Register as buffer (not a parameter, but part of state_dict)
+        self.register_buffer('pe', pe.unsqueeze(0))  # [1, max_seq_len, d_model]
     
-    def _build_cache(self, seq_len: int):
-        """Precompute and cache sin/cos values for positions [0, seq_len)"""
-        if seq_len > self._seq_len_cached:
-            self._seq_len_cached = seq_len
-            
-            # Position indices: [0, 1, 2, ..., seq_len-1]
-            t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-            
-            # Compute outer product: [seq_len, dim/2]
-            # freqs[pos, i] = pos * theta_i
-            freqs = torch.outer(t, self.inv_freq)
-            
-            # Compute sin and cos
-            # We'll interleave these: [cos, cos, ...], [sin, sin, ...]
-            # Shape: [seq_len, dim]
-            emb = torch.cat([freqs, freqs], dim=-1)  # Duplicate for interleaving
-            
-            self._cos_cached = emb.cos()
-            self._sin_cached = emb.sin()
-    
-    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Rotate half the hidden dims of the input.
-        
-        For x = [x0, x1, x2, x3, ...], returns [-x1, x0, -x3, x2, ...]
-        This corresponds to rotating by 90 degrees in each 2D plane.
-        """
-        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-        return torch.cat([-x2, x1], dim=-1)
-    
-    def forward(self, x: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
-        """
-        Apply rotary position embedding to input tensor.
+        Add positional encoding to input tensor.
         
         Args:
-            x: Input tensor of shape [..., seq_len, ..., dim]
-            seq_dim: Dimension index for sequence length (default: 1 for [B, L, ...])
+            x: Input tensor of shape [B, L, d_model]
         
         Returns:
-            Tensor with same shape as x, with rotary embeddings applied
+            Tensor with same shape as x, with positional encodings added
         """
-        seq_len = x.shape[seq_dim]
+        seq_len = x.size(1)
         
-        # Rebuild cache if needed
-        if seq_len > self._seq_len_cached:
-            self._build_cache(seq_len)
+        # Add positional encoding
+        # pe[:, :seq_len, :] has shape [1, L, d_model]
+        return x + self.pe[:, :seq_len, :]
+
+
+# ============================================================================
+# Standard Self-Attention (without RoPE)
+# ============================================================================
+
+class StandardSelfAttention(nn.Module):
+    """
+    Standard Multi-Head Self-Attention
+    Optimized with F.scaled_dot_product_attention
+    """
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         
-        # Get cached values for current sequence length
-        # Shape: [seq_len, dim]
-        cos = self._cos_cached[:seq_len].to(x.device)
-        sin = self._sin_cached[:seq_len].to(x.device)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
         
-        # Reshape for broadcasting
-        # Need to match x's shape: [..., seq_len, ..., dim]
-        # We'll add dimensions as needed
-        shape = [1] * x.ndim
-        shape[seq_dim] = seq_len
-        shape[-1] = self.dim
+        # QKV projections
+        self.qkv_proj = nn.Linear(d_model, d_model * 3, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
         
-        cos = cos.view(shape)
-        sin = sin.view(shape)
+        # Dropout for SDPA
+        self.dropout_p = dropout
+        self.out_dropout = nn.Dropout(dropout)
         
-        # Apply rotation: x_rotated = x * cos + rotate_half(x) * sin
-        return x * cos + self._rotate_half(x) * sin
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None):
+        """
+        Args:
+            x: [B, L, D]
+            key_padding_mask: [B, L] where True means ignore (padding)
+        """
+        B, L, D = x.shape
+        
+        # 1. Project to Q, K, V
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # 2. Split heads: [B, L, n_heads, head_dim]
+        q = q.view(B, L, self.n_heads, self.head_dim)
+        k = k.view(B, L, self.n_heads, self.head_dim)
+        v = v.view(B, L, self.n_heads, self.head_dim)
+        
+        # 3. Transpose for attention: [B, n_heads, L, head_dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # 4. Scaled Dot Product Attention
+        attn_mask = None
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, L] -> [B, 1, 1, L] for broadcasting
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
+        
+        # 5. Concatenate heads: [B, L, D]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, D)
+        
+        # 6. Output projection
+        output = self.out_proj(attn_output)
+        output = self.out_dropout(output)
+        
+        return output
+
+
+class StandardCrossAttention(nn.Module):
+    """
+    Standard Multi-Head Cross-Attention
+    Optimized with F.scaled_dot_product_attention
+    """
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        # Separate Q, K, V projections
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # Dropout for SDPA
+        self.dropout_p = dropout
+        self.out_dropout = nn.Dropout(dropout)
+        
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ):
+        """
+        Args:
+            query: [B, L_q, D]
+            key: [B, L_kv, D]
+            value: [B, L_kv, D]
+            key_padding_mask: [B, L_kv]
+        """
+        B, L_q, D = query.shape
+        L_kv = key.shape[1]
+        
+        # 1. Project Q, K, V
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+        
+        # 2. Split heads
+        q = q.view(B, L_q, self.n_heads, self.head_dim)
+        k = k.view(B, L_kv, self.n_heads, self.head_dim)
+        v = v.view(B, L_kv, self.n_heads, self.head_dim)
+        
+        # 3. Transpose for attention: [B, n_heads, L, head_dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # 4. Scaled Dot Product Attention
+        attn_mask = None
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, L_kv] -> [B, 1, 1, L_kv]
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+        
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
+        
+        # 5. Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L_q, D)
+        
+        # 6. Output projection
+        output = self.out_proj(attn_output)
+        output = self.out_dropout(output)
+        
+        return output
 
 
 # ============================================================================
@@ -108,7 +211,7 @@ class RotaryPositionalEmbedding(nn.Module):
 
 class TransformerEncoderLayer(nn.Module):
     """
-    Single Transformer Encoder Layer with RoPE
+    Single Transformer Encoder Layer with standard attention
     
     Architecture: Self-Attention -> Add & Norm -> FFN -> Add & Norm
     """
@@ -117,13 +220,12 @@ class TransformerEncoderLayer(nn.Module):
         d_model: int,
         n_heads: int,
         d_ff: int,
-        rope_layer: nn.Module,
         dropout: float = 0.1
     ):
         super().__init__()
         
-        # Self-Attention with RoPE
-        self.self_attn = RoPESelfAttention(d_model, n_heads, rope_layer, dropout)
+        # Self-Attention
+        self.self_attn = StandardSelfAttention(d_model, n_heads, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         
@@ -167,14 +269,13 @@ class TransformerProcessor(nn.Module):
     """
     Transformer Encoder for input/output processing.
     
-    Uses standard transformer encoder layers with RoPE positional encoding.
+    Uses standard transformer encoder layers with APE positional encoding.
     
     Args:
         d_model: Model dimension
         n_layers: Number of transformer layers
         n_heads: Number of attention heads
         d_ff: Feed-forward dimension
-        rope_layer: Rotary position embedding module
         dropout: Dropout probability
     """
     def __init__(
@@ -183,7 +284,6 @@ class TransformerProcessor(nn.Module):
         n_layers: int,
         n_heads: int,
         d_ff: int,
-        rope_layer: nn.Module,
         dropout: float = 0.1
     ):
         super().__init__()
@@ -196,7 +296,6 @@ class TransformerProcessor(nn.Module):
                 d_model=d_model,
                 n_heads=n_heads,
                 d_ff=d_ff,
-                rope_layer=rope_layer,
                 dropout=dropout
             )
             for _ in range(n_layers)
@@ -305,181 +404,25 @@ class AdaptiveLayerNorm(nn.Module):
         
         return self.norm(x) * (1 + gamma) + beta
 
-class RoPESelfAttention(nn.Module):
-    """
-    Self-Attention with RoPE applied only to Q and K (NOT to V)
-    Optimized with F.scaled_dot_product_attention
-    """
-    def __init__(self, d_model: int, n_heads: int, rope_layer: nn.Module, dropout: float = 0.1):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.rope = rope_layer
-        
-        # QKV projections
-        self.qkv_proj = nn.Linear(d_model, d_model * 3, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        
-        # Dropout for SDPA
-        self.dropout_p = dropout
-        self.out_dropout = nn.Dropout(dropout)
-        
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None):
-        """
-        Args:
-            x: [B, L, D]
-            key_padding_mask: [B, L] where True means ignore (padding)
-        """
-        B, L, D = x.shape
-        
-        # 1. Project to Q, K, V
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        
-        # 2. Split heads: [B, L, n_heads, head_dim]
-        q = q.view(B, L, self.n_heads, self.head_dim)
-        k = k.view(B, L, self.n_heads, self.head_dim)
-        v = v.view(B, L, self.n_heads, self.head_dim)
-        
-        # 3. Apply RoPE to Q and K ONLY
-        q = self.rope(q, seq_dim=1)
-        k = self.rope(k, seq_dim=1)
-        
-        # 4. Transpose for attention: [B, n_heads, L, head_dim]
-        # F.scaled_dot_product_attention expects [B, H, L, D]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        
-        # 5. Scaled Dot Product Attention (Flash Attention applied automatically if available)
-        attn_mask = None
-        if key_padding_mask is not None:
-            # key_padding_mask: [B, L] -> [B, 1, 1, L] for broadcasting
-            # SDPA supports boolean mask where True = masked out (ignore)
-            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=False
-        )
-        
-        # 6. Concatenate heads: [B, L, D]
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, D)
-        
-        # 7. Output projection
-        output = self.out_proj(attn_output)
-        output = self.out_dropout(output)
-        
-        return output
-
-
-class RoPECrossAttention(nn.Module):
-    """
-    Cross-Attention with RoPE applied only to Q and K
-    Optimized with F.scaled_dot_product_attention
-    """
-    def __init__(self, d_model: int, n_heads: int, rope_layer: nn.Module, dropout: float = 0.1):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.rope = rope_layer
-        
-        # Separate Q, K, V projections
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        
-        # Dropout for SDPA
-        self.dropout_p = dropout
-        self.out_dropout = nn.Dropout(dropout)
-        
-    def forward(
-        self, 
-        query: torch.Tensor, 
-        key: torch.Tensor, 
-        value: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None
-    ):
-        """
-        Args:
-            query: [B, L_q, D]
-            key: [B, L_kv, D]
-            value: [B, L_kv, D]
-            key_padding_mask: [B, L_kv]
-        """
-        B, L_q, D = query.shape
-        L_kv = key.shape[1]
-        
-        # 1. Project Q, K, V
-        q = self.q_proj(query)
-        k = self.k_proj(key)
-        v = self.v_proj(value)
-        
-        # 2. Split heads
-        q = q.view(B, L_q, self.n_heads, self.head_dim)
-        k = k.view(B, L_kv, self.n_heads, self.head_dim)
-        v = v.view(B, L_kv, self.n_heads, self.head_dim)
-        
-        # 3. Apply RoPE to Q and K only
-        q = self.rope(q, seq_dim=1)
-        k = self.rope(k, seq_dim=1)
-        
-        # 4. Transpose for attention: [B, n_heads, L, head_dim]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        
-        # 5. Scaled Dot Product Attention
-        attn_mask = None
-        if key_padding_mask is not None:
-            # key_padding_mask: [B, L_kv] -> [B, 1, 1, L_kv]
-            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-        
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=False
-        )
-        
-        # 6. Concatenate heads
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L_q, D)
-        
-        # 7. Output projection
-        output = self.out_proj(attn_output)
-        output = self.out_dropout(output)
-        
-        return output
-
 
 class DirectionalRecursiveBlock(nn.Module):
-    """Self-Attention + Optional Cross-Attention Block with AdaLN and RoPE"""
+    """Self-Attention + Optional Cross-Attention Block with AdaLN"""
     def __init__(
         self, 
         d_model: int, 
         n_heads: int, 
         d_ff: int, 
-        rope_layer: nn.Module,
         dropout: float = 0.1
     ):
         super().__init__()
         
-        # Self-Attention with RoPE and AdaLN
-        self.self_attn = RoPESelfAttention(d_model, n_heads, rope_layer, dropout)
+        # Self-Attention with AdaLN
+        self.self_attn = StandardSelfAttention(d_model, n_heads, dropout)
         self.norm1 = AdaptiveLayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         
-        # Cross-Attention with RoPE and AdaLN
-        self.cross_attn = RoPECrossAttention(d_model, n_heads, rope_layer, dropout)
+        # Cross-Attention with AdaLN
+        self.cross_attn = StandardCrossAttention(d_model, n_heads, dropout)
         self.norm2 = AdaptiveLayerNorm(d_model)
         self.dropout2 = nn.Dropout(dropout)
         
@@ -508,8 +451,6 @@ class DirectionalRecursiveBlock(nn.Module):
         # Self-Attention with AdaLN
         res = x
         x_norm = self.norm1(x, noise_emb)
-        
-        # RoPE is applied inside self_attn to Q and K only
         attn_out = self.self_attn(x_norm, key_padding_mask=src_key_padding_mask)
         x = res + self.dropout1(attn_out)
         
@@ -517,8 +458,6 @@ class DirectionalRecursiveBlock(nn.Module):
         if context is not None:
             res = x
             x_norm = self.norm2(x, noise_emb)
-            
-            # RoPE is applied inside cross_attn to Q and K only
             attn_out = self.cross_attn(
                 query=x_norm,
                 key=context,
@@ -645,13 +584,13 @@ class GateMLP(nn.Module):
 
 
 # ============================================================================
-# Main RDT Model (Refactored with RoPE & Transformer I/O)
+# Main RDT Model (Refactored with APE & Transformer I/O)
 # ============================================================================
 
 class RDT(nn.Module):
     """
     Recursive Denoising Transformer with:
-    - RoPE for positional encoding
+    - APE (Absolute Positional Encoding) added once at input
     - Transformer Encoder for input/output processing
     - AdaLN-based recursive blocks
     """
@@ -672,8 +611,6 @@ class RDT(nn.Module):
         gate_num_layers: int = 3,
         gate_num_heads: int = 8,
         gate_dropout: float = 0.3,
-        # RoPE Configuration
-        rope_base: float = 10000.0,
         # Training
         total_steps: int = 20,
         gradient_checkpointing: bool = False
@@ -686,13 +623,10 @@ class RDT(nn.Module):
         # Token Embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         
-        # Rotary Position Embedding (RoPE)
-        # Each attention head gets its own rotary embedding
-        head_dim = d_model // n_heads
-        self.rope = RotaryPositionalEmbedding(
-            dim=head_dim,  # Use head dimension, not model dimension!
-            max_seq_len=max_seq_len,
-            base=rope_base
+        # Absolute Positional Embedding (APE)
+        self.pos_embedding = AbsolutePositionalEmbedding(
+            d_model=d_model,
+            max_seq_len=max_seq_len
         )
         
         # Input Processor (Transformer Encoder)
@@ -701,7 +635,6 @@ class RDT(nn.Module):
             n_layers=input_processor_layers,
             n_heads=n_heads,
             d_ff=d_ff,
-            rope_layer=self.rope,
             dropout=dropout
         )
         
@@ -711,9 +644,9 @@ class RDT(nn.Module):
         # Noise Level Embedding
         self.noise_emb = TimestepEmbedder(d_model, frequency_embedding_size=d_model, scale_factor=total_steps)
         
-        # Recursive Encoder (AdaLN Blocks with RoPE)
+        # Recursive Encoder (AdaLN Blocks)
         self.encoder_layers = nn.ModuleList([
-            DirectionalRecursiveBlock(d_model, n_heads, d_ff, self.rope, dropout)
+            DirectionalRecursiveBlock(d_model, n_heads, d_ff, dropout)
             for _ in range(n_encoder_layers)
         ])
         
@@ -723,7 +656,6 @@ class RDT(nn.Module):
             n_layers=output_processor_layers,
             n_heads=n_heads,
             d_ff=d_ff,
-            rope_layer=self.rope,
             dropout=dropout
         )
         
@@ -762,7 +694,7 @@ class RDT(nn.Module):
         sampling_prob=0.0
     ):
         """
-        Forward pass with RoPE applied consistently throughout recursion.
+        Forward pass with APE added once at input.
         
         Args:
             x: [B, L] (tokens) or [B, L, D] (hidden)
@@ -786,7 +718,10 @@ class RDT(nn.Module):
             # Token embedding
             x = self.token_embedding(x) * math.sqrt(self.d_model)
             
-            # Input processing (Transformer Encoder with RoPE)
+            # Add positional encoding (APE - only once at input)
+            x = self.pos_embedding(x)
+            
+            # Input processing (Transformer Encoder)
             key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
             hidden = self.input_processor(x, key_padding_mask=key_padding_mask)
         else:
@@ -808,8 +743,6 @@ class RDT(nn.Module):
         current_noise = predicted_gate.detach()  # Default value
         
         if self.training and gt_timestep is not None:
-            # sampling_prob가 0이어도 수식은 성립함 (use_gt_mask가 모두 False가 됨)
-            # Python 제어문 없이 순수 그래프 연산만 남김 -> XLA 컴파일 1회로 끝
             rand_tensor = torch.rand(1, device=predicted_gate.device)
             use_gt_mask = rand_tensor < sampling_prob
             current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
@@ -867,6 +800,10 @@ class RDT(nn.Module):
             hidden: [B, L, D] initial hidden states (before any recursive steps)
         """
         x = self.token_embedding(tokens) * math.sqrt(self.d_model)
+        
+        # Add positional encoding (APE - only once)
+        x = self.pos_embedding(x)
+        
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         hidden = self.input_processor(x, key_padding_mask=key_padding_mask)
         hidden = self.input_norm(hidden)
@@ -891,27 +828,19 @@ class RDT(nn.Module):
             predicted_gate: None (not used, computed separately after transformation)
             current_pooled: None (not used, computed separately after transformation)
         """
-        # ============================================================
-        # 1. [XLA-Safe] Soft Mixing for Scheduled Sampling
-        # ============================================================
-        # Use last_gate_score (previous step's prediction) as current noise level
-        # Mix with GT for scheduled sampling
-        
+        # Soft Mixing for Scheduled Sampling
         if self.training and gt_timestep is not None:
-            # Soft mixing: weighted combination of GT and predicted
-            # Both GT and predicted are detached to stop gradient flow into noise_emb
             current_noise = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * last_gate_score.detach()
         else:
-            # Inference: always use predicted gate
             current_noise = last_gate_score.detach() if last_gate_score is not None else gt_timestep.detach()
         
-        # 2. Create noise embedding
+        # Create noise embedding
         noise_vec = self.noise_emb(current_noise)
         
-        # 4. Prepare masks
+        # Prepare masks
         src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         
-        # 5. Recursive encoding with AdaLN
+        # Recursive encoding with AdaLN
         for layer in self.encoder_layers:
             if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
@@ -948,7 +877,7 @@ class RDT(nn.Module):
         Returns:
             logits: [B, L, vocab_size]
         """
-        # Output processing (Transformer Encoder with RoPE)
+        # Output processing (Transformer Encoder)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         decoded = self.output_processor(hidden, key_padding_mask=key_padding_mask)
         
@@ -992,88 +921,59 @@ class RDT(nn.Module):
         with torch.no_grad():
             # Process each sample independently
             for sample_idx in range(batch_size):
-                # ================================================================
                 # Extract single sample
-                # ================================================================
                 sample_tokens = x[sample_idx:sample_idx+1]  # [1, L]
                 sample_mask = attention_mask[sample_idx:sample_idx+1] if attention_mask is not None else None  # [1, L]
                 
-                # ================================================================
                 # STEP 0: Initialization (exactly as in training)
-                # ================================================================
-                # h_0 = encode_tokens(x)
                 hidden = self.encode_tokens(sample_tokens, sample_mask)  # [1, L, D]
                 
-                # gate_0, pooled_0 = gate(h_0, mask, None, None)
                 gate_pred, pooled = self.gate(
-                    hidden,           # x: [1, L, D]
-                    sample_mask,      # mask: [1, L]
-                    None,            # prev_pooled: None at step 0
-                    None             # prev_gate: None at step 0
+                    hidden,
+                    sample_mask,
+                    None,
+                    None
                 )  # gate_pred: [1, 1], pooled: [1, D]
                 
-                # ================================================================
                 # Track convergence for this sample
-                # ================================================================
                 converged = False
                 steps_taken = 1  # We count step 0 as 1 step
                 
-                # ================================================================
-                # STEP 1 to max_steps: Recursive steps (exactly as in training)
-                # ================================================================
+                # STEP 1 to max_steps: Recursive steps
                 for step in range(1, max_steps):
-                    # ------------------------------------------------------------
-                    # Check convergence BEFORE transformation
-                    # (In training, we always do max_steps; here we check early stop)
-                    # ------------------------------------------------------------
-                    gate_score = gate_pred.squeeze(-1).item()  # [1, 1] -> scalar
+                    gate_score = gate_pred.squeeze(-1).item()
                     
                     if gate_score < threshold:
                         converged = True
                         break
                     
-                    # ------------------------------------------------------------
-                    # h_i, _, _ = forward_step(h_{i-1}, mask, gate_{i-1}, pooled_{i-1})
-                    # ------------------------------------------------------------
                     hidden, _, _ = self.forward_step(
-                        hidden,                    # h_{i-1}: [1, L, D]
-                        attention_mask=sample_mask,  # mask: [1, L]
-                        last_gate_score=gate_pred,   # gate_{i-1}: [1, 1]
-                        last_pooled=pooled,          # pooled_{i-1}: [1, D]
-                        gt_timestep=None,           # No GT in inference
-                        sampling_prob=0.0           # No sampling in inference
-                    )  # hidden: [1, L, D] (h_i after transformation)
+                        hidden,
+                        attention_mask=sample_mask,
+                        last_gate_score=gate_pred,
+                        last_pooled=pooled,
+                        gt_timestep=None,
+                        sampling_prob=0.0
+                    )
                     
-                    # ------------------------------------------------------------
-                    # gate_i, pooled_i = gate(h_i, mask, pooled_{i-1}, gate_{i-1})
-                    # ------------------------------------------------------------
                     gate_pred, pooled = self.gate(
-                        hidden,        # x: [1, L, D] (transformed h_i)
-                        sample_mask,   # mask: [1, L]
-                        pooled,        # prev_pooled: pooled_{i-1}
-                        gate_pred      # prev_gate: gate_{i-1}
-                    )  # gate_pred: [1, 1] (gate_i), pooled: [1, D] (pooled_i)
+                        hidden,
+                        sample_mask,
+                        pooled,
+                        gate_pred
+                    )
                     
                     steps_taken += 1
                 
-                # ================================================================
-                # FINAL: Decode (exactly as in training, but only last step)
-                # ================================================================
-                # logits = decode(h_final, mask)
+                # FINAL: Decode
                 logits = self.decode(hidden, sample_mask)  # [1, L, vocab_size]
-                
-                # output_tokens = argmax(logits)
                 sample_output = logits.argmax(dim=-1)  # [1, L]
                 
-                # ================================================================
                 # Store results
-                # ================================================================
                 all_output_tokens.append(sample_output)
                 all_steps_taken.append(steps_taken)
         
-        # ================================================================
         # Batch results
-        # ================================================================
         output_tokens = torch.cat(all_output_tokens, dim=0)  # [B, L]
         steps_taken_tensor = torch.tensor(all_steps_taken, device=device)  # [B]
         
