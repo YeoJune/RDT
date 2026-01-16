@@ -631,12 +631,10 @@ class RDTTrainer:
 
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    
-                    if self.scheduler:
-                        self.scheduler.step()
+                        self.optimizer.step()
+                        if self.scheduler:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad()
                 
                 # [Standard Fix] 루프 내 불필요한 연산 및 동기화 제거
                 # epoch_loss += loss.item()  <-- 삭제 (매 스텝 Sync 유발)
@@ -839,12 +837,10 @@ class RDTTrainer:
                     
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    
-                    if self.scheduler:
-                        self.scheduler.step()
+                        self.optimizer.step()
+                        if self.scheduler:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad()
                 
                 step += 1
                 self.global_step = step

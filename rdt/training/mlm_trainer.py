@@ -227,13 +227,6 @@ class MLMTrainer:
         }
         
         return loss, metrics
-        
-        return {
-            'loss': original_loss,
-            'accuracy': accuracy.item(),
-            'mask_ratio': mask_ratio,
-            'lr': self.scheduler.get_last_lr()[0]
-        }
     
     def _train_step_mdlm(self, batch):
         """MDLM training with continuous-time masking and weighted loss"""
@@ -658,10 +651,10 @@ class MLMTrainer:
                     # Gradient Clipping (only when syncing)
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    self.scheduler.step()
+                        self.optimizer.step()
+                        if self.scheduler:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad()
                 
                 self.global_step += 1
                 
@@ -752,10 +745,10 @@ class MLMTrainer:
                     # Gradient Clipping (only when syncing)
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    self.scheduler.step()
+                        self.optimizer.step()
+                        if self.scheduler:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad()
                 
                 self.global_step += 1
                 if self.use_tqdm:
