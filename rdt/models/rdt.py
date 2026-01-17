@@ -296,18 +296,14 @@ class AdaptiveLayerNorm(nn.Module):
         nn.init.constant_(self.proj.bias, 0)
 
     def forward(self, x, emb):
-        # TEMP: Disable adaLN - use standard LayerNorm only
-        return self.norm(x)
+        if emb.dim() == 3:
+            emb = emb.squeeze(1)
+            
+        gamma, beta = self.proj(emb).chunk(2, dim=1)
+        gamma = gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
         
-        # Original adaLN code (disabled):
-        # if emb.dim() == 3:
-        #     emb = emb.squeeze(1)
-        #     
-        # gamma, beta = self.proj(emb).chunk(2, dim=1)
-        # gamma = gamma.unsqueeze(1)
-        # beta = beta.unsqueeze(1)
-        # 
-        # return self.norm(x) * (1 + gamma) + beta
+        return self.norm(x) * (1 + gamma) + beta
 
 class RoPESelfAttention(nn.Module):
     """
