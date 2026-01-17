@@ -7,7 +7,7 @@ model_type: "rdt" # 'rdt' or 'mlm'
 model:
   d_model: 512 # Hidden dimension (auto-set from BERT if use_bert_init=true)
   n_heads: 8 # Attention heads (d_model / 64)
-  n_encoder_layers: 6 # Main encoder depth (recursive)
+  n_encoder_layers: 4 # Main encoder depth (recursive)
   d_ff: 2048 # FFN dimension (4x d_model)
   dropout: 0.1
 
@@ -29,7 +29,7 @@ model:
   gradient_checkpointing: false # Enable gradient checkpointing to save memory
 
   # BERT Weight Initialization
-  use_bert_init: true # Initialize from pretrained BERT
+  use_bert_init: false # Initialize from pretrained BERT
   bert_model_name: "prajjwal1/bert-medium" # 8 layers, 512-dim (perfect for n_encoder_layers=6)
   # Options:
   #   - "prajjwal1/bert-medium": 8 layers, 512-dim → n_encoder_layers=6
@@ -59,13 +59,13 @@ training:
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
   loss_weight_gate: 1.0 # Gate prediction loss weight
-  loss_weight_aux: 0.00001
-  aux_ratio: 0.125 # Auxiliary loss micro-batch ratio (0.0-1.0)
+  loss_weight_aux: 0.0
+  aux_ratio: 0.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
   aux_temp: 0.5
 
   # Optimization
-  batch_size: 64
-  gradient_accumulation_steps: 4 # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 16
+  gradient_accumulation_steps: 1 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 15 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
