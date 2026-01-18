@@ -165,6 +165,11 @@ class RDTPreprocessor:
             
             curr_visible_counts = (curr_visible_ratios * actual_lengths).long()
             target_visible_counts = (target_visible_ratios * actual_lengths).long()
+
+            target_visible_counts = torch.maximum(
+                curr_visible_counts + 1,
+                target_visible_counts
+            )
             
             lower_bound = curr_visible_counts.unsqueeze(1)
             upper_bound = target_visible_counts.unsqueeze(1)
