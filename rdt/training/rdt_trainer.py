@@ -252,40 +252,64 @@ class RDTTrainer:
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
         
         # ============================================================================
-        # STEP 0: Initial Forward (tokens → h_1)
+        # STEP 0: Manual First Forward (tokens → h_0 → h_1)
         # ============================================================================
-        # forward with is_first_step=True:
-        # - Internally: h_0 = encode(tokens), gate_0 = gate(h_0), h_1 = forward_step(h_0, gate_0)
-        # - Returns: (h_1, gate_1, pooled_1)
+        # Instead of calling forward(is_first_step=True), manually call encode and forward_step
+        # This allows us to compute gate loss for both gate_0 and gate_1
         
-        gt_timestep_0 = gate_targets[:, 0].unsqueeze(1)
+        # 1. Encode: tokens → h_0
+        h_0 = raw_model.encode(input_tokens, attention_mask)
+        
+        # 2. Gate prediction for h_0: gate_0, pooled_0
+        gate_0, pooled_0 = raw_model.gate(
+            h_0,
+            attention_mask,
+            prev_pooled=None,
+            prev_gate=None
+        )
+        
+        # 3. Gate loss for gate_0 (predicting step 0's noise level)
+        gate_target_0 = gate_targets[:, 0].unsqueeze(1)
+        gate_loss_0 = torch.nn.functional.mse_loss(gate_0, gate_target_0)
+        accumulated_loss = self.loss_weight_gate * gate_loss_0
+        
+        # 4. Scheduled sampling for noise level
+        gt_timestep_0 = gate_target_0
         gt_noise_0 = torch.randn_like(gt_timestep_0) * 0.2
         gt_timestep_0 = gt_timestep_0 + gt_noise_0
         
-        hidden, gate_pred, pooled = raw_model.forward(
-            x=input_tokens,
-            attention_mask=attention_mask,
-            is_first_step=True,
-            last_gate_score=None,
-            last_pooled=None,
-            gt_timestep=gt_timestep_0,
-            sampling_prob=sampling_prob
-        )
-        # Now: hidden = h_1, gate_pred = gate_1, pooled = pooled_1
+        if self.training:
+            noise_0 = sampling_prob * gt_timestep_0.detach() + (1.0 - sampling_prob) * gate_0.detach()
+        else:
+            noise_0 = gate_0.detach()
         
-        # Gate loss for gate_1 (predicting step 1's noise level)
+        # 5. Transform: h_0 → h_1
+        h_1 = raw_model.forward_step(h_0, noise_0, attention_mask)
+        
+        # 6. Gate prediction for h_1: gate_1, pooled_1
+        gate_1, pooled_1 = raw_model.gate(
+            h_1,
+            attention_mask,
+            prev_pooled=pooled_0,
+            prev_gate=gate_0
+        )
+        
+        # 7. Gate loss for gate_1 (predicting step 1's noise level)
         gate_target_1 = gate_targets[:, 1].unsqueeze(1)
-        gate_loss_1 = torch.nn.functional.mse_loss(gate_pred, gate_target_1)
-        accumulated_loss = self.loss_weight_gate * gate_loss_1
+        gate_loss_1 = torch.nn.functional.mse_loss(gate_1, gate_target_1)
+        accumulated_loss += self.loss_weight_gate * gate_loss_1
+        
+        # Update state for next steps
+        hidden, gate_pred, pooled = h_1, gate_1, pooled_1
         
         # Logging tensors
         total_recon_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
-        total_gate_loss_tensor = gate_loss_1.detach()
+        total_gate_loss_tensor = gate_loss_0.detach() + gate_loss_1.detach()
         total_aux_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
         total_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
         total_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
         
-        num_valid_steps = torch.tensor(1.0, device=self.accelerator.device)
+        num_valid_steps = torch.tensor(2.0, device=self.accelerator.device)  # gate_0 and gate_1
         num_aux_steps = torch.tensor(0.0, device=self.accelerator.device)
         
         # ============================================================================
@@ -464,24 +488,47 @@ class RDTTrainer:
                 num_valid = 0
                 
                 # ================================================================
-                # STEP 0: Initial Forward (tokens → h_1)
+                # STEP 0: Manual First Forward (tokens → h_0 → h_1)
                 # ================================================================
-                hidden, gate_pred, pooled = raw_model.forward(
-                    x=input_tokens,
-                    attention_mask=attention_mask,
-                    is_first_step=True,
-                    last_gate_score=None,
-                    last_pooled=None,
-                    gt_timestep=None,
-                    sampling_prob=0.0
-                )
-                # Now: hidden = h_1, gate_pred = gate_1, pooled = pooled_1
+                # Instead of calling forward(is_first_step=True), manually call encode and forward_step
+                # This allows us to compute gate loss for both gate_0 and gate_1
                 
-                # Gate loss for gate_1
+                # 1. Encode: tokens → h_0
+                h_0 = raw_model.encode(input_tokens, attention_mask)
+                
+                # 2. Gate prediction for h_0: gate_0, pooled_0
+                gate_0, pooled_0 = raw_model.gate(
+                    h_0,
+                    attention_mask,
+                    prev_pooled=None,
+                    prev_gate=None
+                )
+                
+                # 3. Gate loss for gate_0
+                gate_target_0 = gate_targets[:, 0].unsqueeze(1)
+                gate_loss_0 = self.gate_criterion(gate_0, gate_target_0)
+                batch_gate_tensor += gate_loss_0
+                num_valid += 1
+                
+                # 4. Transform: h_0 → h_1
+                h_1 = raw_model.forward_step(h_0, gate_0.detach(), attention_mask)
+                
+                # 5. Gate prediction for h_1: gate_1, pooled_1
+                gate_1, pooled_1 = raw_model.gate(
+                    h_1,
+                    attention_mask,
+                    prev_pooled=pooled_0,
+                    prev_gate=gate_0
+                )
+                
+                # 6. Gate loss for gate_1
                 gate_target_1 = gate_targets[:, 1].unsqueeze(1)
-                gate_loss_1 = self.gate_criterion(gate_pred, gate_target_1)
+                gate_loss_1 = self.gate_criterion(gate_1, gate_target_1)
                 batch_gate_tensor += gate_loss_1
                 num_valid += 1
+                
+                # Update state for next steps
+                hidden, gate_pred, pooled = h_1, gate_1, pooled_1
                 
                 # ================================================================
                 # STEP 1 to actual_max_length: Recursive Steps
