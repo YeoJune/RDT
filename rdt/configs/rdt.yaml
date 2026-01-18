@@ -39,7 +39,7 @@ model:
 # Training Strategy
 training:
   # Chain & Masking
-  min_chain_length: 2 # Minimum length of training segment
+  min_chain_length: 1 # Minimum length of training segment
   max_chain_length: 2 # L: Maximum length of training segment
   total_steps: 10 # N: total denoising steps (100% → 0%)
   masking_strategy: "shuffle" # 'shuffle' (index-based)
