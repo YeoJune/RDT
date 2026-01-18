@@ -705,9 +705,6 @@ class RDT(nn.Module):
             dropout=dropout
         )
         
-        # Input Normalization
-        self.input_norm = nn.LayerNorm(d_model)
-        
         # Noise Level Embedding
         self.noise_emb = TimestepEmbedder(d_model, frequency_embedding_size=d_model, scale_factor=total_steps)
         
@@ -748,114 +745,16 @@ class RDT(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-
-    def forward(
-        self, 
-        x, 
-        context=None, 
-        attention_mask=None, 
-        context_mask=None,
-        last_gate_score=None, 
-        last_pooled=None, 
-        is_first_step=True, 
-        gt_timestep=None, 
-        sampling_prob=0.0
-    ):
-        """
-        Forward pass with RoPE applied consistently throughout recursion.
-        
-        Args:
-            x: [B, L] (tokens) or [B, L, D] (hidden)
-            context: Optional context for cross-attention
-            attention_mask: [B, L] (1=valid, 0=padding)
-            context_mask: [B, L_ctx] (1=valid, 0=padding)
-            last_gate_score: Previous gate prediction
-            last_pooled: Previous pooled features
-            is_first_step: Whether this is the first forward pass
-            gt_timestep: Ground truth timestep for scheduled sampling
-            sampling_prob: Probability of using GT vs predicted gate
-        
-        Returns:
-            hidden: [B, L, D] - output hidden states
-            next_gate_pred: [B, 1] - next gate prediction
-            next_pooled: [B, D] - next pooled features
-        """
-        
-        # 1. Initialization & Projection
-        if is_first_step:
-            # Token embedding
-            x = self.token_embedding(x) * math.sqrt(self.d_model)
-            
-            # Input processing (Transformer Encoder with RoPE)
-            key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-            hidden = self.input_processor(x, key_padding_mask=key_padding_mask)
-        else:
-            # Already processed hidden states
-            hidden = x
-        
-        # Recursive Norm (Reset Distribution)
-        hidden = self.input_norm(hidden)
-
-        # 2. Gate Diagnosis
-        predicted_gate, current_pooled = self.gate(
-            hidden, 
-            attention_mask, 
-            prev_pooled=last_pooled, 
-            prev_gate=last_gate_score
-        )
-        
-        # 3. Scheduled Sampling (TPU-Optimized: No .item() call, No Python control flow)
-        current_noise = predicted_gate.detach()  # Default value
-        
-        if self.training and gt_timestep is not None:
-            # sampling_prob가 0이어도 수식은 성립함 (use_gt_mask가 모두 False가 됨)
-            # Python 제어문 없이 순수 그래프 연산만 남김 -> XLA 컴파일 1회로 끝
-            rand_tensor = torch.rand(1, device=predicted_gate.device)
-            use_gt_mask = rand_tensor < sampling_prob
-            current_noise = torch.where(use_gt_mask, gt_timestep, current_noise)
-
-        # 4. Create Noise Embedding
-        noise_vec = self.noise_emb(current_noise)
-
-        # 5. Prepare Masks
-        src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        context_key_padding_mask = (context_mask == 0) if context_mask is not None else None
-
-        # 6. Recursive Encoding with AdaLN
-        for layer in self.encoder_layers:
-            if self.gradient_checkpointing and self.training:
-                def create_custom_forward(module):
-                    def custom_forward(h, n_emb, c, sm, cm):
-                        return module(h, noise_emb=n_emb, context=c, 
-                                    src_key_padding_mask=sm, 
-                                    context_key_padding_mask=cm)
-                    return custom_forward
-                
-                hidden = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer),
-                    hidden, noise_vec, context, src_key_padding_mask, context_key_padding_mask,
-                    use_reentrant=False
-                )
-            else:
-                hidden = layer(
-                    hidden,
-                    noise_emb=noise_vec,
-                    context=context,
-                    src_key_padding_mask=src_key_padding_mask,
-                    context_key_padding_mask=context_key_padding_mask
-                )
-
-        # 7. Next Gate Prediction
-        next_gate_pred, next_pooled = self.gate(
-            hidden, 
-            attention_mask, 
-            prev_pooled=current_pooled, 
-            prev_gate=predicted_gate
-        )
-        
-        return hidden, next_gate_pred, next_pooled
     
-    def encode_tokens(self, tokens, attention_mask=None):
+    def tie_weights(self):
+        """Tie output projection weights with token embedding"""
+        self.output_projection.weight = self.token_embedding.weight
+    
+    def count_parameters(self):
+        """Count total trainable parameters"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+    def encode(self, tokens, attention_mask=None):
         """
         Initial encoding: tokens → h_0
         
@@ -864,54 +763,39 @@ class RDT(nn.Module):
             attention_mask: [B, L] attention mask (1=valid, 0=padding)
         
         Returns:
-            hidden: [B, L, D] initial hidden states (before any recursive steps)
+            h_0: [B, L, D] initial hidden states
         """
+        # 1. Token embedding
         x = self.token_embedding(tokens) * math.sqrt(self.d_model)
+        
+        # 2. Input processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        hidden = self.input_processor(x, key_padding_mask=key_padding_mask)
-        hidden = self.input_norm(hidden)
-        return hidden
-    
-    def forward_step(self, hidden, attention_mask=None,
-                     last_gate_score=None, last_pooled=None,
-                     gt_timestep=None, sampling_prob=0.0):
+        h_0 = self.input_processor(x, key_padding_mask=key_padding_mask)
+        
+        return h_0
+
+
+    def forward_step(self, hidden, noise_level, attention_mask=None):
         """
         Single recursive step: h_i → h_{i+1}
+        Does NOT call gate network.
         
         Args:
-            hidden: [B, L, D] current hidden states
+            hidden: [B, L, D] current hidden states h_i
+            noise_level: [B, 1] noise level for this step
             attention_mask: [B, L] attention mask (1=valid, 0=padding)
-            last_gate_score: [B, 1] previous gate prediction
-            last_pooled: [B, D] previous pooled features
-            gt_timestep: [B, 1] ground truth timestep for scheduled sampling
-            sampling_prob: scalar tensor (0~1) for soft mixing
         
         Returns:
-            hidden: [B, L, D] next hidden states (after recursive blocks)
-            predicted_gate: None (not used, computed separately after transformation)
-            current_pooled: None (not used, computed separately after transformation)
+            h_{i+1}: [B, L, D] next hidden states
         """
-        # ============================================================
-        # 1. [XLA-Safe] Soft Mixing for Scheduled Sampling
-        # ============================================================
-        # Use last_gate_score (previous step's prediction) as current noise level
-        # Mix with GT for scheduled sampling
+        # 1. Create noise embedding
+        noise_vec = self.noise_emb(noise_level)
         
-        if self.training and gt_timestep is not None:
-            # Soft mixing: weighted combination of GT and predicted
-            # Both GT and predicted are detached to stop gradient flow into noise_emb
-            current_noise = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * last_gate_score.detach()
-        else:
-            # Inference: always use predicted gate
-            current_noise = last_gate_score.detach() if last_gate_score is not None else gt_timestep.detach()
-        
-        # 2. Create noise embedding
-        noise_vec = self.noise_emb(current_noise)
-        
-        # 4. Prepare masks
+        # 2. Prepare mask
         src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         
-        # 5. Recursive encoding with AdaLN
+        # 3. Apply recursive encoder layers with AdaLN
+        h_next = hidden
         for layer in self.encoder_layers:
             if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
@@ -921,69 +805,162 @@ class RDT(nn.Module):
                                     context_key_padding_mask=None)
                     return custom_forward
                 
-                hidden = torch.utils.checkpoint.checkpoint(
+                h_next = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer),
-                    hidden, noise_vec, src_key_padding_mask,
+                    h_next, noise_vec, src_key_padding_mask,
                     use_reentrant=False
                 )
             else:
-                hidden = layer(
-                    hidden,
+                h_next = layer(
+                    h_next,
                     noise_emb=noise_vec,
                     context=None,
                     src_key_padding_mask=src_key_padding_mask,
                     context_key_padding_mask=None
                 )
         
-        return hidden, None, None
-    
+        return h_next
+
+
     def decode(self, hidden, attention_mask=None):
         """
-        Output Decoder: hidden -> logits
+        Output decoder: h_n → logits
         
         Args:
-            hidden: [B, L, D]
-            attention_mask: [B, L] (1=valid, 0=padding)
+            hidden: [B, L, D] final hidden states h_n
+            attention_mask: [B, L] attention mask (1=valid, 0=padding)
         
         Returns:
             logits: [B, L, vocab_size]
         """
-        # Output processing (Transformer Encoder with RoPE)
+        # 1. Output processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        decoded = self.output_processor(hidden, key_padding_mask=key_padding_mask)
+        processed = self.output_processor(hidden, key_padding_mask=key_padding_mask)
         
-        # Project to vocabulary
-        logits = self.output_projection(decoded)
+        # 2. Project to vocabulary
+        logits = self.output_projection(processed)
         
         return logits
 
-    def inference(self, x, context=None, attention_mask=None, context_mask=None,
-                max_steps=20, threshold=0.02, return_steps=False):
+
+    def forward(
+        self,
+        x,
+        attention_mask=None,
+        is_first_step=True,
+        last_gate_score=None,
+        last_pooled=None,
+        gt_timestep=None,
+        sampling_prob=0.0
+    ):
         """
-        Inference with per-sample processing - ZERO ambiguity version.
-        Each sample is processed independently in a loop, then batched for output.
+        Forward pass with gate network integration.
         
-        This ensures EXACT correspondence with training logic:
-        - Step 0: encode_tokens + initial gate
-        - Step 1~N: forward_step + gate + convergence check
-        - Final: decode
+        If is_first_step=True:
+            x [B, L] tokens → h_0 → gate_0 → h_1 → gate_1
+            Returns: (h_1, gate_1, pooled_1)
+        
+        If is_first_step=False:
+            x [B, L, D] hidden (h_i) → h_{i+1} → gate_{i+1}
+            Returns: (h_{i+1}, gate_{i+1}, pooled_{i+1})
         
         Args:
-            x: [B, L] - input tokens
-            context: Optional context for cross-attention (not used currently)
-            attention_mask: [B, L] - attention mask (1=valid, 0=padding)
-            context_mask: [B, L_ctx] - context mask (not used currently)
-            max_steps: Maximum recursive steps
-            threshold: Stop when gate score < threshold (per sample)
-            return_steps: If True, return per-sample step counts
+            x: [B, L] (tokens) if is_first_step else [B, L, D] (hidden)
+            attention_mask: [B, L] attention mask (1=valid, 0=padding)
+            is_first_step: whether this is the first forward pass
+            last_gate_score: [B, 1] previous gate prediction (required if not first step)
+            last_pooled: [B, D] previous pooled features (required if not first step)
+            gt_timestep: [B, 1] ground truth timestep for scheduled sampling
+            sampling_prob: float or tensor, probability of using GT vs predicted gate
         
         Returns:
-            output_tokens: [B, L] - predicted tokens
-            steps_taken: [B] or float - number of steps taken
+            hidden: [B, L, D] output hidden states (h_1 or h_{i+1})
+            gate_pred: [B, 1] gate prediction for next step
+            pooled: [B, D] pooled features for next step
+        """
+        
+        if is_first_step:
+            # ============================================================
+            # FIRST STEP: tokens → h_0 → gate_0 → h_1 → gate_1
+            # ============================================================
+            
+            # 1. Encode: tokens → h_0
+            h_0 = self.encode(x, attention_mask)
+            
+            # 2. Initial gate prediction: gate(h_0, None, None)
+            gate_0, pooled_0 = self.gate(
+                h_0,
+                attention_mask,
+                prev_pooled=None,
+                prev_gate=None
+            )
+            
+            # 3. Scheduled sampling for noise level
+            if self.training and gt_timestep is not None:
+                # XLA-safe soft mixing
+                noise_0 = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * gate_0.detach()
+            else:
+                noise_0 = gate_0.detach()
+            
+            # 4. Transform: h_0 → h_1
+            h_1 = self.forward_step(h_0, noise_0, attention_mask)
+            
+            # 5. Next gate prediction: gate(h_1, pooled_0, gate_0)
+            gate_1, pooled_1 = self.gate(
+                h_1,
+                attention_mask,
+                prev_pooled=pooled_0,
+                prev_gate=gate_0
+            )
+            
+            return h_1, gate_1, pooled_1
+        
+        else:
+            # ============================================================
+            # SUBSEQUENT STEPS: h_i → h_{i+1} → gate_{i+1}
+            # ============================================================
+            
+            h_i = x  # x is already hidden states
+            
+            # 1. Scheduled sampling for noise level
+            if self.training and gt_timestep is not None:
+                # XLA-safe soft mixing
+                noise_i = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * last_gate_score.detach()
+            else:
+                noise_i = last_gate_score.detach()
+            
+            # 2. Transform: h_i → h_{i+1}
+            h_next = self.forward_step(h_i, noise_i, attention_mask)
+            
+            # 3. Next gate prediction: gate(h_{i+1}, last_pooled, last_gate_score)
+            gate_next, pooled_next = self.gate(
+                h_next,
+                attention_mask,
+                prev_pooled=last_pooled,
+                prev_gate=last_gate_score
+            )
+            
+            return h_next, gate_next, pooled_next
+        
+    def inference(self, tokens, attention_mask=None, max_steps=20, threshold=0.02, return_steps=False):
+        """
+        Clean inference using the standardized methods.
+        Each sample is processed independently for exact step-by-step control.
+        
+        Args:
+            tokens: [B, L] input tokens
+            attention_mask: [B, L] attention mask (1=valid, 0=padding)
+            max_steps: maximum recursive steps
+            threshold: stop when gate score < threshold (per sample)
+            return_steps: if True, return per-sample step counts
+        
+        Returns:
+            output_tokens: [B, L] predicted tokens
+            steps_taken: [B] (if return_steps=True) or float (mean steps)
         """
         self.eval()
-        batch_size = x.size(0)
-        device = x.device
+        batch_size = tokens.size(0)
+        device = tokens.device
         
         # Storage for results
         all_output_tokens = []
@@ -995,72 +972,75 @@ class RDT(nn.Module):
                 # ================================================================
                 # Extract single sample
                 # ================================================================
-                sample_tokens = x[sample_idx:sample_idx+1]  # [1, L]
-                sample_mask = attention_mask[sample_idx:sample_idx+1] if attention_mask is not None else None  # [1, L]
+                sample_tokens = tokens[sample_idx:sample_idx+1]  # [1, L]
+                sample_mask = attention_mask[sample_idx:sample_idx+1] if attention_mask is not None else None
                 
                 # ================================================================
-                # STEP 0: Initialization (exactly as in training)
+                # STEP 0: Initial encoding
                 # ================================================================
-                # h_0 = encode_tokens(x)
-                hidden = self.encode_tokens(sample_tokens, sample_mask)  # [1, L, D]
+                # h_0 = encode(tokens)
+                h_0 = self.encode(sample_tokens, sample_mask)
                 
-                # gate_0, pooled_0 = gate(h_0, mask, None, None)
-                gate_pred, pooled = self.gate(
-                    hidden,           # x: [1, L, D]
-                    sample_mask,      # mask: [1, L]
-                    None,            # prev_pooled: None at step 0
-                    None             # prev_gate: None at step 0
-                )  # gate_pred: [1, 1], pooled: [1, D]
-                
-                # ================================================================
-                # Track convergence for this sample
-                # ================================================================
-                converged = False
-                steps_taken = 1  # We count step 0 as 1 step
+                # gate_0, pooled_0 = gate(h_0, None, None)
+                gate_0, pooled_0 = self.gate(
+                    h_0,
+                    sample_mask,
+                    prev_pooled=None,
+                    prev_gate=None
+                )
                 
                 # ================================================================
-                # STEP 1 to max_steps: Recursive steps (exactly as in training)
+                # STEP 1: First transformation
                 # ================================================================
-                for step in range(1, max_steps):
-                    # ------------------------------------------------------------
-                    # Check convergence BEFORE transformation
-                    # (In training, we always do max_steps; here we check early stop)
-                    # ------------------------------------------------------------
-                    gate_score = gate_pred.squeeze(-1).item()  # [1, 1] -> scalar
+                # h_1 = forward_step(h_0, noise=gate_0)
+                h_1 = self.forward_step(h_0, gate_0.detach(), sample_mask)
+                
+                # gate_1, pooled_1 = gate(h_1, pooled_0, gate_0)
+                gate_1, pooled_1 = self.gate(
+                    h_1,
+                    sample_mask,
+                    prev_pooled=pooled_0,
+                    prev_gate=gate_0
+                )
+                
+                # Current state
+                h_current = h_1
+                gate_current = gate_1
+                pooled_current = pooled_1
+                steps_taken = 1
+                
+                # ================================================================
+                # STEP 2 to max_steps: Recursive steps
+                # ================================================================
+                for step in range(2, max_steps + 1):
+                    # Check convergence BEFORE next transformation
+                    gate_score = gate_current.squeeze(-1).item()
                     
                     if gate_score < threshold:
-                        converged = True
                         break
                     
-                    # ------------------------------------------------------------
-                    # h_i, _, _ = forward_step(h_{i-1}, mask, gate_{i-1}, pooled_{i-1})
-                    # ------------------------------------------------------------
-                    hidden, _, _ = self.forward_step(
-                        hidden,                    # h_{i-1}: [1, L, D]
-                        attention_mask=sample_mask,  # mask: [1, L]
-                        last_gate_score=gate_pred,   # gate_{i-1}: [1, 1]
-                        last_pooled=pooled,          # pooled_{i-1}: [1, D]
-                        gt_timestep=None,           # No GT in inference
-                        sampling_prob=0.0           # No sampling in inference
-                    )  # hidden: [1, L, D] (h_i after transformation)
+                    # h_{i+1} = forward_step(h_i, noise=gate_i)
+                    h_next = self.forward_step(h_current, gate_current.detach(), sample_mask)
                     
-                    # ------------------------------------------------------------
-                    # gate_i, pooled_i = gate(h_i, mask, pooled_{i-1}, gate_{i-1})
-                    # ------------------------------------------------------------
-                    gate_pred, pooled = self.gate(
-                        hidden,        # x: [1, L, D] (transformed h_i)
-                        sample_mask,   # mask: [1, L]
-                        pooled,        # prev_pooled: pooled_{i-1}
-                        gate_pred      # prev_gate: gate_{i-1}
-                    )  # gate_pred: [1, 1] (gate_i), pooled: [1, D] (pooled_i)
+                    # gate_{i+1}, pooled_{i+1} = gate(h_{i+1}, pooled_i, gate_i)
+                    gate_next, pooled_next = self.gate(
+                        h_next,
+                        sample_mask,
+                        prev_pooled=pooled_current,
+                        prev_gate=gate_current
+                    )
                     
-                    steps_taken += 1
+                    # Update state
+                    h_current = h_next
+                    gate_current = gate_next
+                    pooled_current = pooled_next
+                    steps_taken = step
                 
                 # ================================================================
-                # FINAL: Decode (exactly as in training, but only last step)
+                # FINAL: Decode
                 # ================================================================
-                # logits = decode(h_final, mask)
-                logits = self.decode(hidden, sample_mask)  # [1, L, vocab_size]
+                # logits = decode(h_final)
+                logits = self.decode(h_current, sample_mask)
                 
                 # output_tokens = argmax(logits)
                 sample_output = logits.argmax(dim=-1)  # [1, L]
@@ -1081,11 +1061,3 @@ class RDT(nn.Module):
             return output_tokens, steps_taken_tensor
         else:
             return output_tokens, steps_taken_tensor.float().mean().item()
-        
-    def tie_weights(self):
-        """Tie output projection weights with token embedding"""
-        self.output_projection.weight = self.token_embedding.weight
-    
-    def count_parameters(self):
-        """Count total trainable parameters"""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)

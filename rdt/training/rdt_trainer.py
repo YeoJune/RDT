@@ -231,7 +231,7 @@ class RDTTrainer:
         self.model.train()
         raw_model = self.accelerator.unwrap_model(self.model)
 
-        # 데이터 로드 (prepare된 DataLoader는 이미 올바른 device에 배치됨)
+        # 데이터 로드
         input_tokens = batch['input']
         targets = batch['targets']
         attention_mask = batch['attention_mask']
@@ -240,30 +240,47 @@ class RDTTrainer:
         chain_lengths = batch['chain_lengths']
         
         batch_size = input_tokens.shape[0]
-        # [Standard Fix] Float를 Tensor로 변환하여 XLA 컴파일 최적화
         sampling_prob_val = self.get_sampling_prob(self.current_epoch, self.global_step)
         sampling_prob = torch.tensor(sampling_prob_val, device=self.accelerator.device)
 
         # [TPU Optimization] max_length 계산
         if self.is_tpu:
-            # TPU: 고정 길이 사용하여 그래프 안정성 확보
             max_length = self.config['training']['max_chain_length']
         else:
-            # GPU: 동적 길이로 효율성 확보
             max_length = chain_lengths.max().item()
         
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
         
-        # --- Step 0 ---
-        h_0 = raw_model.encode_tokens(input_tokens)
-        gate_pred_0, pooled_0 = raw_model.gate(h_0, attention_mask)
+        # ============================================================================
+        # STEP 0: Initial Forward (tokens → h_1)
+        # ============================================================================
+        # forward with is_first_step=True:
+        # - Internally: h_0 = encode(tokens), gate_0 = gate(h_0), h_1 = forward_step(h_0, gate_0)
+        # - Returns: (h_1, gate_1, pooled_1)
         
-        gate_loss_0 = torch.nn.functional.mse_loss(gate_pred_0, gate_targets[:, 0].unsqueeze(1))
-        accumulated_loss = self.loss_weight_gate * gate_loss_0
+        gt_timestep_0 = gate_targets[:, 0].unsqueeze(1)
+        gt_noise_0 = torch.randn_like(gt_timestep_0) * 0.2
+        gt_timestep_0 = gt_timestep_0 + gt_noise_0
         
-        # Logging용 텐서 (detached internally where created or via logic below)
+        hidden, gate_pred, pooled = raw_model.forward(
+            x=input_tokens,
+            attention_mask=attention_mask,
+            is_first_step=True,
+            last_gate_score=None,
+            last_pooled=None,
+            gt_timestep=gt_timestep_0,
+            sampling_prob=sampling_prob
+        )
+        # Now: hidden = h_1, gate_pred = gate_1, pooled = pooled_1
+        
+        # Gate loss for gate_1 (predicting step 1's noise level)
+        gate_target_1 = gate_targets[:, 1].unsqueeze(1)
+        gate_loss_1 = torch.nn.functional.mse_loss(gate_pred, gate_target_1)
+        accumulated_loss = self.loss_weight_gate * gate_loss_1
+        
+        # Logging tensors
         total_recon_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
-        total_gate_loss_tensor = gate_loss_0.detach()
+        total_gate_loss_tensor = gate_loss_1.detach()
         total_aux_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
         total_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
         total_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
@@ -271,32 +288,47 @@ class RDTTrainer:
         num_valid_steps = torch.tensor(1.0, device=self.accelerator.device)
         num_aux_steps = torch.tensor(0.0, device=self.accelerator.device)
         
-        hidden = h_0
-        gate_pred = gate_pred_0
-        pooled = pooled_0
+        # ============================================================================
+        # STEP 1 to max_length: Recursive Steps
+        # ============================================================================
+        # Current state: h_1, gate_1, pooled_1
+        # We've already computed step 0→1, so we start from step_idx=1 (which computes h_2)
         
-        # --- Recursive Steps ---
-        for step_idx in range(max_length):
+        for step_idx in range(1, max_length):
             valid_mask = chain_lengths > step_idx
             if not self.is_tpu and valid_mask.sum() == 0:
                 break
             
-            step_gt_gate = gate_targets[:, step_idx].unsqueeze(1)
-            gt_noise = torch.randn_like(gate_pred) * 0.2 # Small noise for stability
-            step_gt_gate = step_gt_gate + gt_noise
-
-            hidden, _, _ = raw_model.forward_step(
-                hidden, attention_mask=attention_mask, last_gate_score=gate_pred,
-                last_pooled=pooled, gt_timestep=step_gt_gate, sampling_prob=sampling_prob
+            # GT timestep for this step
+            gt_timestep = gate_targets[:, step_idx].unsqueeze(1)
+            gt_noise = torch.randn_like(gt_timestep) * 0.2
+            gt_timestep = gt_timestep + gt_noise
+            
+            # ========================================================================
+            # Forward: h_i → h_{i+1}
+            # ========================================================================
+            # forward with is_first_step=False:
+            # - Internally: h_{i+1} = forward_step(h_i, noise), gate_{i+1} = gate(h_{i+1})
+            # - Returns: (h_{i+1}, gate_{i+1}, pooled_{i+1})
+            
+            hidden, gate_pred, pooled = raw_model.forward(
+                x=hidden,
+                attention_mask=attention_mask,
+                is_first_step=False,
+                last_gate_score=gate_pred,
+                last_pooled=pooled,
+                gt_timestep=gt_timestep,
+                sampling_prob=sampling_prob
             )
+            # Now: hidden = h_{i+1}, gate_pred = gate_{i+1}, pooled = pooled_{i+1}
             
-            # Gate prediction for transformed hidden
-            gate_pred, pooled = raw_model.gate(hidden, attention_mask, pooled, gate_pred)
-            
+            # ========================================================================
+            # Compute losses for step_idx
+            # ========================================================================
             step_targets = targets[:, step_idx, :]
             step_loss_mask = loss_masks[:, step_idx, :]
             
-            # [A] Recon Loss & Accuracy
+            # [A] Reconstruction Loss & Accuracy
             logits_pred = raw_model.decode(hidden, attention_mask)
             
             # Accuracy calculation (EM)
@@ -313,21 +345,25 @@ class RDTTrainer:
             
             # Loss calculation
             if self.is_tpu:
-                loss_per_token = torch.nn.functional.cross_entropy(logits_pred.transpose(1, 2), step_targets, reduction='none')
+                loss_per_token = torch.nn.functional.cross_entropy(
+                    logits_pred.transpose(1, 2), step_targets, reduction='none'
+                )
                 mask_float = step_loss_mask.float()
                 recon_loss = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
             else:
                 if step_loss_mask.sum() > 0:
-                    recon_loss = self.recon_criterion(logits_pred[step_loss_mask], step_targets[step_loss_mask])
+                    recon_loss = self.recon_criterion(
+                        logits_pred[step_loss_mask], step_targets[step_loss_mask]
+                    )
                 else:
                     recon_loss = torch.tensor(0.0, device=self.accelerator.device)
             
-            # [B] Aux Loss
+            # [B] Auxiliary Loss
             aux_kl = torch.tensor(0.0, device=self.accelerator.device)
             if self.loss_weight_aux > 0:
                 aux_mask = step_loss_mask[:aux_batch_size]
                 with torch.no_grad():
-                    h_GT = raw_model.encode_tokens(step_targets[:aux_batch_size])
+                    h_GT = raw_model.encode(step_targets[:aux_batch_size], attention_mask[:aux_batch_size])
                     logits_GT = raw_model.decode(h_GT, attention_mask[:aux_batch_size])
                     target_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
                 
@@ -348,47 +384,38 @@ class RDTTrainer:
                 total_aux_loss_tensor += aux_kl.detach()
                 num_aux_steps += 1.0
             
-            # [C] Gate Loss
-            step_gate_target = gate_targets[:, step_idx + 1].unsqueeze(1)
+            # [C] Gate Loss (predicting next step's noise level)
+            gate_target_next = gate_targets[:, step_idx + 1].unsqueeze(1)
             if self.is_tpu:
-                gate_loss_raw = torch.nn.functional.mse_loss(gate_pred, step_gate_target, reduction='none')
+                gate_loss_raw = torch.nn.functional.mse_loss(
+                    gate_pred, gate_target_next, reduction='none'
+                )
                 valid_mask_float = valid_mask.float().unsqueeze(1)
                 gate_loss = (gate_loss_raw * valid_mask_float).sum() / (valid_mask_float.sum() + 1e-6)
             else:
                 if valid_mask.sum() > 0:
-                    gate_loss = self.gate_criterion(gate_pred[valid_mask], step_gate_target[valid_mask])
+                    gate_loss = self.gate_criterion(gate_pred[valid_mask], gate_target_next[valid_mask])
                 else:
                     gate_loss = torch.tensor(0.0, device=self.accelerator.device)
             
-            step_loss = (self.loss_weight_recon * recon_loss + self.loss_weight_gate * gate_loss + self.loss_weight_aux * aux_kl)
+            # Accumulate step loss
+            step_loss = (
+                self.loss_weight_recon * recon_loss + 
+                self.loss_weight_gate * gate_loss + 
+                self.loss_weight_aux * aux_kl
+            )
             accumulated_loss += step_loss
             
+            # Update logging tensors
             total_recon_loss_tensor += recon_loss.detach()
             total_gate_loss_tensor += gate_loss.detach()
             num_valid_steps += 1.0
         
         # ============================================================================
-        # Loss Calculation - Accelerate Standard Pattern
+        # Final Loss Calculation
         # ============================================================================
-        # Calculate average loss per recursive step
         final_loss = accumulated_loss / num_valid_steps
         
-        # IMPORTANT: Loss scaling is handled automatically by accelerator.accumulate()
-        # 
-        # How it works:
-        # 1. We pass gradient_accumulation_steps to Accelerator.__init__()
-        # 2. accelerator.accumulate() context manager automatically:
-        #    - Scales gradients by 1/gradient_accumulation_steps
-        #    - Controls when to sync gradients across devices
-        #    - Handles optimizer stepping at the right intervals
-        # 
-        # Reference: https://huggingface.co/docs/accelerate/usage_guides/gradient_accumulation
-        # 
-        # DO NOT manually divide loss by gradient_accumulation_steps here!
-        # That would cause double-scaling and incorrect training.
-        
-        # Return final_loss for backward pass (not detached)
-        # Return logging tensors (detached)
         accuracy = (total_correct_tokens / (total_target_tokens + 1e-6)).detach()
         return (
             final_loss,
@@ -400,8 +427,6 @@ class RDTTrainer:
     
     def validate(self) -> Tuple[float, float, float, float]:
         self.model.eval()
-        
-        # Unwrap model to access custom methods (DDP-safe)
         raw_model = self.accelerator.unwrap_model(self.model)
         
         total_loss = 0
@@ -411,14 +436,13 @@ class RDTTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            # Accelerate가 준비한 DataLoader 그대로 사용
             val_iter = self.val_loader
             
             if self.use_tqdm:
-                val_iter = tqdm(val_iter, desc="Validating", leave=False, disable=not self.accelerator.is_local_main_process)
+                val_iter = tqdm(val_iter, desc="Validating", leave=False, 
+                            disable=not self.accelerator.is_local_main_process)
             
             for batch in val_iter:
-                # 데이터 로드 (prepare된 DataLoader는 이미 올바른 device에 배치됨)
                 input_tokens = batch['input']
                 targets = batch['targets']
                 loss_masks = batch['loss_masks']
@@ -431,44 +455,52 @@ class RDTTrainer:
                     actual_max_length = self.config['training']['max_chain_length']
                 else:
                     actual_max_length = chain_lengths.max().item()
-                # [최적화] 텐서로 누적 (매 스텝마다 .item() 호출하지 않음)
+                
+                # Logging tensors
                 batch_recon_tensor = torch.tensor(0.0, device=self.accelerator.device)
                 batch_gate_tensor = torch.tensor(0.0, device=self.accelerator.device)
                 batch_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
                 batch_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
                 num_valid = 0
                 
-                # Initial encoding
-                h_0 = raw_model.encode_tokens(input_tokens)
-                gate_pred_0, pooled_0 = raw_model.gate(h_0, attention_mask, None, None)
+                # ================================================================
+                # STEP 0: Initial Forward (tokens → h_1)
+                # ================================================================
+                hidden, gate_pred, pooled = raw_model.forward(
+                    x=input_tokens,
+                    attention_mask=attention_mask,
+                    is_first_step=True,
+                    last_gate_score=None,
+                    last_pooled=None,
+                    gt_timestep=None,
+                    sampling_prob=0.0
+                )
+                # Now: hidden = h_1, gate_pred = gate_1, pooled = pooled_1
                 
-                # Gate loss for h_0
-                gate_target_0 = gate_targets[:, 0].unsqueeze(1)
-                gate_loss_0 = self.gate_criterion(gate_pred_0, gate_target_0)
-                batch_gate_tensor += gate_loss_0
+                # Gate loss for gate_1
+                gate_target_1 = gate_targets[:, 1].unsqueeze(1)
+                gate_loss_1 = self.gate_criterion(gate_pred, gate_target_1)
+                batch_gate_tensor += gate_loss_1
                 num_valid += 1
                 
-                # Iterative steps
-                hidden = h_0
-                gate_pred = gate_pred_0
-                pooled = pooled_0
-                
-                for step_idx in range(actual_max_length):
+                # ================================================================
+                # STEP 1 to actual_max_length: Recursive Steps
+                # ================================================================
+                for step_idx in range(1, actual_max_length):
                     valid_mask = chain_lengths > step_idx
-                    # [TPU Consistency] train_step과 동일한 패턴 적용
                     if not self.is_tpu and valid_mask.sum() == 0:
                         break
                     
-                    # Forward step
-                    hidden, _, _ = raw_model.forward_step(
-                        hidden,
+                    # Forward: h_i → h_{i+1}
+                    hidden, gate_pred, pooled = raw_model.forward(
+                        x=hidden,
                         attention_mask=attention_mask,
+                        is_first_step=False,
                         last_gate_score=gate_pred,
-                        last_pooled=pooled
+                        last_pooled=pooled,
+                        gt_timestep=None,
+                        sampling_prob=0.0
                     )
-                    
-                    # Gate prediction for transformed hidden
-                    gate_pred, pooled = raw_model.gate(hidden, attention_mask, pooled, gate_pred)
                     
                     # Reconstruction loss & Accuracy
                     step_targets = targets[:, step_idx, :]
@@ -489,17 +521,17 @@ class RDTTrainer:
                         recon_loss = torch.tensor(0.0, device=self.accelerator.device)
                     
                     # Gate loss
-                    step_gate_targets = gate_targets[:, step_idx + 1].unsqueeze(1)
-                    gate_pred_valid = gate_pred[valid_mask]
-                    gate_target_valid = step_gate_targets[valid_mask]
-                    gate_loss = self.gate_criterion(gate_pred_valid, gate_target_valid) if len(gate_pred_valid) > 0 else torch.tensor(0.0, device=self.accelerator.device)
+                    gate_target_next = gate_targets[:, step_idx + 1].unsqueeze(1)
+                    if valid_mask.sum() > 0:
+                        gate_loss = self.gate_criterion(gate_pred[valid_mask], gate_target_next[valid_mask])
+                    else:
+                        gate_loss = torch.tensor(0.0, device=self.accelerator.device)
                     
-                    # [최적화] 텐서끼리 덧셈 (동기화 없음)
                     batch_recon_tensor += recon_loss
                     batch_gate_tensor += gate_loss
                     num_valid += 1
                 
-                # [최적화] 배치 끝에 한 번만 .item() 호출
+                # Batch averaging
                 if num_valid > 0:
                     avg_recon = (batch_recon_tensor / num_valid).item()
                     avg_gate = (batch_gate_tensor / num_valid).item()
@@ -515,15 +547,13 @@ class RDTTrainer:
         if num_batches == 0:
             return 0.0, 0.0, 0.0, 0.0
         
-        # [Distributed Validation] 모든 프로세스에서 값을 수집하여 평균 계산
-        # 각 프로세스는 배치들의 평균을 누적했으므로 (total_loss / num_batches)로 정규화
+        # Distributed gathering
         total_loss_tensor = torch.tensor(total_loss, device=self.accelerator.device)
         total_recon_tensor = torch.tensor(total_recon, device=self.accelerator.device)
         total_gate_tensor = torch.tensor(total_gate, device=self.accelerator.device)
         total_accuracy_tensor = torch.tensor(total_accuracy, device=self.accelerator.device)
         num_batches_tensor = torch.tensor(num_batches, device=self.accelerator.device)
         
-        # gather: 모든 프로세스의 값을 수집 (sum으로 통합)
         total_loss_tensor = self.accelerator.gather(total_loss_tensor).sum()
         total_recon_tensor = self.accelerator.gather(total_recon_tensor).sum()
         total_gate_tensor = self.accelerator.gather(total_gate_tensor).sum()
@@ -533,7 +563,6 @@ class RDTTrainer:
         if num_batches_tensor == 0:
             return 0.0, 0.0, 0.0, 0.0
         
-        # 전체 배치 수로 나누어 최종 평균 계산 (단 한 번만)
         return (
             (total_loss_tensor / num_batches_tensor).item(),
             (total_recon_tensor / num_batches_tensor).item(),
@@ -830,7 +859,7 @@ class RDTTrainer:
                 
                 # Accelerate의 gradient accumulation 자동 처리
                 with self.accelerator.accumulate(self.model):
-                    loss, recon, gate, aux = self.train_step(batch)
+                    loss, recon, gate, aux, acc = self.train_step(batch)
                     
                     # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
                     self.accelerator.backward(loss)
@@ -854,6 +883,7 @@ class RDTTrainer:
                     current_recon = recon.item()
                     current_gate = gate.item()
                     current_aux = aux.item()
+                    current_acc = acc.item()
 
                     log_data = {
                         'epoch': epoch,
@@ -862,6 +892,7 @@ class RDTTrainer:
                         'recon_loss': current_recon,
                         'gate_loss': current_gate,
                         'aux_loss': current_aux,
+                        'accuracy': current_acc,
                         'lr': self.optimizer.param_groups[0]['lr'],
                         'sampling_prob': self.get_sampling_prob(step=step)
                     }
@@ -878,11 +909,11 @@ class RDTTrainer:
                             'step': step,
                             'loss': f'{current_loss:.4f}',
                             'recon': f'{current_recon:.4f}',
-                            'aux': f'{current_aux:.4f}'
+                            'acc': f'{current_acc:.3f}'
                         })
                     else:
                         # Print logging when tqdm is disabled
-                        print(f"Epoch {epoch+1} | Step {step}/{self.max_training_steps} | Loss: {current_loss:.4f} | Recon: {current_recon:.4f} | Gate: {current_gate:.4f} | Aux: {current_aux:.4f} | LR: {log_data['lr']:.6f}")
+                        print(f"Epoch {epoch+1} | Step {step}/{self.max_training_steps} | Loss: {current_loss:.4f} | Recon: {current_recon:.4f} | Gate: {current_gate:.4f} | Aux: {current_aux:.4f} | Acc: {current_acc:.3f} | LR: {log_data['lr']:.6f}")
                 
                 # Validation at regular step intervals
                 if step % self.eval_every_n_steps == 0:

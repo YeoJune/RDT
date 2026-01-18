@@ -36,7 +36,7 @@ class Evaluator:
             raise ValueError(f"Unknown model type: {model_type}. Choose 'rdt', 'mlm', 'cmlm', or 'mdlm'")
     
     def evaluate_rdt(self, dataloader: DataLoader, max_steps: int = 20,
-                     threshold: float = 0.02, mask_ratio: float = 0.15) -> Dict[str, float]:
+                 threshold: float = 0.02, mask_ratio: float = 0.15) -> Dict[str, float]:
         """
         Evaluate RDT model with actual inference capability (no preprocessor).
         
@@ -117,7 +117,8 @@ class Evaluator:
                     # Re-encoding and decoding is necessary to get probability distributions
                     # This still respects the "decode once" principle of inference
                     with torch.no_grad():
-                        hidden = self.model.encode_tokens(output_ids, attention_mask)
+                        # ✅ FIX: encode_tokens → encode
+                        hidden = self.model.encode(output_ids, attention_mask)
                         logits = self.model.decode(hidden, attention_mask)
                     
                     # Loss only on masked tokens
