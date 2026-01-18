@@ -7,7 +7,7 @@ model_type: "rdt" # 'rdt' or 'mlm'
 model:
   d_model: 512 # Hidden dimension (auto-set from BERT if use_bert_init=true)
   n_heads: 8 # Attention heads (d_model / 64)
-  n_encoder_layers: 6 # Main encoder depth (recursive)
+  n_encoder_layers: 4 # Main encoder depth (recursive)
   d_ff: 2048 # FFN dimension (4x d_model)
   dropout: 0.1
 
@@ -29,7 +29,7 @@ model:
   gradient_checkpointing: false # Enable gradient checkpointing to save memory
 
   # BERT Weight Initialization
-  use_bert_init: true # Initialize from pretrained BERT
+  use_bert_init: false # Initialize from pretrained BERT
   bert_model_name: "prajjwal1/bert-medium" # 8 layers, 512-dim (perfect for n_encoder_layers=6)
   # Options:
   #   - "prajjwal1/bert-medium": 8 layers, 512-dim → n_encoder_layers=6
@@ -40,7 +40,7 @@ model:
 training:
   # Chain & Masking
   max_chain_length: 2 # L: length of training segment
-  total_steps: 20 # N: total denoising steps (100% → 0%)
+  total_steps: 10 # N: total denoising steps (100% → 0%)
   masking_strategy: "shuffle" # 'shuffle' (index-based)
   visible_loss_ratio: 0.0 # Visible 중에서도 loss 계산할 비율 (안정화)
 
@@ -69,7 +69,7 @@ training:
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 15 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
-  learning_rate: 0.0002 # 2e-4
+  learning_rate: 0.0005 # 5e-4
   weight_decay: 0.01
   warmup_ratio: 0.05 # 5% of total steps
 
