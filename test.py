@@ -126,7 +126,7 @@ def main():
     # Tokenize
     encoded = tokenizer(
         text,
-        max_length=20,
+        max_length=128,
         padding='max_length',
         truncation=True,
         return_tensors='pt'
