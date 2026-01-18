@@ -18,6 +18,7 @@ class RDTPreprocessor:
         # ✅ BEST PRACTICE: Store all special token IDs
         self.all_special_ids = set(tokenizer.all_special_ids)
         
+        self.min_chain_length = config['training'].get('min_chain_length', 1)
         self.max_chain_length = config['training']['max_chain_length']
         self.total_steps = config['training']['total_steps']
         self.visible_loss_ratio = config['training'].get('visible_loss_ratio', 0.15)
@@ -56,7 +57,7 @@ class RDTPreprocessor:
         if not self.curriculum_enabled:
             return (self.max_chain_length, self.total_steps)
         
-        # Min: Always fixed at max_chain_length
+        # Min: Always fixed at max_chain_length (ensures all chain lengths can be sampled)
         min_step = self.max_chain_length
         
         # Max: Linear interpolation from start_step to total_steps
@@ -88,8 +89,8 @@ class RDTPreprocessor:
         # Non-special token mask for actual length calculation
         non_special_mask = ~special_token_mask
         
-        # 1. Chain Length
-        chain_lengths = torch.randint(1, self.max_chain_length + 1, (B,), device=device)
+        # 1. Chain Length (sample between min and max)
+        chain_lengths = torch.randint(self.min_chain_length, self.max_chain_length + 1, (B,), device=device)
         
         # 2. Start Step Sampling with Curriculum
         if self.curriculum_enabled:
