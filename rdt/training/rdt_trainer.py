@@ -278,7 +278,7 @@ class RDTTrainer:
         gt_noise_0 = torch.randn_like(gt_timestep_0) * 0.2
         gt_timestep_0 = gt_timestep_0 + gt_noise_0
         
-        if self.training:
+        if raw_model.training:
             noise_0 = sampling_prob * gt_timestep_0.detach() + (1.0 - sampling_prob) * gate_0.detach()
         else:
             noise_0 = gate_0.detach()
