@@ -15,6 +15,9 @@ class RDTPreprocessor:
         self.vocab_size = tokenizer.vocab_size
         self.device = device
         
+        # ✅ BEST PRACTICE: Store all special token IDs
+        self.all_special_ids = set(tokenizer.all_special_ids)
+        
         self.max_chain_length = config['training']['max_chain_length']
         self.total_steps = config['training']['total_steps']
         self.visible_loss_ratio = config['training'].get('visible_loss_ratio', 0.15)
@@ -74,6 +77,17 @@ class RDTPreprocessor:
         
         B, L = input_ids.shape
         
+        # ========================================================================
+        # [FIX] Special Token Identification using all_special_ids
+        # ========================================================================
+        # Create mask for ALL special tokens (more robust and standard)
+        special_token_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+        for special_id in self.all_special_ids:
+            special_token_mask |= (input_ids == special_id)
+        
+        # Non-special token mask for actual length calculation
+        non_special_mask = ~special_token_mask
+        
         # 1. Chain Length
         chain_lengths = torch.randint(1, self.max_chain_length + 1, (B,), device=device)
         
@@ -100,8 +114,12 @@ class RDTPreprocessor:
         
         # 3. Random Permutation Logic
         rand_scores = torch.rand(B, L, device=device)
-        padding_mask = (input_ids == self.pad_token_id)
-        rand_scores = torch.where(padding_mask, torch.tensor(1e9, device=device), rand_scores)
+        # ✅ FIX: Exclude ALL special tokens from ranking
+        rand_scores = torch.where(
+            special_token_mask, 
+            torch.tensor(1e9, device=device), 
+            rand_scores
+        )
         restore_ranks = rand_scores.argsort(dim=1).argsort(dim=1)
         
         # 4. Init Tensors
@@ -110,7 +128,9 @@ class RDTPreprocessor:
         loss_masks = torch.zeros((B, self.max_chain_length, L), dtype=torch.bool, device=device)
         gate_targets = torch.zeros((B, self.max_chain_length + 1), dtype=torch.float, device=device)
         attention_mask = (input_ids != self.pad_token_id).long()
-        actual_lengths = attention_mask.sum(dim=1).float()
+        
+        # ✅ FIX: Count only non-special tokens for actual length
+        actual_lengths = non_special_mask.sum(dim=1).float()
         
         # 5. Input Generation (s_0)
         input_steps = start_steps
@@ -118,7 +138,8 @@ class RDTPreprocessor:
         visible_counts = (visible_ratios * actual_lengths).long()
         
         is_masked = restore_ranks >= visible_counts.unsqueeze(1)
-        is_masked = is_masked & (attention_mask.bool())
+        # ✅ FIX: Only mask non-special tokens
+        is_masked = is_masked & non_special_mask
         
         inputs = input_ids.clone()
         if self.bert_masking_enabled:
@@ -154,7 +175,8 @@ class RDTPreprocessor:
                 rehearsal_mask = (torch.rand(B, L, device=device) < self.visible_loss_ratio) & already_visible
                 step_loss_mask = step_loss_mask | rehearsal_mask
             
-            step_loss_mask = step_loss_mask & attention_mask.bool()
+            # ✅ FIX: Exclude special tokens from loss mask
+            step_loss_mask = step_loss_mask & non_special_mask
             
             still_masked = restore_ranks >= upper_bound
             step_targets = torch.where(
