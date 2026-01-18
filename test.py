@@ -60,10 +60,12 @@ def visualize_batch(batch, tokenizer, batch_idx=0, sample_idx=0):
     input_text = decode_tokens(tokenizer, input_tokens, skip_special=True)
     print(f"Text: {input_text[:200]}...")
     
-    # Count mask tokens in input
+    # Count mask tokens in input (only in valid positions)
     mask_token_id = tokenizer.mask_token_id
-    num_masked = (input_tokens == mask_token_id).sum().item()
     num_valid = attention_mask.sum().item()
+    # ✅ FIX: Only count masks in non-padding positions
+    valid_mask = attention_mask.bool()
+    num_masked = ((input_tokens == mask_token_id) & valid_mask).sum().item()
     mask_ratio = num_masked / num_valid if num_valid > 0 else 0
     print(f"Masked tokens: {num_masked}/{num_valid} ({mask_ratio*100:.1f}%)")
     
@@ -79,8 +81,10 @@ def visualize_batch(batch, tokenizer, batch_idx=0, sample_idx=0):
         print(f"\nTarget (h_{step_idx + 1}):")
         print(f"  Text: {target_text[:200]}...")
         
-        # Count masks in target
-        num_masked_target = (step_targets == mask_token_id).sum().item()
+        # Count masks in target (only in valid positions)
+        # ✅ FIX: Only count masks in non-padding positions
+        valid_mask = attention_mask.bool()
+        num_masked_target = ((step_targets == mask_token_id) & valid_mask).sum().item()
         target_mask_ratio = num_masked_target / num_valid if num_valid > 0 else 0
         print(f"  Masked tokens: {num_masked_target}/{num_valid} ({target_mask_ratio*100:.1f}%)")
         
