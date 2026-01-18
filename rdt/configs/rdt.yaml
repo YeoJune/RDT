@@ -70,7 +70,7 @@ training:
   training_mode: "epoch" # 'epoch' or 'step'
   num_epochs: 15 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
-  learning_rate: 0.0002 # 2e-4
+  learning_rate: 0.00005 # 5e-5
   weight_decay: 0.01
   warmup_ratio: 0.05 # 5% of total steps
 

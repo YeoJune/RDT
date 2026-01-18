@@ -295,79 +295,15 @@ class RDTTrainer:
         gate_loss_0 = torch.nn.functional.mse_loss(gate_0, gate_target_0)
         total_gate_loss += gate_loss_0
         num_gate_steps += 1
-        
-        # 4. Scheduled sampling for noise level
-        gt_timestep_0 = gate_target_0
-        gt_noise_0 = torch.randn_like(gt_timestep_0) * 0.2
-        gt_timestep_0 = gt_timestep_0 + gt_noise_0
-        
-        if raw_model.training:
-            noise_0 = sampling_prob * gt_timestep_0.detach() + (1.0 - sampling_prob) * gate_0.detach()
-        else:
-            noise_0 = gate_0.detach()
-        
-        # 5. Transform: h_0 → h_1
-        h_1 = raw_model.forward_step(h_0, noise_0, attention_mask)
-        
-        # 6. Gate prediction for h_1: gate_1, pooled_1
-        gate_1, pooled_1 = raw_model.gate(
-            h_1,
-            attention_mask,
-            prev_pooled=pooled_0,
-            prev_gate=gate_0
-        )
-        
-        # 7. Gate loss for gate_1 (predicting step 1's noise level)
-        gate_target_1 = gate_targets[:, 1].unsqueeze(1)
-        gate_loss_1 = torch.nn.functional.mse_loss(gate_1, gate_target_1)
-        total_gate_loss += gate_loss_1
-        num_gate_steps += 1
-        
-        # 8. Reconstruction Loss for h_1
-        step_0_targets = targets[:, 0, :]
-        step_0_loss_mask = loss_masks[:, 0, :]
-        
-        # Decode h_1
-        logits_h1 = raw_model.decode(h_1, attention_mask)
-        
-        # Accuracy calculation
-        pred_tokens_h1 = logits_h1.argmax(dim=-1)
-        if self.is_tpu:
-            correct = (pred_tokens_h1 == step_0_targets).float() * step_0_loss_mask.float()
-            total_correct_tokens += correct.sum()
-            total_target_tokens += step_0_loss_mask.float().sum()
-        else:
-            if step_0_loss_mask.sum() > 0:
-                correct = (pred_tokens_h1[step_0_loss_mask] == step_0_targets[step_0_loss_mask]).float().sum()
-                total_correct_tokens += correct
-                total_target_tokens += step_0_loss_mask.sum().float()
-        
-        # Reconstruction loss
-        if self.is_tpu:
-            loss_per_token = torch.nn.functional.cross_entropy(
-                logits_h1.transpose(1, 2), step_0_targets, reduction='none'
-            )
-            mask_float = step_0_loss_mask.float()
-            recon_loss_h1 = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
-        else:
-            if step_0_loss_mask.sum() > 0:
-                recon_loss_h1 = self.recon_criterion(
-                    logits_h1[step_0_loss_mask], step_0_targets[step_0_loss_mask]
-                )
-            else:
-                recon_loss_h1 = torch.tensor(0.0, device=self.accelerator.device)
-        
-        total_recon_loss += recon_loss_h1
-        num_recon_steps += 1
-        
+
         # Update state for next steps
-        hidden, gate_pred, pooled = h_1, gate_1, pooled_1
+        hidden, gate_pred, pooled = h_0, gate_0, pooled_0
         
         # ============================================================================
         # STEP 1 to max_length: Recursive Steps
         # ============================================================================
         
-        for step_idx in range(1, max_length):
+        for step_idx in range(0, max_length):
             valid_mask = chain_lengths > step_idx
             if not self.is_tpu and valid_mask.sum() == 0:
                 break
@@ -571,62 +507,8 @@ class RDTTrainer:
                 batch_gate_loss += gate_loss_0
                 num_gate_steps += 1
                 
-                # 4. Transform: h_0 → h_1
-                h_1 = raw_model.forward_step(h_0, gate_0.detach(), attention_mask)
-                
-                # 5. Gate prediction for h_1: gate_1, pooled_1
-                gate_1, pooled_1 = raw_model.gate(
-                    h_1,
-                    attention_mask,
-                    prev_pooled=pooled_0,
-                    prev_gate=gate_0
-                )
-                
-                # 6. Gate loss for gate_1
-                gate_target_1 = gate_targets[:, 1].unsqueeze(1)
-                gate_loss_1 = self.gate_criterion(gate_1, gate_target_1)
-                batch_gate_loss += gate_loss_1
-                num_gate_steps += 1
-                
-                # 7. Reconstruction Loss for h_1
-                step_0_targets = targets[:, 0, :]
-                step_0_loss_mask = loss_masks[:, 0, :]
-                
-                # Decode h_1
-                logits_h1 = raw_model.decode(h_1, attention_mask)
-                
-                # Accuracy calculation
-                pred_tokens_h1 = logits_h1.argmax(dim=-1)
-                if self.is_tpu:
-                    correct = (pred_tokens_h1 == step_0_targets).float() * step_0_loss_mask.float()
-                    batch_correct_tokens += correct.sum()
-                    batch_target_tokens += step_0_loss_mask.float().sum()
-                else:
-                    if step_0_loss_mask.sum() > 0:
-                        correct = (pred_tokens_h1[step_0_loss_mask] == step_0_targets[step_0_loss_mask]).float().sum()
-                        batch_correct_tokens += correct
-                        batch_target_tokens += step_0_loss_mask.sum().float()
-                
-                # Reconstruction loss
-                if self.is_tpu:
-                    loss_per_token = torch.nn.functional.cross_entropy(
-                        logits_h1.transpose(1, 2), step_0_targets, reduction='none'
-                    )
-                    mask_float = step_0_loss_mask.float()
-                    recon_loss_h1 = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
-                else:
-                    if step_0_loss_mask.sum() > 0:
-                        recon_loss_h1 = self.recon_criterion(
-                            logits_h1[step_0_loss_mask], step_0_targets[step_0_loss_mask]
-                        )
-                    else:
-                        recon_loss_h1 = torch.tensor(0.0, device=self.accelerator.device)
-                
-                batch_recon_loss += recon_loss_h1
-                num_recon_steps += 1
-                
                 # Update state for next steps
-                hidden, gate_pred, pooled = h_1, gate_1, pooled_1
+                hidden, gate_pred, pooled = h_0, gate_0, pooled_0
                 
                 # ================================================================
                 # STEP 1 to actual_max_length: Recursive Steps
