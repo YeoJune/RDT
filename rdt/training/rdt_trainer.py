@@ -299,17 +299,66 @@ class RDTTrainer:
         gate_loss_1 = torch.nn.functional.mse_loss(gate_1, gate_target_1)
         accumulated_loss += self.loss_weight_gate * gate_loss_1
         
+        # ============================================================================
+        # 8. Reconstruction Loss for h_1 (CRITICAL FIX)
+        # ============================================================================
+        # h_1 should predict targets[:, 0, :] (first denoising step target)
+        step_0_targets = targets[:, 0, :]
+        step_0_loss_mask = loss_masks[:, 0, :]
+        
+        # Decode h_1
+        logits_h1 = raw_model.decode(h_1, attention_mask)
+        
+        # Accuracy calculation
+        pred_tokens_h1 = logits_h1.argmax(dim=-1)
+        if self.is_tpu:
+            correct = (pred_tokens_h1 == step_0_targets).float() * step_0_loss_mask.float()
+            total_correct_tokens = correct.sum()
+            total_target_tokens = step_0_loss_mask.float().sum()
+        else:
+            if step_0_loss_mask.sum() > 0:
+                correct = (pred_tokens_h1[step_0_loss_mask] == step_0_targets[step_0_loss_mask]).float().sum()
+                total_correct_tokens = correct
+                total_target_tokens = step_0_loss_mask.sum().float()
+            else:
+                total_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
+                total_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
+        
+        # Reconstruction loss
+        if self.is_tpu:
+            loss_per_token = torch.nn.functional.cross_entropy(
+                logits_h1.transpose(1, 2), step_0_targets, reduction='none'
+            )
+            mask_float = step_0_loss_mask.float()
+            recon_loss_h1 = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
+        else:
+            if step_0_loss_mask.sum() > 0:
+                recon_loss_h1 = self.recon_criterion(
+                    logits_h1[step_0_loss_mask], step_0_targets[step_0_loss_mask]
+                )
+            else:
+                recon_loss_h1 = torch.tensor(0.0, device=self.accelerator.device)
+        
+        # Accumulate loss
+        accumulated_loss += self.loss_weight_recon * recon_loss_h1
+        
         # Update state for next steps
         hidden, gate_pred, pooled = h_1, gate_1, pooled_1
         
-        # Logging tensors
-        total_recon_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
+        # ============================================================================
+        # Logging tensors (accurate counting)
+        # ============================================================================
+        total_recon_loss_tensor = recon_loss_h1.detach()
         total_gate_loss_tensor = gate_loss_0.detach() + gate_loss_1.detach()
         total_aux_loss_tensor = torch.tensor(0.0, device=self.accelerator.device)
-        total_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
-        total_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
         
-        num_valid_steps = torch.tensor(2.0, device=self.accelerator.device)  # gate_0 and gate_1
+        # Step counting: 
+        # - num_valid_steps: number of recursive denoising steps (for final_loss average)
+        # - num_gate_steps: number of gate predictions (gate_0, gate_1, ...)
+        # - num_recon_steps: number of reconstruction losses (recon_h1, recon_h2, ...)
+        num_valid_steps = torch.tensor(1.0, device=self.accelerator.device)  # Step 0→1
+        num_gate_steps = torch.tensor(2.0, device=self.accelerator.device)   # gate_0, gate_1
+        num_recon_steps = torch.tensor(1.0, device=self.accelerator.device)  # recon_h1
         num_aux_steps = torch.tensor(0.0, device=self.accelerator.device)
         
         # ============================================================================
@@ -430,21 +479,23 @@ class RDTTrainer:
             )
             accumulated_loss += step_loss
             
-            # Update logging tensors
+            # Update logging tensors and counters
             total_recon_loss_tensor += recon_loss.detach()
             total_gate_loss_tensor += gate_loss.detach()
             num_valid_steps += 1.0
+            num_gate_steps += 1.0
+            num_recon_steps += 1.0
         
         # ============================================================================
-        # Final Loss Calculation
+        # Final Loss Calculation (Per-Step Average)
         # ============================================================================
         final_loss = accumulated_loss / num_valid_steps
         
         accuracy = (total_correct_tokens / (total_target_tokens + 1e-6)).detach()
         return (
             final_loss,
-            (total_recon_loss_tensor / num_valid_steps).detach(),
-            (total_gate_loss_tensor / num_valid_steps).detach(),
+            (total_recon_loss_tensor / num_recon_steps).detach(),  # Average over recon steps
+            (total_gate_loss_tensor / num_gate_steps).detach(),    # Average over gate predictions
             (total_aux_loss_tensor / (num_aux_steps + 1e-6)).detach(),
             accuracy
         )
@@ -525,6 +576,45 @@ class RDTTrainer:
                 gate_target_1 = gate_targets[:, 1].unsqueeze(1)
                 gate_loss_1 = self.gate_criterion(gate_1, gate_target_1)
                 batch_gate_tensor += gate_loss_1
+                num_valid += 1
+                
+                # ============================================================
+                # 7. Reconstruction Loss for h_1 (CRITICAL FIX)
+                # ============================================================
+                step_0_targets = targets[:, 0, :]
+                step_0_loss_mask = loss_masks[:, 0, :]
+                
+                # Decode h_1
+                logits_h1 = raw_model.decode(h_1, attention_mask)
+                
+                # Accuracy calculation
+                pred_tokens_h1 = logits_h1.argmax(dim=-1)
+                if self.is_tpu:
+                    correct = (pred_tokens_h1 == step_0_targets).float() * step_0_loss_mask.float()
+                    batch_correct_tokens += correct.sum()
+                    batch_target_tokens += step_0_loss_mask.float().sum()
+                else:
+                    if step_0_loss_mask.sum() > 0:
+                        correct = (pred_tokens_h1[step_0_loss_mask] == step_0_targets[step_0_loss_mask]).float().sum()
+                        batch_correct_tokens += correct
+                        batch_target_tokens += step_0_loss_mask.sum().float()
+                
+                # Reconstruction loss
+                if self.is_tpu:
+                    loss_per_token = torch.nn.functional.cross_entropy(
+                        logits_h1.transpose(1, 2), step_0_targets, reduction='none'
+                    )
+                    mask_float = step_0_loss_mask.float()
+                    recon_loss_h1 = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
+                else:
+                    if step_0_loss_mask.sum() > 0:
+                        recon_loss_h1 = self.recon_criterion(
+                            logits_h1[step_0_loss_mask], step_0_targets[step_0_loss_mask]
+                        )
+                    else:
+                        recon_loss_h1 = torch.tensor(0.0, device=self.accelerator.device)
+                
+                batch_recon_tensor += recon_loss_h1
                 num_valid += 1
                 
                 # Update state for next steps
