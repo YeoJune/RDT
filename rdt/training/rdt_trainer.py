@@ -103,7 +103,7 @@ class RDTTrainer:
         #     self.model = torch.compile(self.model)
         
         # Loss functions
-        self.recon_criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding
+        self.recon_criterion = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)  # Ignore padding
         self.gate_criterion = nn.MSELoss()
         
         # Logging with W&B (Main Process Only)
