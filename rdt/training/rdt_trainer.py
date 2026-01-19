@@ -67,14 +67,18 @@ class RDTTrainer:
         # TPU 환경 감지 (표준 방식)
         self.is_tpu = self.accelerator.state.distributed_type == DistributedType.XLA
         
+        # Weight tying enabled status from config
+        self.weight_tying = config['model'].get('weight_tying', True)
+        
         # ============================================================================
-        # [CRITICAL] Weight Tying - Step 1: Apply BEFORE prepare()
+        # [CRITICAL] Weight Tying - Step 1: Apply BEFORE prepare() (if enabled)
         # ============================================================================
         # Weight tying must be done before DDP/FSDP wrapping to ensure proper sharing
-        if hasattr(model, 'tie_weights'):
-            model.tie_weights()
-        elif hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
-            model.output_projection.weight = model.token_embedding.weight
+        if self.weight_tying:
+            if hasattr(model, 'tie_weights'):
+                model.tie_weights()
+            elif hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
+                model.output_projection.weight = model.token_embedding.weight
         
         # ============================================================================
         # Accelerate Prepare - Standard Pattern
@@ -85,15 +89,16 @@ class RDTTrainer:
             )
         
         # ============================================================================
-        # [CRITICAL] Weight Tying - Step 2: Re-apply AFTER prepare()
+        # [CRITICAL] Weight Tying - Step 2: Re-apply AFTER prepare() (if enabled)
         # ============================================================================
         # DDP/FSDP wrapping can break weight sharing, so we must re-apply
         # Use unwrap_model to access the underlying model
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-        if hasattr(unwrapped_model, 'tie_weights'):
-            unwrapped_model.tie_weights()
-        elif hasattr(unwrapped_model, 'output_projection') and hasattr(unwrapped_model, 'token_embedding'):
-            unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
+        if self.weight_tying:
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            if hasattr(unwrapped_model, 'tie_weights'):
+                unwrapped_model.tie_weights()
+            elif hasattr(unwrapped_model, 'output_projection') and hasattr(unwrapped_model, 'token_embedding'):
+                unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
         
         # ============================================================================
         # Scheduler Creation - AFTER prepare() to use prepared DataLoader length
@@ -159,32 +164,41 @@ class RDTTrainer:
             # ========================================================================
             if hasattr(unwrapped_model, 'output_projection') and hasattr(unwrapped_model, 'token_embedding'):
                 is_tied = unwrapped_model.output_projection.weight is unwrapped_model.token_embedding.weight
-                print(f"\nWeight Tying Status: {'✓ ENABLED' if is_tied else '✗ FAILED'}")
                 
-                if not is_tied:
-                    print("ERROR: Weight tying verification failed!")
-                    print("Attempting to fix...")
+                if self.weight_tying:
+                    # Weight tying should be enabled
+                    print(f"\nWeight Tying Status: {'✓ ENABLED' if is_tied else '✗ FAILED'}")
                     
-                    # Try to fix
-                    if hasattr(unwrapped_model, 'tie_weights'):
-                        unwrapped_model.tie_weights()
+                    if not is_tied:
+                        print("ERROR: Weight tying verification failed!")
+                        print("Attempting to fix...")
+                        
+                        # Try to fix
+                        if hasattr(unwrapped_model, 'tie_weights'):
+                            unwrapped_model.tie_weights()
+                        else:
+                            unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
+                        
+                        # Final verification
+                        is_tied_after_fix = unwrapped_model.output_projection.weight is unwrapped_model.token_embedding.weight
+                        if is_tied_after_fix:
+                            print("✓ Weight tying fixed successfully!")
+                        else:
+                            print("✗ CRITICAL: Weight tying could not be fixed!")
+                            print("This may lead to incorrect training behavior.")
                     else:
-                        unwrapped_model.output_projection.weight = unwrapped_model.token_embedding.weight
-                    
-                    # Final verification
-                    is_tied_after_fix = unwrapped_model.output_projection.weight is unwrapped_model.token_embedding.weight
-                    if is_tied_after_fix:
-                        print("✓ Weight tying fixed successfully!")
-                    else:
-                        print("✗ CRITICAL: Weight tying could not be fixed!")
-                        print("This may lead to incorrect training behavior.")
+                        # Show memory addresses to confirm
+                        emb_addr = id(unwrapped_model.token_embedding.weight)
+                        proj_addr = id(unwrapped_model.output_projection.weight)
+                        print(f"  - Token embedding: {emb_addr}")
+                        print(f"  - Output projection: {proj_addr}")
+                        print(f"  - Same object: {emb_addr == proj_addr}")
                 else:
-                    # Show memory addresses to confirm
-                    emb_addr = id(unwrapped_model.token_embedding.weight)
-                    proj_addr = id(unwrapped_model.output_projection.weight)
-                    print(f"  - Token embedding: {emb_addr}")
-                    print(f"  - Output projection: {proj_addr}")
-                    print(f"  - Same object: {emb_addr == proj_addr}")
+                    # Weight tying should be disabled
+                    print(f"\nWeight Tying Status: {'✓ DISABLED (as configured)' if not is_tied else '⚠️ UNEXPECTED - Still tied'}")
+                    if is_tied:
+                        print("WARNING: Weights are tied even though weight_tying=False in config.")
+                        print("This might be due to model checkpoint having tied weights.")
     
     def _create_scheduler(self):
         """Create learning rate scheduler"""

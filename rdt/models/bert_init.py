@@ -367,6 +367,7 @@ def initialize_rdt_with_bert(
     d_model: Optional[int] = None,
     n_encoder_layers: int = 6,
     verbose: bool = True,
+    weight_tying: bool = True,
     **rdt_kwargs
 ) -> nn.Module:
     """
@@ -434,6 +435,7 @@ def initialize_rdt_with_bert(
         vocab_size=vocab_size,
         d_model=d_model,
         n_encoder_layers=n_encoder_layers,
+        weight_tying=weight_tying,
         **rdt_kwargs
     )
     

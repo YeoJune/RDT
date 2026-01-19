@@ -28,6 +28,9 @@ model:
   # Memory optimization
   gradient_checkpointing: false # Enable gradient checkpointing to save memory
 
+  # Weight Tying
+  weight_tying: false # Tie output projection weights with token embedding (reduces params, improves training)
+
   # BERT Weight Initialization
   use_bert_init: false # Initialize from pretrained BERT
   bert_model_name: "prajjwal1/bert-medium" # 8 layers, 512-dim (perfect for n_encoder_layers=6)

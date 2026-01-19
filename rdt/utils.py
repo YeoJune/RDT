@@ -346,6 +346,7 @@ def create_model_from_config(config: Dict, vocab_size: int):
             rope_base=model_config.get('rope_base', 10000.0),
             total_steps=config.get("training", {}).get('total_steps', 20),
             gradient_checkpointing=model_config.get('gradient_checkpointing', False),
+            weight_tying=model_config.get('weight_tying', True),
             verbose=True
         )
     else:
@@ -366,7 +367,8 @@ def create_model_from_config(config: Dict, vocab_size: int):
             gate_dropout=model_config.get('gate_dropout', 0.1),
             rope_base=model_config.get('rope_base', 10000.0),
             total_steps=config.get("training", {}).get('total_steps', 20),
-            gradient_checkpointing=model_config.get('gradient_checkpointing', False)
+            gradient_checkpointing=model_config.get('gradient_checkpointing', False),
+            weight_tying=model_config.get('weight_tying', True)
         )
     
     return model

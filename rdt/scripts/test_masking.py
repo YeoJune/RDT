@@ -1139,7 +1139,8 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
             gate_dropout=config['model']['gate_dropout'],
             rope_base=config['model'].get('rope_base', 10000.0),
             total_steps=config['training']['total_steps'],
-            gradient_checkpointing=config['model'].get('gradient_checkpointing', False)
+            gradient_checkpointing=config['model'].get('gradient_checkpointing', False),
+            weight_tying=config['model'].get('weight_tying', True)
         )
         
         state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
@@ -1169,15 +1170,24 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         
         model = model.to(device)
 
-        # CRITICAL: Weight tying 복원 (.to() 이후 다시 적용)
-        # RDT 모델인 경우에만 적용
-        if hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
-            model.output_projection.weight = model.token_embedding.weight
-            print("✅ Weight tying reapplied.")
+        # Weight tying restoration after .to() (conditional based on config)
+        # Only apply if weight_tying is enabled in config
+        weight_tying_enabled = config['model'].get('weight_tying', True)
+        if weight_tying_enabled:
+            if hasattr(model, 'output_projection') and hasattr(model, 'token_embedding'):
+                model.output_projection.weight = model.token_embedding.weight
+                print("✅ Weight tying reapplied.")
 
-        # 검증
+        # Verify weight tying status
         is_tied = model.output_projection.weight is model.token_embedding.weight
-        print(f"Weight tying verified: {is_tied}")
+        if weight_tying_enabled:
+            print(f"Weight tying verified: {is_tied} (expected: True)")
+            if not is_tied:
+                print("⚠️ WARNING: Weight tying failed even though it's enabled in config!")
+        else:
+            print(f"Weight tying verified: {is_tied} (expected: False - disabled in config)")
+            if is_tied:
+                print("⚠️ WARNING: Weights are still tied even though weight_tying=False in config.")
 
         model.eval()
         

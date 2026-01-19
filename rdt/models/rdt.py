@@ -676,12 +676,14 @@ class RDT(nn.Module):
         rope_base: float = 10000.0,
         # Training
         total_steps: int = 20,
-        gradient_checkpointing: bool = False
+        gradient_checkpointing: bool = False,
+        weight_tying: bool = True
     ):
         super().__init__()
         self.d_model = d_model
         self.total_steps = total_steps
         self.gradient_checkpointing = gradient_checkpointing
+        self.weight_tying = weight_tying
         
         # Token Embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -736,8 +738,9 @@ class RDT(nn.Module):
             dropout=gate_dropout
         )
         
-        # Weight Tying
-        self.output_projection.weight = self.token_embedding.weight
+        # Weight Tying (conditional based on config)
+        if self.weight_tying:
+            self.output_projection.weight = self.token_embedding.weight
         
         self._init_weights()
 
@@ -747,8 +750,9 @@ class RDT(nn.Module):
                 nn.init.xavier_uniform_(p)
     
     def tie_weights(self):
-        """Tie output projection weights with token embedding"""
-        self.output_projection.weight = self.token_embedding.weight
+        """Tie output projection weights with token embedding (only if weight_tying is enabled)"""
+        if self.weight_tying:
+            self.output_projection.weight = self.token_embedding.weight
     
     def count_parameters(self):
         """Count total trainable parameters"""
