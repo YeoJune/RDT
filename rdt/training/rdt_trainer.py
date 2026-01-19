@@ -269,15 +269,15 @@ class RDTTrainer:
         # ============================================================================
         # Reconstruction: Token-weighted
         total_recon_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
-        total_recon_tokens = torch.tensor(0, device=self.accelerator.device)
+        total_recon_tokens = torch.tensor(0.0, device=self.accelerator.device)
         
         # Gate: Sample-weighted
         total_gate_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
-        total_gate_samples = torch.tensor(0, device=self.accelerator.device)
+        total_gate_samples = torch.tensor(0.0, device=self.accelerator.device)
         
         # Auxiliary: Token-weighted
         total_aux_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
-        total_aux_tokens = torch.tensor(0, device=self.accelerator.device)
+        total_aux_tokens = torch.tensor(0.0, device=self.accelerator.device)
         
         # Accuracy
         total_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
@@ -291,7 +291,7 @@ class RDTTrainer:
         h_0 = self.model.encode(input_tokens, attention_mask)
         
         # 2. Gate prediction for h_0: gate_0, pooled_0
-        gate_0, pooled_0 = raw_model.gate(
+        gate_0, pooled_0 = self.model.gate(
             h_0,
             attention_mask,
             prev_pooled=None,
@@ -335,7 +335,7 @@ class RDTTrainer:
             gt_timestep = gt_timestep + gt_noise
             
             # Forward: h_i → h_{i+1}
-            hidden, gate_pred, pooled = raw_model.forward(
+            hidden, gate_pred, pooled = self.model.forward(
                 x=hidden,
                 attention_mask=attention_mask,
                 is_first_step=False,
@@ -352,7 +352,7 @@ class RDTTrainer:
             step_loss_mask = loss_masks[:, step_idx, :]
             
             # [A] Reconstruction Loss & Accuracy (Token-weighted)
-            logits_pred = raw_model.decode(hidden, attention_mask)
+            logits_pred = self.model.decode(hidden, attention_mask)
             
             # Accuracy calculation (EM)
             pred_tokens = logits_pred.argmax(dim=-1)
@@ -399,8 +399,8 @@ class RDTTrainer:
             if self.loss_weight_aux > 0:
                 aux_mask = step_loss_mask[:aux_batch_size]
                 with torch.no_grad():
-                    h_GT = raw_model.encode(step_targets[:aux_batch_size], attention_mask[:aux_batch_size])
-                    logits_GT = raw_model.decode(h_GT, attention_mask[:aux_batch_size])
+                    h_GT = self.model.encode(step_targets[:aux_batch_size], attention_mask[:aux_batch_size])
+                    logits_GT = self.model.decode(h_GT, attention_mask[:aux_batch_size])
                     target_dist = torch.softmax(logits_GT / self.aux_temp, dim=-1)
                 
                 log_probs_pred = torch.log_softmax(logits_pred[:aux_batch_size] / self.aux_temp, dim=-1)
@@ -533,10 +533,10 @@ class RDTTrainer:
                 # ================================================================
                 
                 # 1. Encode: tokens → h_0
-                h_0 = raw_model.encode(input_tokens, attention_mask)
+                h_0 = self.model.encode(input_tokens, attention_mask)
                 
                 # 2. Gate prediction for h_0: gate_0, pooled_0
-                gate_0, pooled_0 = raw_model.gate(
+                gate_0, pooled_0 = self.model.gate(
                     h_0,
                     attention_mask,
                     prev_pooled=None,
@@ -573,7 +573,7 @@ class RDTTrainer:
                         break
                     
                     # Forward: h_i → h_{i+1}
-                    hidden, gate_pred, pooled = raw_model.forward(
+                    hidden, gate_pred, pooled = self.model.forward(
                         x=hidden,
                         attention_mask=attention_mask,
                         is_first_step=False,
@@ -587,7 +587,7 @@ class RDTTrainer:
                     step_targets = targets[:, step_idx, :]
                     step_loss_mask = loss_masks[:, step_idx, :]
                     
-                    logits = raw_model.decode(hidden, attention_mask)
+                    logits = self.model.decode(hidden, attention_mask)
                     
                     # Accuracy
                     pred_tokens = logits.argmax(dim=-1)
