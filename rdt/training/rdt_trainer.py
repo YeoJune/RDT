@@ -242,7 +242,6 @@ class RDTTrainer:
             accuracy: Token-level accuracy
         """
         self.model.train()
-        raw_model = self.accelerator.unwrap_model(self.model)
 
         # Load data
         input_tokens = batch['input']
@@ -493,7 +492,6 @@ class RDTTrainer:
             avg_accuracy: Token-level accuracy
         """
         self.model.eval()
-        raw_model = self.accelerator.unwrap_model(self.model)
         
         # ✅ Global accumulators with token/sample weighting
         total_recon_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
