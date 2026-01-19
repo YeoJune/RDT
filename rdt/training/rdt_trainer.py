@@ -32,6 +32,9 @@ class RDTTrainer:
 
         self.train_loader = train_loader
         self.val_loader = val_loader
+
+        tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         
         # Training config
         self.training_mode = config['training'].get('training_mode', 'epoch')
@@ -229,14 +232,14 @@ class RDTTrainer:
 
     def train_step(self, batch: Dict) -> Tuple[float, float, float, float, float]:
         """
-        Standard loss computation with separate counters for each metric.
+        Standard loss computation with token-weighted averaging (MLM standard).
         
         Returns:
             final_loss: Total weighted loss (used for backprop)
-            avg_recon: Average reconstruction loss (for logging)
-            avg_gate: Average gate loss (for logging)
-            avg_aux: Average auxiliary loss (for logging)
-            accuracy: Token-level accuracy (for logging)
+            avg_recon: Average reconstruction loss (token-weighted)
+            avg_gate: Average gate loss (sample-weighted)
+            avg_aux: Average auxiliary loss (token-weighted)
+            accuracy: Token-level accuracy
         """
         self.model.train()
         raw_model = self.accelerator.unwrap_model(self.model)
@@ -262,25 +265,30 @@ class RDTTrainer:
         aux_batch_size = max(1, int(batch_size * self.aux_ratio))
         
         # ============================================================================
-        # Loss accumulation with separate counters
+        # ✅ Token-weighted and Sample-weighted Loss Accumulation (MLM Standard)
         # ============================================================================
-        total_recon_loss = torch.tensor(0.0, device=self.accelerator.device)
-        total_gate_loss = torch.tensor(0.0, device=self.accelerator.device)
-        total_aux_loss = torch.tensor(0.0, device=self.accelerator.device)
+        # Reconstruction: Token-weighted
+        total_recon_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
+        total_recon_tokens = torch.tensor(0, device=self.accelerator.device)
         
+        # Gate: Sample-weighted
+        total_gate_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
+        total_gate_samples = torch.tensor(0, device=self.accelerator.device)
+        
+        # Auxiliary: Token-weighted
+        total_aux_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
+        total_aux_tokens = torch.tensor(0, device=self.accelerator.device)
+        
+        # Accuracy
         total_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
         total_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
-        
-        num_recon_steps = 0
-        num_gate_steps = 0
-        num_aux_steps = 0
         
         # ============================================================================
         # STEP 0: Manual First Forward (tokens → h_0 → h_1)
         # ============================================================================
         
         # 1. Encode: tokens → h_0
-        h_0 = raw_model.encode(input_tokens, attention_mask)
+        h_0 = self.model.encode(input_tokens, attention_mask)
         
         # 2. Gate prediction for h_0: gate_0, pooled_0
         gate_0, pooled_0 = raw_model.gate(
@@ -292,9 +300,22 @@ class RDTTrainer:
         
         # 3. Gate loss for gate_0 (predicting step 0's noise level)
         gate_target_0 = gate_targets[:, 0].unsqueeze(1)
-        gate_loss_0 = torch.nn.functional.mse_loss(gate_0, gate_target_0)
-        total_gate_loss += gate_loss_0
-        num_gate_steps += 1
+        
+        if self.is_tpu:
+            gate_loss_raw_0 = torch.nn.functional.mse_loss(
+                gate_0, gate_target_0, reduction='none'
+            )
+            # All samples are valid for step 0
+            num_samples_0 = torch.tensor(batch_size, dtype=torch.float, device=self.accelerator.device)
+            gate_loss_sum_0 = gate_loss_raw_0.sum()
+        else:
+            gate_loss_sum_0 = torch.nn.functional.mse_loss(
+                gate_0, gate_target_0, reduction='sum'
+            )
+            num_samples_0 = torch.tensor(batch_size, dtype=torch.float, device=self.accelerator.device)
+        
+        total_gate_loss_raw += gate_loss_sum_0
+        total_gate_samples += num_samples_0
 
         # Update state for next steps
         hidden, gate_pred, pooled = h_0, gate_0, pooled_0
@@ -330,7 +351,7 @@ class RDTTrainer:
             step_targets = targets[:, step_idx, :]
             step_loss_mask = loss_masks[:, step_idx, :]
             
-            # [A] Reconstruction Loss & Accuracy
+            # [A] Reconstruction Loss & Accuracy (Token-weighted)
             logits_pred = raw_model.decode(hidden, attention_mask)
             
             # Accuracy calculation (EM)
@@ -345,25 +366,36 @@ class RDTTrainer:
                     total_correct_tokens += correct
                     total_target_tokens += step_loss_mask.sum().float()
             
-            # Loss calculation
+            # ✅ Token-weighted Loss (MLM Standard)
             if self.is_tpu:
                 loss_per_token = torch.nn.functional.cross_entropy(
-                    logits_pred.transpose(1, 2), step_targets, reduction='none'
+                    logits_pred.transpose(1, 2), step_targets, 
+                    reduction='none',
+                    ignore_index=self.pad_token_id  # ✅ Added for efficiency
                 )
                 mask_float = step_loss_mask.float()
-                recon_loss = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
+                step_recon_loss_sum = (loss_per_token * mask_float).sum()
+                step_num_tokens = mask_float.sum()
             else:
                 if step_loss_mask.sum() > 0:
-                    recon_loss = self.recon_criterion(
-                        logits_pred[step_loss_mask], step_targets[step_loss_mask]
+                    # Use reduction='sum' for token-weighted averaging
+                    criterion_sum = torch.nn.CrossEntropyLoss(
+                        ignore_index=self.pad_token_id, 
+                        reduction='sum'
                     )
+                    step_recon_loss_sum = criterion_sum(
+                        logits_pred[step_loss_mask], 
+                        step_targets[step_loss_mask]
+                    )
+                    step_num_tokens = step_loss_mask.sum().float()
                 else:
-                    recon_loss = torch.tensor(0.0, device=self.accelerator.device)
+                    step_recon_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+                    step_num_tokens = torch.tensor(0.0, device=self.accelerator.device)
             
-            total_recon_loss += recon_loss
-            num_recon_steps += 1
+            total_recon_loss_raw += step_recon_loss_sum
+            total_recon_tokens += step_num_tokens
             
-            # [B] Auxiliary Loss
+            # [B] Auxiliary Loss (Token-weighted)
             if self.loss_weight_aux > 0:
                 aux_mask = step_loss_mask[:aux_batch_size]
                 with torch.no_grad():
@@ -375,46 +407,61 @@ class RDTTrainer:
                 
                 if self.is_tpu:
                     kl_loss_all = target_dist * (torch.log(target_dist + 1e-9) - log_probs_pred)
-                    kl_per_token = kl_loss_all.sum(dim=-1)
+                    kl_per_token = kl_loss_all.sum(dim=-1)  # [B_aux, L]
                     aux_mask_float = aux_mask.float()
-                    aux_kl = (kl_per_token * aux_mask_float).sum() / (aux_mask_float.sum() + 1e-6)
+                    step_aux_loss_sum = (kl_per_token * aux_mask_float).sum()
+                    step_aux_tokens = aux_mask_float.sum()
                 else:
                     if aux_mask.sum() > 0:
                         kl_criterion = torch.nn.KLDivLoss(reduction='none')
-                        kl_per_token = kl_criterion(log_probs_pred, target_dist).sum(dim=-1)
-                        aux_kl = kl_per_token[aux_mask].mean()
+                        kl_per_token = kl_criterion(log_probs_pred, target_dist).sum(dim=-1)  # [B_aux, L]
+                        step_aux_loss_sum = kl_per_token[aux_mask].sum()
+                        step_aux_tokens = aux_mask.sum().float()
                     else:
-                        aux_kl = torch.tensor(0.0, device=self.accelerator.device)
+                        step_aux_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+                        step_aux_tokens = torch.tensor(0.0, device=self.accelerator.device)
                 
-                aux_kl = aux_kl * (self.aux_temp ** 2)
-                total_aux_loss += aux_kl
-                num_aux_steps += 1
+                step_aux_loss_sum = step_aux_loss_sum * (self.aux_temp ** 2)
+                total_aux_loss_raw += step_aux_loss_sum
+                total_aux_tokens += step_aux_tokens
             
-            # [C] Gate Loss (predicting next step's noise level)
+            # [C] Gate Loss (Sample-weighted)
             gate_target_next = gate_targets[:, step_idx + 1].unsqueeze(1)
+            
             if self.is_tpu:
                 gate_loss_raw = torch.nn.functional.mse_loss(
                     gate_pred, gate_target_next, reduction='none'
                 )
                 valid_mask_float = valid_mask.float().unsqueeze(1)
-                gate_loss = (gate_loss_raw * valid_mask_float).sum() / (valid_mask_float.sum() + 1e-6)
+                step_gate_loss_sum = (gate_loss_raw * valid_mask_float).sum()
+                step_num_samples = valid_mask_float.sum()
             else:
                 if valid_mask.sum() > 0:
-                    gate_loss = self.gate_criterion(gate_pred[valid_mask], gate_target_next[valid_mask])
+                    step_gate_loss_sum = torch.nn.functional.mse_loss(
+                        gate_pred[valid_mask], 
+                        gate_target_next[valid_mask], 
+                        reduction='sum'
+                    )
+                    step_num_samples = valid_mask.sum().float()
                 else:
-                    gate_loss = torch.tensor(0.0, device=self.accelerator.device)
+                    step_gate_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+                    step_num_samples = torch.tensor(0.0, device=self.accelerator.device)
             
-            total_gate_loss += gate_loss
-            num_gate_steps += 1
+            total_gate_loss_raw += step_gate_loss_sum
+            total_gate_samples += step_num_samples
         
         # ============================================================================
-        # Final Loss Calculation (Standard Weighted Average)
+        # ✅ Final Loss Calculation (Token/Sample-weighted Averages - MLM Standard)
         # ============================================================================
         
-        # Average each metric by its own counter
-        avg_recon = total_recon_loss / max(num_recon_steps, 1)
-        avg_gate = total_gate_loss / max(num_gate_steps, 1)
-        avg_aux = total_aux_loss / max(num_aux_steps, 1) if num_aux_steps > 0 else torch.tensor(0.0, device=self.accelerator.device)
+        # Token-weighted average for reconstruction
+        avg_recon = total_recon_loss_raw / (total_recon_tokens + 1e-6)
+        
+        # Sample-weighted average for gate
+        avg_gate = total_gate_loss_raw / (total_gate_samples + 1e-6)
+        
+        # Token-weighted average for auxiliary
+        avg_aux = total_aux_loss_raw / (total_aux_tokens + 1e-6) if total_aux_tokens > 0 else torch.tensor(0.0, device=self.accelerator.device)
         
         # Weighted sum for backprop
         final_loss = (
@@ -434,25 +481,29 @@ class RDTTrainer:
             accuracy.detach()
         )
 
+
     def validate(self) -> Tuple[float, float, float, float]:
         """
-        Standard validation with consistent loss computation.
+        Standard validation with token/sample-weighted loss computation.
         
         Returns:
             avg_total_loss: Weighted average of all losses
-            avg_recon_loss: Average reconstruction loss
-            avg_gate_loss: Average gate loss
+            avg_recon_loss: Average reconstruction loss (token-weighted)
+            avg_gate_loss: Average gate loss (sample-weighted)
             avg_accuracy: Token-level accuracy
         """
         self.model.eval()
         raw_model = self.accelerator.unwrap_model(self.model)
         
-        # Global accumulators across all batches
-        total_loss = 0.0
-        total_recon = 0.0
-        total_gate = 0.0
-        total_accuracy = 0.0
-        num_batches = 0
+        # ✅ Global accumulators with token/sample weighting
+        total_recon_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
+        total_recon_tokens = torch.tensor(0, device=self.accelerator.device)
+        
+        total_gate_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
+        total_gate_samples = torch.tensor(0, device=self.accelerator.device)
+        
+        total_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
+        total_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
         
         with torch.no_grad():
             val_iter = self.val_loader
@@ -469,22 +520,13 @@ class RDTTrainer:
                 gate_targets = batch['gate_targets']
                 chain_lengths = batch['chain_lengths']
                 
+                batch_size = input_tokens.shape[0]
+                
                 # [TPU Optimization] max_length 계산
                 if self.is_tpu:
                     actual_max_length = self.config['training']['max_chain_length']
                 else:
                     actual_max_length = chain_lengths.max().item()
-                
-                # ================================================================
-                # Per-batch loss accumulation with separate counters
-                # ================================================================
-                batch_recon_loss = torch.tensor(0.0, device=self.accelerator.device)
-                batch_gate_loss = torch.tensor(0.0, device=self.accelerator.device)
-                batch_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
-                batch_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
-                
-                num_recon_steps = 0
-                num_gate_steps = 0
                 
                 # ================================================================
                 # STEP 0: Manual First Forward (tokens → h_0 → h_1)
@@ -503,9 +545,21 @@ class RDTTrainer:
                 
                 # 3. Gate loss for gate_0
                 gate_target_0 = gate_targets[:, 0].unsqueeze(1)
-                gate_loss_0 = self.gate_criterion(gate_0, gate_target_0)
-                batch_gate_loss += gate_loss_0
-                num_gate_steps += 1
+                
+                if self.is_tpu:
+                    gate_loss_raw_0 = torch.nn.functional.mse_loss(
+                        gate_0, gate_target_0, reduction='none'
+                    )
+                    num_samples_0 = torch.tensor(batch_size, dtype=torch.float, device=self.accelerator.device)
+                    gate_loss_sum_0 = gate_loss_raw_0.sum()
+                else:
+                    gate_loss_sum_0 = torch.nn.functional.mse_loss(
+                        gate_0, gate_target_0, reduction='sum'
+                    )
+                    num_samples_0 = torch.tensor(batch_size, dtype=torch.float, device=self.accelerator.device)
+                
+                total_gate_loss_raw += gate_loss_sum_0
+                total_gate_samples += num_samples_0
                 
                 # Update state for next steps
                 hidden, gate_pred, pooled = h_0, gate_0, pooled_0
@@ -513,7 +567,7 @@ class RDTTrainer:
                 # ================================================================
                 # STEP 1 to actual_max_length: Recursive Steps
                 # ================================================================
-                for step_idx in range(1, actual_max_length):
+                for step_idx in range(0, actual_max_length):
                     valid_mask = chain_lengths > step_idx
                     if not self.is_tpu and valid_mask.sum() == 0:
                         break
@@ -533,98 +587,111 @@ class RDTTrainer:
                     step_targets = targets[:, step_idx, :]
                     step_loss_mask = loss_masks[:, step_idx, :]
                     
+                    logits = raw_model.decode(hidden, attention_mask)
+                    
+                    # Accuracy
+                    pred_tokens = logits.argmax(dim=-1)
                     if self.is_tpu:
-                        logits = raw_model.decode(hidden, attention_mask)
-                        
-                        # Accuracy
-                        pred_tokens = logits.argmax(dim=-1)
                         correct = (pred_tokens == step_targets).float() * step_loss_mask.float()
-                        batch_correct_tokens += correct.sum()
-                        batch_target_tokens += step_loss_mask.float().sum()
-                        
-                        # Recon loss
-                        loss_per_token = torch.nn.functional.cross_entropy(
-                            logits.transpose(1, 2), step_targets, reduction='none'
-                        )
-                        mask_float = step_loss_mask.float()
-                        recon_loss = (loss_per_token * mask_float).sum() / (mask_float.sum() + 1e-6)
+                        total_correct_tokens += correct.sum()
+                        total_target_tokens += step_loss_mask.float().sum()
                     else:
                         if step_loss_mask.sum() > 0:
-                            logits = raw_model.decode(hidden, attention_mask)
-                            sel_logits = logits[step_loss_mask]
-                            sel_targ = step_targets[step_loss_mask]
-                            recon_loss = self.recon_criterion(sel_logits, sel_targ)
-                            
-                            # Accuracy calculation (EM)
-                            pred_tokens = logits.argmax(dim=-1)
                             correct = (pred_tokens[step_loss_mask] == step_targets[step_loss_mask]).float().sum()
-                            batch_correct_tokens += correct
-                            batch_target_tokens += step_loss_mask.sum().float()
+                            total_correct_tokens += correct
+                            total_target_tokens += step_loss_mask.sum().float()
+                    
+                    # ✅ Token-weighted Recon Loss
+                    if self.is_tpu:
+                        loss_per_token = torch.nn.functional.cross_entropy(
+                            logits.transpose(1, 2), step_targets, 
+                            reduction='none',
+                            ignore_index=self.pad_token_id  # ✅ Added
+                        )
+                        mask_float = step_loss_mask.float()
+                        step_recon_loss_sum = (loss_per_token * mask_float).sum()
+                        step_num_tokens = mask_float.sum()
+                    else:
+                        if step_loss_mask.sum() > 0:
+                            criterion_sum = torch.nn.CrossEntropyLoss(
+                                ignore_index=self.pad_token_id, 
+                                reduction='sum'
+                            )
+                            step_recon_loss_sum = criterion_sum(
+                                logits[step_loss_mask], 
+                                step_targets[step_loss_mask]
+                            )
+                            step_num_tokens = step_loss_mask.sum().float()
                         else:
-                            recon_loss = torch.tensor(0.0, device=self.accelerator.device)
+                            step_recon_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+                            step_num_tokens = torch.tensor(0.0, device=self.accelerator.device)
                     
-                    batch_recon_loss += recon_loss
-                    num_recon_steps += 1
+                    total_recon_loss_raw += step_recon_loss_sum
+                    total_recon_tokens += step_num_tokens
                     
-                    # Gate loss
+                    # ✅ Sample-weighted Gate loss
                     gate_target_next = gate_targets[:, step_idx + 1].unsqueeze(1)
+                    
                     if self.is_tpu:
                         gate_loss_raw = torch.nn.functional.mse_loss(
                             gate_pred, gate_target_next, reduction='none'
                         )
                         valid_mask_float = valid_mask.float().unsqueeze(1)
-                        gate_loss = (gate_loss_raw * valid_mask_float).sum() / (valid_mask_float.sum() + 1e-6)
+                        step_gate_loss_sum = (gate_loss_raw * valid_mask_float).sum()
+                        step_num_samples = valid_mask_float.sum()
                     else:
                         if valid_mask.sum() > 0:
-                            gate_loss = self.gate_criterion(gate_pred[valid_mask], gate_target_next[valid_mask])
+                            step_gate_loss_sum = torch.nn.functional.mse_loss(
+                                gate_pred[valid_mask], 
+                                gate_target_next[valid_mask], 
+                                reduction='sum'
+                            )
+                            step_num_samples = valid_mask.sum().float()
                         else:
-                            gate_loss = torch.tensor(0.0, device=self.accelerator.device)
+                            step_gate_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+                            step_num_samples = torch.tensor(0.0, device=self.accelerator.device)
                     
-                    batch_gate_loss += gate_loss
-                    num_gate_steps += 1
-                
-                # ================================================================
-                # Batch-level averaging (consistent with training)
-                # ================================================================
-                if num_recon_steps > 0 and num_gate_steps > 0:
-                    avg_recon = (batch_recon_loss / num_recon_steps).item()
-                    avg_gate = (batch_gate_loss / num_gate_steps).item()
-                    avg_total = self.loss_weight_recon * avg_recon + self.loss_weight_gate * avg_gate
-                    batch_acc = (batch_correct_tokens / (batch_target_tokens + 1e-6)).item()
-                    
-                    total_loss += avg_total
-                    total_recon += avg_recon
-                    total_gate += avg_gate
-                    total_accuracy += batch_acc
-                    num_batches += 1
-            
-            if num_batches == 0:
-                return 0.0, 0.0, 0.0, 0.0
+                    total_gate_loss_raw += step_gate_loss_sum
+                    total_gate_samples += step_num_samples
             
             # ================================================================
-            # Distributed gathering (average across all processes)
+            # ✅ Final Averaging (Token/Sample-weighted - MLM Standard)
             # ================================================================
-            total_loss_tensor = torch.tensor(total_loss, device=self.accelerator.device)
-            total_recon_tensor = torch.tensor(total_recon, device=self.accelerator.device)
-            total_gate_tensor = torch.tensor(total_gate, device=self.accelerator.device)
-            total_accuracy_tensor = torch.tensor(total_accuracy, device=self.accelerator.device)
-            num_batches_tensor = torch.tensor(num_batches, device=self.accelerator.device)
             
-            total_loss_tensor = self.accelerator.gather(total_loss_tensor).sum()
-            total_recon_tensor = self.accelerator.gather(total_recon_tensor).sum()
-            total_gate_tensor = self.accelerator.gather(total_gate_tensor).sum()
-            total_accuracy_tensor = self.accelerator.gather(total_accuracy_tensor).sum()
-            num_batches_tensor = self.accelerator.gather(num_batches_tensor).sum()
+            # Token-weighted average for reconstruction
+            avg_recon = total_recon_loss_raw / (total_recon_tokens + 1e-6)
             
-            if num_batches_tensor == 0:
+            # Sample-weighted average for gate
+            avg_gate = total_gate_loss_raw / (total_gate_samples + 1e-6)
+            
+            # Token-level accuracy
+            avg_accuracy = total_correct_tokens / (total_target_tokens + 1e-6)
+            
+            # Total loss (weighted sum)
+            avg_total = self.loss_weight_recon * avg_recon + self.loss_weight_gate * avg_gate
+            
+            # ================================================================
+            # Distributed gathering (sum raw values, then average)
+            # ================================================================
+            total_recon_loss_raw = self.accelerator.gather(total_recon_loss_raw).sum()
+            total_recon_tokens = self.accelerator.gather(total_recon_tokens).sum()
+            
+            total_gate_loss_raw = self.accelerator.gather(total_gate_loss_raw).sum()
+            total_gate_samples = self.accelerator.gather(total_gate_samples).sum()
+            
+            total_correct_tokens = self.accelerator.gather(total_correct_tokens).sum()
+            total_target_tokens = self.accelerator.gather(total_target_tokens).sum()
+            
+            # Final averages after gathering
+            if total_recon_tokens == 0 or total_gate_samples == 0:
                 return 0.0, 0.0, 0.0, 0.0
             
-            return (
-                (total_loss_tensor / num_batches_tensor).item(),
-                (total_recon_tensor / num_batches_tensor).item(),
-                (total_gate_tensor / num_batches_tensor).item(),
-                (total_accuracy_tensor / num_batches_tensor).item()
-            )
+            final_avg_recon = (total_recon_loss_raw / total_recon_tokens).item()
+            final_avg_gate = (total_gate_loss_raw / total_gate_samples).item()
+            final_avg_accuracy = (total_correct_tokens / total_target_tokens).item()
+            final_avg_total = self.loss_weight_recon * final_avg_recon + self.loss_weight_gate * final_avg_gate
+            
+            return final_avg_total, final_avg_recon, final_avg_gate, final_avg_accuracy
 
     def get_curriculum_progress(self) -> float:
         """
