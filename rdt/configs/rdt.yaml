@@ -7,7 +7,7 @@ model_type: "rdt" # 'rdt' or 'mlm'
 model:
   d_model: 512 # Hidden dimension (auto-set from BERT if use_bert_init=true)
   n_heads: 8 # Attention heads (d_model / 64)
-  n_encoder_layers: 4 # Main encoder depth (recursive)
+  n_encoder_layers: 6 # Main encoder depth (recursive)
   d_ff: 2048 # FFN dimension (4x d_model)
   dropout: 0.1
 
@@ -29,10 +29,10 @@ model:
   gradient_checkpointing: false # Enable gradient checkpointing to save memory
 
   # Weight Tying
-  weight_tying: false # Tie output projection weights with token embedding (reduces params, improves training)
+  weight_tying: true # Tie output projection weights with token embedding (reduces params, improves training)
 
   # BERT Weight Initialization
-  use_bert_init: false # Initialize from pretrained BERT
+  use_bert_init: true # Initialize from pretrained BERT
   bert_model_name: "prajjwal1/bert-medium" # 8 layers, 512-dim (perfect for n_encoder_layers=6)
   # Options:
   #   - "prajjwal1/bert-medium": 8 layers, 512-dim → n_encoder_layers=6
@@ -55,7 +55,7 @@ training:
 
   # BERT-style masking (for masked tokens)
   bert_masking:
-    enabled: false # BERT 스타일 마스킹 활성화 여부
+    enabled: true # BERT 스타일 마스킹 활성화 여부
     mask_prob: 0.8 # [MASK] 토큰으로 대체할 확률
     random_prob: 0.1 # 랜덤 토큰으로 대체할 확률
     keep_prob: 0.1 # 원본 유지 확률 (합: 1.0)
@@ -100,7 +100,7 @@ data:
   tokenizer_name: "bert-base-uncased" # Using standard BERT tokenizer
 
   # DataLoader
-  num_workers: 2
+  num_workers: 4
   pin_memory: true
   cache_dir: "./data_cache"
 
