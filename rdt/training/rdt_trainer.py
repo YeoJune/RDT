@@ -517,10 +517,10 @@ class RDTTrainer:
         
         # ✅ Global accumulators with token/sample weighting
         total_recon_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
-        total_recon_tokens = torch.tensor(0, device=self.accelerator.device)
+        total_recon_tokens = torch.tensor(0.0, device=self.accelerator.device)
         
         total_gate_loss_raw = torch.tensor(0.0, device=self.accelerator.device)
-        total_gate_samples = torch.tensor(0, device=self.accelerator.device)
+        total_gate_samples = torch.tensor(0.0, device=self.accelerator.device)
         
         total_correct_tokens = torch.tensor(0.0, device=self.accelerator.device)
         total_target_tokens = torch.tensor(0.0, device=self.accelerator.device)
