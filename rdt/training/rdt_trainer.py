@@ -352,7 +352,7 @@ class RDTTrainer:
             
             # GT timestep for this step
             gt_timestep = gate_targets[:, step_idx].unsqueeze(1)
-            gt_noise = torch.randn_like(gt_timestep) * 0.2
+            gt_noise = torch.randn_like(gt_timestep) * 0.1
             gt_timestep = gt_timestep + gt_noise
             
             # Forward: h_i → h_{i+1}
