@@ -941,6 +941,9 @@ class RDT(nn.Module):
             else:
                 noise_i = last_gate_score.detach()
 
+            if gt_timestep is None:
+                gt_timestep = last_gate_score
+
             noise_i = gt_timestep.detach() # TEMP: Disable scheduled sampling for stability
             
             # 2. Transform: h_i → h_{i+1}
