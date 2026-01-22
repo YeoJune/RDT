@@ -1,31 +1,248 @@
-"""RDT Model Architecture (Enhanced with AdaLN & Cross-Attention) - Diffusion Style"""
+"""RDT Model Architecture (Refactored with RoPE & Transformer I/O)"""
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
+from typing import List, Optional
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+# ============================================================================
+# Rotary Position Embedding (RoPE)
+# ============================================================================
+
+class RotaryPositionalEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) as described in RoFormer paper.
+    Reference: https://arxiv.org/abs/2104.09864
     
-    def forward(self, x):
-        seq_len = x.size(1)
-        pos_emb = self.pe[:seq_len, :].unsqueeze(0)
-        return self.dropout(x + pos_emb)
+    RoPE encodes position by rotating query/key vectors in pairs.
+    This implementation caches sin/cos values for efficiency.
+    """
+    def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        
+        # Precompute frequencies: theta_i = base^(-2i/d) for i in [0, d/2)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        
+        # Cache for sin/cos values
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
+        
+        # Build initial cache
+        self._build_cache(max_seq_len)
+    
+    def _build_cache(self, seq_len: int):
+        """Precompute and cache sin/cos values for positions [0, seq_len)"""
+        if seq_len > self._seq_len_cached:
+            self._seq_len_cached = seq_len
+            
+            # Position indices: [0, 1, 2, ..., seq_len-1]
+            t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+            
+            # Compute outer product: [seq_len, dim/2]
+            # freqs[pos, i] = pos * theta_i
+            freqs = torch.outer(t, self.inv_freq)
+            
+            # Compute sin and cos
+            # We'll interleave these: [cos, cos, ...], [sin, sin, ...]
+            # Shape: [seq_len, dim]
+            emb = torch.cat([freqs, freqs], dim=-1)  # Duplicate for interleaving
+            
+            self._cos_cached = emb.cos()
+            self._sin_cached = emb.sin()
+    
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Rotate half the hidden dims of the input.
+        
+        For x = [x0, x1, x2, x3, ...], returns [-x1, x0, -x3, x2, ...]
+        This corresponds to rotating by 90 degrees in each 2D plane.
+        """
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+        return torch.cat([-x2, x1], dim=-1)
+    
+    def forward(self, x: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
+        """
+        Apply rotary position embedding to input tensor.
+        
+        Args:
+            x: Input tensor of shape [..., seq_len, ..., dim]
+            seq_dim: Dimension index for sequence length (default: 1 for [B, L, ...])
+        
+        Returns:
+            Tensor with same shape as x, with rotary embeddings applied
+        """
+        seq_len = x.shape[seq_dim]
+        
+        # Rebuild cache if needed
+        if seq_len > self._seq_len_cached:
+            self._build_cache(seq_len)
+        
+        # Get cached values for current sequence length
+        # Shape: [seq_len, dim]
+        cos = self._cos_cached[:seq_len].to(x.device)
+        sin = self._sin_cached[:seq_len].to(x.device)
+        
+        # Reshape for broadcasting
+        # Need to match x's shape: [..., seq_len, ..., dim]
+        # We'll add dimensions as needed
+        shape = [1] * x.ndim
+        shape[seq_dim] = seq_len
+        shape[-1] = self.dim
+        
+        cos = cos.view(shape)
+        sin = sin.view(shape)
+        
+        # Apply rotation: x_rotated = x * cos + rotate_half(x) * sin
+        return x * cos + self._rotate_half(x) * sin
+
+
+# ============================================================================
+# Transformer Encoder Processor
+# ============================================================================
+
+class TransformerEncoderLayer(nn.Module):
+    """
+    Single Transformer Encoder Layer with RoPE
+    
+    Architecture: Self-Attention -> Add & Norm -> FFN -> Add & Norm
+    """
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        rope_layer: nn.Module,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        
+        # Self-Attention with RoPE
+        self.self_attn = RoPESelfAttention(d_model, n_heads, rope_layer, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        # Feed-Forward Network
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass
+        
+        Args:
+            x: [B, L, d_model]
+            key_padding_mask: [B, L] where True means ignore (padding)
+        
+        Returns:
+            [B, L, d_model]
+        """
+        # Self-Attention
+        res = x
+        x_norm = self.norm1(x)
+        attn_out = self.self_attn(x_norm, key_padding_mask=key_padding_mask)
+        x = res + self.dropout1(attn_out)
+        
+        # Feed-Forward
+        res = x
+        x_norm = self.norm2(x)
+        ffn_out = self.ffn(x_norm)
+        x = res + self.dropout2(ffn_out)
+        
+        return x
+
+
+class TransformerProcessor(nn.Module):
+    """
+    Transformer Encoder for input/output processing.
+    
+    Uses standard transformer encoder layers with RoPE positional encoding.
+    
+    Args:
+        d_model: Model dimension
+        n_layers: Number of transformer layers
+        n_heads: Number of attention heads
+        d_ff: Feed-forward dimension
+        rope_layer: Rotary position embedding module
+        dropout: Dropout probability
+    """
+    def __init__(
+        self, 
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        d_ff: int,
+        rope_layer: nn.Module,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        
+        # Build transformer encoder layers
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(
+                d_model=d_model,
+                n_heads=n_heads,
+                d_ff=d_ff,
+                rope_layer=rope_layer,
+                dropout=dropout
+            )
+            for _ in range(n_layers)
+        ])
+        
+        self.norm = nn.LayerNorm(d_model)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using Xavier uniform"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass
+        
+        Args:
+            x: [B, L, d_model]
+            key_padding_mask: [B, L] where True means ignore (padding)
+        
+        Returns:
+            [B, L, d_model]
+        """
+        hidden = x
+        
+        for layer in self.layers:
+            hidden = layer(hidden, key_padding_mask=key_padding_mask)
+        
+        return self.norm(hidden)
+
+
+# ============================================================================
+# Core RDT Components
+# ============================================================================
 
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     Classic DDPM Style: Sinusoidal -> Linear -> SiLU -> Linear
     """
-    def __init__(self, hidden_dim, frequency_embedding_size=256):
+    def __init__(self, hidden_dim, frequency_embedding_size=256, scale_factor = 20.0):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_dim),
@@ -33,6 +250,8 @@ class TimestepEmbedder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.frequency_embedding_size = frequency_embedding_size
+        self.gate_scale = 20.0
+        self.scale_factor = scale_factor
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
@@ -41,84 +260,230 @@ class TimestepEmbedder(nn.Module):
         t: [Batch] (1D Tensor)
         dim: Output dimension
         """
-        # 1. Frequency 계산: exp(-log(10000) / (d-1))
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
         ).to(device=t.device)
         
-        # 2. Argument 계산: t * freq
-        # t가 [Batch, 1]로 들어올 수도 있으므로 차원 맞춤
         if t.dim() == 2:
-            t = t.squeeze(-1) # [Batch]
+            t = t.squeeze(-1)
             
         args = t[:, None].float() * freqs[None]
-        
-        # 3. Sin/Cos 결합
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         
-        # 4. 차원이 홀수일 경우 0 패딩 (안전장치)
         if dim % 2:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
             
         return embedding
 
     def forward(self, t):
-        # t: [Batch, 1] (0.0 ~ 1.0)
-        t_freq = self.timestep_embedding(t * 50, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t * self.scale_factor / self.gate_scale, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
-        return t_emb.unsqueeze(1) # [Batch, 1, Hidden]
+        return t_emb.unsqueeze(1)
+
 
 class AdaptiveLayerNorm(nn.Module):
     """
     Diffusion Style Adaptive LayerNorm (AdaLN)
-    Noise Embedding을 받아 LayerNorm의 Scale(gamma)과 Shift(beta)를 동적으로 제어
     """
     def __init__(self, d_model: int):
         super().__init__()
-        # elementwise_affine=False: 정적 파라미터 끔 (동적으로 생성할 것이므로)
         self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
-        
-        # 임베딩을 Scale & Shift로 변환
         self.proj = nn.Linear(d_model, d_model * 2)
         
-        # [Zero-Init Trick]
-        # 학습 초기에는 조건이 영향을 주지 않도록(Identity) 가중치를 0으로 초기화
+        # Zero-init for identity at start
         nn.init.constant_(self.proj.weight, 0)
         nn.init.constant_(self.proj.bias, 0)
 
     def forward(self, x, emb):
-        # emb: [Batch, 1, D] -> [Batch, D]
         if emb.dim() == 3:
             emb = emb.squeeze(1)
             
-        # Scale & Shift 예측
         gamma, beta = self.proj(emb).chunk(2, dim=1)
-        
-        # 차원 맞추기 (Broadcasting: [B, 1, D])
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)
         
-        # Modulation: Norm(x) * (1 + gamma) + beta
         return self.norm(x) * (1 + gamma) + beta
+
+class RoPESelfAttention(nn.Module):
+    """
+    Self-Attention with RoPE applied only to Q and K (NOT to V)
+    Optimized with F.scaled_dot_product_attention
+    """
+    def __init__(self, d_model: int, n_heads: int, rope_layer: nn.Module, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.rope = rope_layer
+        
+        # QKV projections
+        self.qkv_proj = nn.Linear(d_model, d_model * 3, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # Dropout for SDPA
+        self.dropout_p = dropout
+        self.out_dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None):
+        """
+        Args:
+            x: [B, L, D]
+            key_padding_mask: [B, L] where True means ignore (padding)
+        """
+        B, L, D = x.shape
+        
+        # 1. Project to Q, K, V
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # 2. Split heads: [B, L, n_heads, head_dim]
+        q = q.view(B, L, self.n_heads, self.head_dim)
+        k = k.view(B, L, self.n_heads, self.head_dim)
+        v = v.view(B, L, self.n_heads, self.head_dim)
+        
+        # 3. Apply RoPE to Q and K ONLY
+        q = self.rope(q, seq_dim=1)
+        k = self.rope(k, seq_dim=1)
+        
+        # 4. Transpose for attention: [B, n_heads, L, head_dim]
+        # F.scaled_dot_product_attention expects [B, H, L, D]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # 5. Scaled Dot Product Attention (Flash Attention applied automatically if available)
+        attn_mask = None
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, L] -> [B, 1, 1, L] for broadcasting
+            # SDPA supports boolean mask where True = masked out (ignore)
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
+        
+        # 6. Concatenate heads: [B, L, D]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, D)
+        
+        # 7. Output projection
+        output = self.out_proj(attn_output)
+        output = self.out_dropout(output)
+        
+        return output
+
+
+class RoPECrossAttention(nn.Module):
+    """
+    Cross-Attention with RoPE applied only to Q and K
+    Optimized with F.scaled_dot_product_attention
+    """
+    def __init__(self, d_model: int, n_heads: int, rope_layer: nn.Module, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.rope = rope_layer
+        
+        # Separate Q, K, V projections
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # Dropout for SDPA
+        self.dropout_p = dropout
+        self.out_dropout = nn.Dropout(dropout)
+        
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ):
+        """
+        Args:
+            query: [B, L_q, D]
+            key: [B, L_kv, D]
+            value: [B, L_kv, D]
+            key_padding_mask: [B, L_kv]
+        """
+        B, L_q, D = query.shape
+        L_kv = key.shape[1]
+        
+        # 1. Project Q, K, V
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+        
+        # 2. Split heads
+        q = q.view(B, L_q, self.n_heads, self.head_dim)
+        k = k.view(B, L_kv, self.n_heads, self.head_dim)
+        v = v.view(B, L_kv, self.n_heads, self.head_dim)
+        
+        # 3. Apply RoPE to Q and K only
+        q = self.rope(q, seq_dim=1)
+        k = self.rope(k, seq_dim=1)
+        
+        # 4. Transpose for attention: [B, n_heads, L, head_dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # 5. Scaled Dot Product Attention
+        attn_mask = None
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, L_kv] -> [B, 1, 1, L_kv]
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+        
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
+        
+        # 6. Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L_q, D)
+        
+        # 7. Output projection
+        output = self.out_proj(attn_output)
+        output = self.out_dropout(output)
+        
+        return output
 
 
 class DirectionalRecursiveBlock(nn.Module):
-    """Self-Attention + Optional Cross-Attention Block with AdaLN"""
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+    """Self-Attention + Optional Cross-Attention Block with AdaLN and RoPE"""
+    def __init__(
+        self, 
+        d_model: int, 
+        n_heads: int, 
+        d_ff: int, 
+        rope_layer: nn.Module,
+        dropout: float = 0.1
+    ):
         super().__init__()
         
-        # 1. Self-Attention (AdaLN 적용)
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        # Self-Attention with RoPE and AdaLN
+        self.self_attn = RoPESelfAttention(d_model, n_heads, rope_layer, dropout)
         self.norm1 = AdaptiveLayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         
-        # 2. Cross-Attention (Conditional, AdaLN 적용)
-        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        # Cross-Attention with RoPE and AdaLN
+        self.cross_attn = RoPECrossAttention(d_model, n_heads, rope_layer, dropout)
         self.norm2 = AdaptiveLayerNorm(d_model)
         self.dropout2 = nn.Dropout(dropout)
         
-        # 3. Feed-Forward (AdaLN 적용)
+        # Feed-Forward with AdaLN
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.GELU(),
@@ -130,34 +495,41 @@ class DirectionalRecursiveBlock(nn.Module):
 
     def forward(self, x, noise_emb, context=None, src_key_padding_mask=None, context_key_padding_mask=None):
         """
-        noise_emb: [B, 1, D] - 필수 입력 (Gate Embedding)
+        Args:
+            x: [B, L, D] - input hidden states
+            noise_emb: [B, 1, D] - noise level embedding for AdaLN
+            context: [B, L_ctx, D] - optional context for cross-attention
+            src_key_padding_mask: [B, L] - self-attention mask (True = ignore)
+            context_key_padding_mask: [B, L_ctx] - cross-attention mask (True = ignore)
+        
+        Returns:
+            [B, L, D] - output hidden states
         """
-        # Phase 1: Self-Attention
+        # Self-Attention with AdaLN
         res = x
-        x_norm = self.norm1(x, noise_emb) # AdaLN
-        attn_out, _ = self.self_attn(
-            x_norm, x_norm, x_norm, 
-            key_padding_mask=src_key_padding_mask, 
-            need_weights=False
-        )
+        x_norm = self.norm1(x, noise_emb)
+        
+        # RoPE is applied inside self_attn to Q and K only
+        attn_out = self.self_attn(x_norm, key_padding_mask=src_key_padding_mask)
         x = res + self.dropout1(attn_out)
         
-        # Phase 2: Cross-Attention
+        # Cross-Attention with AdaLN (if context provided)
         if context is not None:
             res = x
-            x_norm = self.norm2(x, noise_emb) # AdaLN
-            attn_out, _ = self.cross_attn(
-                query=x_norm, 
-                key=context, 
-                value=context, 
-                key_padding_mask=context_key_padding_mask, 
-                need_weights=False
+            x_norm = self.norm2(x, noise_emb)
+            
+            # RoPE is applied inside cross_attn to Q and K only
+            attn_out = self.cross_attn(
+                query=x_norm,
+                key=context,
+                value=context,
+                key_padding_mask=context_key_padding_mask
             )
             x = res + self.dropout2(attn_out)
         
-        # Phase 3: Feed-Forward
+        # Feed-Forward with AdaLN
         res = x
-        x_norm = self.norm3(x, noise_emb) # AdaLN
+        x_norm = self.norm3(x, noise_emb)
         ffn_out = self.ffn(x_norm)
         x = res + self.dropout3(ffn_out)
         
@@ -165,50 +537,124 @@ class DirectionalRecursiveBlock(nn.Module):
 
 
 class GateMLP(nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int = 256):
+    """
+    Gate with residual prediction using concatenated features
+    """
+    def __init__(self, d_model: int, hidden_dim: int = 512, num_layers: int = 3, 
+                 num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
-        # Attention-based pooling
-        self.attention = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.gate_scale = 20.0 # for numerical stability
         
-        # Gate prediction
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden_dim), 
-            nn.ReLU(), 
-            nn.Linear(hidden_dim, 1)
+        # Multi-head attention pooling
+        self.attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
         )
+        self.query = nn.Parameter(torch.randn(1, 1, d_model))
+        nn.init.normal_(self.query, std=0.02)
+        
+        # Fusion layer
+        self.fusion = nn.Linear(d_model * 2, hidden_dim)
+        
+        # N-layer MLP with residual connections
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            self.layers.append(nn.ModuleDict({
+                'linear': nn.Linear(hidden_dim, hidden_dim),
+                'norm': nn.LayerNorm(hidden_dim),
+                'dropout': nn.Dropout(dropout)
+            }))
+        
+        # Separate output heads
+        self.first_step_proj = nn.Linear(hidden_dim, 1)
+        self.delta_proj = nn.Linear(hidden_dim, 1)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.fusion.weight)
+        nn.init.zeros_(self.fusion.bias)
+        
+        for layer_dict in self.layers:
+            nn.init.xavier_uniform_(layer_dict['linear'].weight)
+            nn.init.zeros_(layer_dict['linear'].bias)
+        
+        nn.init.xavier_uniform_(self.first_step_proj.weight)
+        nn.init.constant_(self.first_step_proj.bias, self.gate_scale / 2)
+        
+        nn.init.xavier_uniform_(self.delta_proj.weight)
+        nn.init.constant_(self.delta_proj.bias, 1.0)
     
     def forward(self, x, mask=None, prev_pooled=None, prev_gate=None):
-        """
-        x: [B, L, D]
-        mask: [B, L] (1=valid, 0=padding)
-        """
-        if x.dim() == 2:  # Already pooled
-            return torch.sigmoid(self.mlp(x))
+        x = x.detach()
+        batch_size = x.size(0)
         
-        # Attention scores
-        attn_scores = self.attention(x).squeeze(-1)  # [B, L]
+        # Multi-head attention pooling
+        query = self.query.expand(batch_size, -1, -1)
+        key_padding_mask = (mask == 0) if mask is not None else None
         
-        # Mask out padding
-        if mask is not None:
-            # -1e4 is safer than -1e9 for fp16
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e4)
+        pooled, _ = self.attention(
+            query=query,
+            key=x,
+            value=x,
+            key_padding_mask=key_padding_mask,
+            need_weights=False
+        )
+        pooled = pooled.squeeze(1)
         
-        # Softmax
-        attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, L, 1]
+        # Concatenate with previous pooled features
+        if prev_pooled is None:
+            prev_pooled = torch.zeros_like(pooled)
+
+        prev_pooled = prev_pooled.detach()
         
-        # Weighted sum
-        pooled = (x * attn_weights).sum(dim=1)  # [B, D]
+        combined = torch.cat([pooled, prev_pooled], dim=-1)
         
-        raw_output = self.mlp(pooled)
-        gate_output = nn.functional.softplus(raw_output)
+        # Fusion layer
+        h = self.fusion(combined)
+        h = nn.functional.gelu(h)
         
-        return gate_output, None
+        # N-layer MLP processing
+        for i, layer_dict in enumerate(self.layers):
+            h_new = layer_dict['linear'](h)
+            h_new = layer_dict['norm'](h_new)
+            h_new = nn.functional.gelu(h_new)
+            h_new = layer_dict['dropout'](h_new)
+            
+            if i > 0:
+                h = h + h_new
+            else:
+                h = h_new
+        
+        # Output prediction
+        if prev_gate is None:
+            raw = self.first_step_proj(h)
+            decrease = nn.functional.softplus(raw)
+            gate_output = torch.clamp(self.gate_scale - decrease, min=0.0)
+        else:
+            raw = self.delta_proj(h)
+            delta = nn.functional.softplus(raw)
+            gate_output = torch.clamp(prev_gate - delta, min=0.0)
+        
+        return gate_output, pooled
+
+
+# ============================================================================
+# Main RDT Model (Refactored with RoPE & Transformer I/O)
+# ============================================================================
 
 class RDT(nn.Module):
+    """
+    Recursive Denoising Transformer with:
+    - RoPE for positional encoding
+    - Transformer Encoder for input/output processing
+    - AdaLN-based recursive blocks
+    """
     def __init__(
         self, 
         vocab_size: int,
@@ -235,81 +681,83 @@ class RDT(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
+        self.total_steps = total_steps
         self.gradient_checkpointing = gradient_checkpointing
+        self.weight_tying = weight_tying
         
-        # 1. Input Processing
+        # Token Embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
         
-        # Input Encoder (1-2 layer Transformer)
-        input_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, 
-            dropout=dropout, batch_first=True
+        # Rotary Position Embedding (RoPE)
+        # Each attention head gets its own rotary embedding
+        head_dim = d_model // n_heads
+        self.rope = RotaryPositionalEmbedding(
+            dim=head_dim,  # Use head dimension, not model dimension!
+            max_seq_len=max_seq_len,
+            base=rope_base
         )
-        self.input_encoder = nn.TransformerEncoder(input_encoder_layer, num_layers=input_processor_layers)
+        
+        # Input Processor (Transformer Encoder)
+        self.input_processor = TransformerProcessor(
+            d_model=d_model,
+            n_layers=input_processor_layers,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            rope_layer=self.rope,
+            dropout=dropout
+        )
         self.input_norm = nn.LayerNorm(d_model)
         
         # Noise Level Embedding
-        self.noise_emb = TimestepEmbedder(d_model, frequency_embedding_size=d_model)
+        self.noise_emb = TimestepEmbedder(d_model, frequency_embedding_size=d_model, scale_factor=total_steps)
         
-        # 2. Recursive Encoder (Using AdaLN Blocks)
+        # Recursive Encoder (AdaLN Blocks with RoPE)
         self.encoder_layers = nn.ModuleList([
-            DirectionalRecursiveBlock(d_model, n_heads, d_ff, dropout)
+            DirectionalRecursiveBlock(d_model, n_heads, d_ff, self.rope, dropout)
             for _ in range(n_encoder_layers)
         ])
         
-        # 3. Output Decoder (1-2 layer Transformer)
-        output_decoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, batch_first=True
+        # Output Processor (Transformer Encoder)
+        self.output_processor = TransformerProcessor(
+            d_model=d_model,
+            n_layers=output_processor_layers,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            rope_layer=self.rope,
+            dropout=dropout
         )
-        self.output_decoder = nn.TransformerEncoder(output_decoder_layer, num_layers=output_processor_layers)
-        self.output_projection = nn.Linear(d_model, vocab_size)
-            
-        self.gate = GateMLP(d_model, gate_hidden_dim)
         
-        # Weight Tying
-        self.output_projection.weight = self.token_embedding.weight
+        # Output Projection
+        self.output_projection = nn.Linear(d_model, vocab_size)
+        
+        # Gate Network
+        self.gate = GateMLP(
+            d_model=d_model,
+            hidden_dim=gate_hidden_dim,
+            num_layers=gate_num_layers,
+            num_heads=gate_num_heads,
+            dropout=gate_dropout
+        )
+        
+        # Weight Tying (conditional based on config)
+        if self.weight_tying:
+            self.output_projection.weight = self.token_embedding.weight
         
         self._init_weights()
 
     def _init_weights(self):
         for p in self.parameters():
-            if p.dim() > 1: 
+            if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
     
-    def decode(self, hidden, attention_mask=None):
-        """
-        Output Decoder: hidden -> logits
-        hidden: [B, L, D]
-        attention_mask: [B, L] (1=valid, 0=padding)
-        Returns: logits [B, L, vocab_size]
-        """
-        src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        decoded = self.output_decoder(hidden, src_key_padding_mask=src_key_padding_mask)
-        logits = self.output_projection(decoded)
-        return logits
-
-    def inference(self, x, context=None, max_steps=20, threshold=0.02):
-        self.eval()
-        with torch.no_grad():
-            hidden, gate_pred = self.forward(x, context=context, is_first_step=True)
-            step = 1
-            while step < max_steps and gate_pred.mean().item() > threshold:
-                hidden, gate_pred = self.forward(
-                    hidden, 
-                    context=context, 
-                    last_gate_score=gate_pred,
-                    is_first_step=False
-                )
-                step += 1
-            
-            # Use decode method
-            logits = self.decode(hidden)
-            output_tokens = logits.argmax(dim=-1)
-            
-        return output_tokens, step
+    def tie_weights(self):
+        """Tie output projection weights with token embedding (only if weight_tying is enabled)"""
+        if self.weight_tying:
+            self.output_projection.weight = self.token_embedding.weight
     
+    def count_parameters(self):
+        """Count total trainable parameters"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def encode(self, tokens, attention_mask=None):
         """
@@ -322,12 +770,12 @@ class RDT(nn.Module):
         Returns:
             h_0: [B, L, D] initial hidden states
         """
-        x = tokens
-        x = self.token_embedding(x) * math.sqrt(self.d_model)
-        x = self.pos_encoding(x)
-        # Input Encoder
-        src_key_padding_mask_temp = (attention_mask == 0) if attention_mask is not None else None
-        h_0 = self.input_encoder(x, src_key_padding_mask=src_key_padding_mask_temp)
+        # 1. Token embedding
+        x = self.token_embedding(tokens) * math.sqrt(self.d_model)
+        
+        # 2. Input processing (Transformer Encoder with RoPE)
+        key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        h_0 = self.input_processor(x, key_padding_mask=key_padding_mask)
         
         return h_0
 
@@ -345,41 +793,38 @@ class RDT(nn.Module):
         Returns:
             h_{i+1}: [B, L, D] next hidden states
         """
+        # 1. Create noise embedding
+        noise_vec = self.noise_emb(noise_level)
         
-        # Recursive Norm (Reset Distribution)
-        hidden = self.input_norm(hidden)
-
-        # 4. Create Noise Embedding (Condition)
-        # Additive Injection 제거 -> AdaLN을 위한 임베딩 생성만 함
-        noise_vec = self.noise_emb(noise_level)  # [B, 1, D]
-
-        # 5. Prepare Masks
+        # 2. Prepare mask
         src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-
-        # 6. Recursive Encoding with AdaLN
+        
+        # 3. Apply recursive encoder layers with AdaLN
+        h_next = hidden
         for layer in self.encoder_layers:
             if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
-                    def custom_forward(h, n_emb, c, sm, cm):
-                        # noise_emb를 블록 안으로 전달
-                        return module(h, noise_emb=n_emb, context=c, src_key_padding_mask=sm, context_key_padding_mask=cm)
+                    def custom_forward(h, n_emb, sm):
+                        return module(h, noise_emb=n_emb, context=None,
+                                    src_key_padding_mask=sm,
+                                    context_key_padding_mask=None)
                     return custom_forward
                 
-                hidden = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer), 
-                    hidden, noise_vec, None, src_key_padding_mask, None,
+                h_next = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    h_next, noise_vec, src_key_padding_mask,
                     use_reentrant=False
                 )
             else:
-                hidden = layer(
-                    hidden, 
-                    noise_emb=noise_vec, # [중요] AdaLN을 위해 전달
-                    context=None, 
-                    src_key_padding_mask=src_key_padding_mask, 
+                h_next = layer(
+                    h_next,
+                    noise_emb=noise_vec,
+                    context=None,
+                    src_key_padding_mask=src_key_padding_mask,
                     context_key_padding_mask=None
                 )
         
-        return hidden
+        return h_next
 
 
     def decode(self, hidden, attention_mask=None):
@@ -393,9 +838,13 @@ class RDT(nn.Module):
         Returns:
             logits: [B, L, vocab_size]
         """
-        src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        decoded = self.output_decoder(hidden, src_key_padding_mask=src_key_padding_mask)
-        logits = self.output_projection(decoded)
+        # 1. Output processing (Transformer Encoder with RoPE)
+        key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        processed = self.output_processor(hidden, key_padding_mask=key_padding_mask)
+        
+        # 2. Project to vocabulary
+        logits = self.output_projection(processed)
+        
         return logits
 
 
@@ -442,6 +891,7 @@ class RDT(nn.Module):
             
             # 1. Encode: tokens → h_0
             h_0 = self.encode(x, attention_mask)
+            h_0 = self.input_norm(h_0)
             
             # 2. Initial gate prediction: gate(h_0, None, None)
             gate_0, pooled_0 = self.gate(
@@ -476,7 +926,7 @@ class RDT(nn.Module):
             # SUBSEQUENT STEPS: h_i → h_{i+1} → gate_{i+1}
             # ============================================================
             
-            h_i = x  # x is already hidden states
+            h_i = self.input_norm(x)  # x is already hidden states
             
             # 1. Scheduled sampling for noise level
             if self.training and gt_timestep is not None:

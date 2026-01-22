@@ -554,6 +554,7 @@ class RDTTrainer:
                 
                 # 1. Encode: tokens → h_0
                 h_0 = self.model.encode(input_tokens, attention_mask)
+                h_0 = self.model.input_norm(h_0)
                 
                 # 2. Gate prediction for h_0: gate_0, pooled_0
                 gate_0, pooled_0 = self.model.gate(
