@@ -770,8 +770,7 @@ class RDT(nn.Module):
             h_0: [B, L, D] initial hidden states
         """
         # 1. Token embedding
-        x = self.token_embedding(tokens) * math.sqrt(self.d_model)
-        return x # TEMP: Skip input processor
+        x = self.token_embedding(tokens)
         
         # 2. Input processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
@@ -838,7 +837,6 @@ class RDT(nn.Module):
         Returns:
             logits: [B, L, vocab_size]
         """
-        return self.output_projection(hidden)  # TEMP: Skip output processor
     
         # 1. Output processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
