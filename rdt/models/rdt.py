@@ -644,82 +644,6 @@ class GateMLP(nn.Module):
         return gate_output, pooled
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-    
-    def forward(self, x):
-        seq_len = x.size(1)
-        pos_emb = self.pe[:seq_len, :].unsqueeze(0)
-        return self.dropout(x + pos_emb)
-
-class DirectionalRecursiveBlockT(nn.Module):
-    """Self-Attention + Optional Cross-Attention Block with AdaLN"""
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
-        super().__init__()
-        
-        # 1. Self-Attention (AdaLN 적용)
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.norm1 = AdaptiveLayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        
-        # 2. Cross-Attention (Conditional, AdaLN 적용)
-        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.norm2 = AdaptiveLayerNorm(d_model)
-        self.dropout2 = nn.Dropout(dropout)
-        
-        # 3. Feed-Forward (AdaLN 적용)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model)
-        )
-        self.norm3 = AdaptiveLayerNorm(d_model)
-        self.dropout3 = nn.Dropout(dropout)
-
-    def forward(self, x, noise_emb, context=None, src_key_padding_mask=None, context_key_padding_mask=None):
-        """
-        noise_emb: [B, 1, D] - 필수 입력 (Gate Embedding)
-        """
-        # Phase 1: Self-Attention
-        res = x
-        x_norm = self.norm1(x, noise_emb) # AdaLN
-        attn_out, _ = self.self_attn(
-            x_norm, x_norm, x_norm, 
-            key_padding_mask=src_key_padding_mask, 
-            need_weights=False
-        )
-        x = res + self.dropout1(attn_out)
-        
-        # Phase 2: Cross-Attention
-        if context is not None:
-            res = x
-            x_norm = self.norm2(x, noise_emb) # AdaLN
-            attn_out, _ = self.cross_attn(
-                query=x_norm, 
-                key=context, 
-                value=context, 
-                key_padding_mask=context_key_padding_mask, 
-                need_weights=False
-            )
-            x = res + self.dropout2(attn_out)
-        
-        # Phase 3: Feed-Forward
-        res = x
-        x_norm = self.norm3(x, noise_emb) # AdaLN
-        ffn_out = self.ffn(x_norm)
-        x = res + self.dropout3(ffn_out)
-        
-        return x
-    
 # ============================================================================
 # Main RDT Model (Refactored with RoPE & Transformer I/O)
 # ============================================================================
@@ -813,27 +737,6 @@ class RDT(nn.Module):
             num_heads=gate_num_heads,
             dropout=gate_dropout
         )
-
-        # TEMP -- for debuging
-        self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
-        input_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, 
-            dropout=dropout, batch_first=True
-        )
-        self.input_encoder = nn.TransformerEncoder(input_encoder_layer, num_layers=input_processor_layers)
-        self.input_norm = nn.LayerNorm(d_model)
-
-        self.encoder_layers = nn.ModuleList([
-            DirectionalRecursiveBlockT(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_encoder_layers)
-        ])
-
-        output_decoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, batch_first=True
-        )
-        self.output_decoder = nn.TransformerEncoder(output_decoder_layer, num_layers=output_processor_layers)
-        # TEMP -- for debuging
         
         # Weight Tying (conditional based on config)
         if self.weight_tying:
@@ -868,13 +771,10 @@ class RDT(nn.Module):
         """
         # 1. Token embedding
         x = self.token_embedding(tokens) * math.sqrt(self.d_model)
-        x = self.pos_encoding(x)
         
         # 2. Input processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        h_0 = self.input_encoder(x, src_key_padding_mask=key_padding_mask)
-
-        h_0 = self.input_norm(h_0)
+        h_0 = self.input_processor(x, key_padding_mask=key_padding_mask)
         
         return h_0
 
@@ -892,7 +792,6 @@ class RDT(nn.Module):
         Returns:
             h_{i+1}: [B, L, D] next hidden states
         """
-        noise_level, _ = self.gate(hidden, attention_mask, None, None)
         # 1. Create noise embedding
         noise_vec = self.noise_emb(noise_level)
         
@@ -938,13 +837,12 @@ class RDT(nn.Module):
         Returns:
             logits: [B, L, vocab_size]
         """
-    
         # 1. Output processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        decoded = self.output_decoder(hidden, src_key_padding_mask=key_padding_mask)
+        processed = self.output_processor(hidden, key_padding_mask=key_padding_mask)
         
         # 2. Project to vocabulary
-        logits = self.output_projection(decoded)
+        logits = self.output_projection(processed)
         
         return logits
 
@@ -1028,12 +926,6 @@ class RDT(nn.Module):
             
             h_i = x  # x is already hidden states
             
-            last_gate_score, _ = self.gate(
-                h_i,
-                attention_mask,
-                prev_pooled=last_pooled,
-                prev_gate=last_gate_score
-            )
             # 1. Scheduled sampling for noise level
             if self.training and gt_timestep is not None:
                 # XLA-safe soft mixing

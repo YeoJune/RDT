@@ -158,16 +158,21 @@ class StreamingTextDataset(IterableDataset, DatasetLoaderMixin):
                 text,
                 max_length=self.max_seq_length,
                 truncation=True,
-                padding=False
+                padding='max_length',
+                return_overflowing_tokens=True,
+                stride=0
             )
             
-            input_ids = encoded['input_ids']
-
-            if len(input_ids) >= 10:
+            for input_ids in encoded['input_ids']:
+                if len(input_ids) < 10: continue
+                
                 yield {
                     'input_ids': torch.tensor(input_ids, dtype=torch.long)
                 }
+                
                 yielded_samples += 1
+                if max_samples is not None and yielded_samples >= max_samples:
+                    return
 
 
 class WikiTextDataset(Dataset, DatasetLoaderMixin):
