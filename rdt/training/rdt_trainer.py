@@ -212,12 +212,12 @@ class RDTTrainer:
         
         return sampling_prob
 
-    def train_step(self, batch: Dict) -> Tuple[float, float, float, float]:
+    def train_step(self, batch: Dict) -> Tuple[float, float, float, float, float]:
         """
         Training step (2번 스타일 구현)
         
         Returns:
-            final_loss, avg_recon, avg_gate, avg_aux
+            final_loss, avg_recon, avg_gate, avg_aux, avg_recon_em
         """
         self.model.train()
         
@@ -241,6 +241,8 @@ class RDTTrainer:
         accumulated_loss = 0
         total_recon_loss = 0
         total_gate_loss = 0
+        total_recon_em = 0
+        num_recon_steps = 0
         num_valid_steps = 0
         
         with torch.amp.autocast('cuda', enabled=self.use_amp):
@@ -296,6 +298,12 @@ class RDTTrainer:
                     selected_logits = logits[step_loss_mask]
                     selected_targets = step_targets[step_loss_mask]
                     recon_loss = self.recon_criterion(selected_logits, selected_targets)
+                    
+                    # Calculate Exact Match (EM) for reconstruction
+                    predictions = selected_logits.argmax(dim=-1)
+                    recon_em = (predictions == selected_targets).float().mean().item()
+                    total_recon_em += recon_em
+                    num_recon_steps += 1
                 else:
                     recon_loss = torch.tensor(0.0, device=self.device)
                 
@@ -379,24 +387,28 @@ class RDTTrainer:
         if self.scheduler:
             self.scheduler.step()
         
+        avg_recon_em = total_recon_em / max(1, num_recon_steps)
+        
         return (
             final_loss.item(),
             total_recon_loss / max(1, num_valid_steps),
             total_gate_loss / max(1, num_valid_steps),
-            aux_loss.item()
+            aux_loss.item(),
+            avg_recon_em
         )
 
-    def validate(self) -> Tuple[float, float, float]:
+    def validate(self) -> Tuple[float, float, float, float]:
         """
         Validation (2번 스타일 구현)
         
         Returns:
-            avg_total_loss, avg_recon_loss, avg_gate_loss
+            avg_total_loss, avg_recon_loss, avg_gate_loss, avg_recon_em
         """
         self.model.eval()
         total_loss = 0
         total_recon = 0
         total_gate = 0
+        total_recon_em = 0
         num_batches = 0
         
         with torch.no_grad():
@@ -416,6 +428,8 @@ class RDTTrainer:
                 actual_max_length = chain_lengths.max().item()
                 batch_recon = 0
                 batch_gate = 0
+                batch_recon_em = 0
+                num_recon_steps = 0
                 num_valid = 0
                 
                 # STEP 0: Manual encoding (2번 스타일)
@@ -452,6 +466,12 @@ class RDTTrainer:
                         sel_logits = logits[step_loss_mask]
                         sel_targ = step_targets[step_loss_mask]
                         recon_loss = self.recon_criterion(sel_logits, sel_targ)
+                        
+                        # Calculate Exact Match (EM) for reconstruction
+                        predictions = sel_logits.argmax(dim=-1)
+                        recon_em = (predictions == sel_targ).float().mean().item()
+                        batch_recon_em += recon_em
+                        num_recon_steps += 1
                     else:
                         recon_loss = torch.tensor(0.0, device=self.device)
                     
@@ -475,15 +495,22 @@ class RDTTrainer:
                     avg_recon = batch_recon / num_valid
                     avg_gate = batch_gate / num_valid
                     avg_total = self.loss_weight_recon * avg_recon + self.loss_weight_gate * avg_gate
+                    avg_batch_recon_em = batch_recon_em / max(1, num_recon_steps)
                     
                     total_loss += avg_total
                     total_recon += avg_recon
                     total_gate += avg_gate
+                    total_recon_em += avg_batch_recon_em
                     num_batches += 1
         
         if num_batches == 0:
-            return 0.0, 0.0, 0.0
-        return total_loss / num_batches, total_recon / num_batches, total_gate / num_batches
+            return 0.0, 0.0, 0.0, 0.0
+        return (
+            total_loss / num_batches,
+            total_recon / num_batches,
+            total_gate / num_batches,
+            total_recon_em / num_batches
+        )
 
     def _update_curriculum_progress(self, progress: float):
         """Update curriculum progress (1번 인터페이스)"""
@@ -554,7 +581,7 @@ class RDTTrainer:
                 train_iter = progress_bar
             
             for batch in train_iter:
-                loss, recon, gate, aux = self.train_step(batch)
+                loss, recon, gate, aux, recon_em = self.train_step(batch)
                 self.global_step += 1
                 
                 # Logging (1번 인터페이스)
@@ -564,6 +591,7 @@ class RDTTrainer:
                         'step': self.global_step,
                         'loss': loss,
                         'recon_loss': recon,
+                        'recon_em': recon_em,
                         'gate_loss': gate,
                         'aux_loss': aux,
                         'lr': self.optimizer.param_groups[0]['lr'],
@@ -590,15 +618,16 @@ class RDTTrainer:
             
             # Validation
             if (epoch + 1) % self.eval_every_n_epochs == 0:
-                val_loss, val_recon, val_gate = self.validate()
+                val_loss, val_recon, val_gate, val_recon_em = self.validate()
                 
-                print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
+                print(f"Val - Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}, Recon EM: {val_recon_em:.4f}")
                 
                 val_data = {
                     'epoch': epoch,
                     'step': self.global_step,
                     'val_loss': val_loss,
                     'val_recon': val_recon,
+                    'val_recon_em': val_recon_em,
                     'val_gate': val_gate
                 }
                 self.csv_logger.log(val_data)
@@ -607,6 +636,7 @@ class RDTTrainer:
                     wandb.log({
                         'val/loss': val_loss,
                         'val/recon_loss': val_recon,
+                        'val/recon_em': val_recon_em,
                         'val/gate_loss': val_gate,
                         'epoch': epoch
                     }, step=self.global_step)
@@ -698,7 +728,7 @@ class RDTTrainer:
                 if step >= self.max_training_steps:
                     break
                 
-                loss, recon, gate, aux = self.train_step(batch)
+                loss, recon, gate, aux, recon_em = self.train_step(batch)
                 step += 1
                 self.global_step = step
                 
@@ -709,6 +739,7 @@ class RDTTrainer:
                         'step': step,
                         'loss': loss,
                         'recon_loss': recon,
+                        'recon_em': recon_em,
                         'gate_loss': gate,
                         'aux_loss': aux,
                         'lr': self.optimizer.param_groups[0]['lr'],
@@ -733,15 +764,16 @@ class RDTTrainer:
                 
                 # Validation
                 if step % self.eval_every_n_steps == 0:
-                    val_loss, val_recon, val_gate = self.validate()
+                    val_loss, val_recon, val_gate, val_recon_em = self.validate()
                     
-                    print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}")
+                    print(f"\nStep {step} - Val Loss: {val_loss:.4f}, Recon: {val_recon:.4f}, Gate: {val_gate:.4f}, Recon EM: {val_recon_em:.4f}")
                     
                     val_data = {
                         'epoch': epoch,
                         'step': step,
                         'val_loss': val_loss,
                         'val_recon': val_recon,
+                        'val_recon_em': val_recon_em,
                         'val_gate': val_gate
                     }
                     self.csv_logger.log(val_data)
@@ -750,6 +782,7 @@ class RDTTrainer:
                         wandb.log({
                             'val/loss': val_loss,
                             'val/recon_loss': val_recon,
+                            'val/recon_em': val_recon_em,
                             'val/gate_loss': val_gate,
                             'step': step
                         }, step=step)
