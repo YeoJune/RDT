@@ -266,7 +266,7 @@ class RDTTrainer:
             
             # First main encoder forward
             step_gt_timestep = gate_targets[:, 1].unsqueeze(1)
-            hidden, gate_pred = self.model(
+            hidden, gate_pred, _ = self.model(
                 h_0,
                 attention_mask=attention_mask,
                 is_first_step=False,
@@ -432,7 +432,7 @@ class RDTTrainer:
                 batch_gate += gate_loss_0.item()
                 num_valid += 1
                 
-                hidden, gate_pred = self.model(
+                hidden, gate_pred, _ = self.model(
                     h_0,
                     attention_mask=attention_mask,
                     is_first_step=False
