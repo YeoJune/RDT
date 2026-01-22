@@ -1,12 +1,11 @@
-"""Unified training script for all models (RDT and baselines) using Accelerate"""
+"""Unified training script for all models (RDT and baselines) - Manual PyTorch Version"""
 
 import argparse
 from pathlib import Path
 import torch
 from transformers import AutoTokenizer
-from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration
 import os
+import wandb
 
 from rdt.models import RDT, MLM
 from rdt.models.cmlm import CMLM
@@ -25,6 +24,8 @@ def main():
                         help='Path to checkpoint to resume from (loads model, optimizer, scheduler, and training state)')
     parser.add_argument('--pretrained', type=str, default=None,
                         help='Path to pretrained weights to load (loads only model weights, starts training from scratch)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda:0, cuda:1, cpu). If not specified, uses cuda:0 if available')
     
     args = parser.parse_args()
     
@@ -40,33 +41,40 @@ def main():
         override_config = load_config(args.override)
         config = merge_configs(config, override_config)
     
-    accelerator = Accelerator(
-        log_with="wandb" if config.get('use_wandb', True) else None,
-        project_config=ProjectConfiguration(
-            project_dir=config['output']['log_dir'],
-            logging_dir=config['output']['log_dir']
-        ),
-        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1)
-    )
-
-    if config.get('use_wandb', True):
-        # run_name 설정 (config에 없으면 자동 생성)
+    # ============================================================================
+    # Device Setup (Manual)
+    # ============================================================================
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    
+    print(f"Using device: {device}")
+    
+    # Mixed precision info
+    mixed_precision = config.get('mixed_precision', False)
+    if mixed_precision:
+        print(f"Mixed Precision: Enabled (AMP)")
+    else:
+        print(f"Mixed Precision: Disabled")
+    
+    # ============================================================================
+    # W&B Initialization (Manual)
+    # ============================================================================
+    use_wandb = config.get('use_wandb', True)
+    if use_wandb:
         run_name = config.get('run_name', f"{config.get('model_type', 'model')}-run")
         
-        # main.py에서 설정한 환경변수(WANDB_PROJECT 등)를 자동으로 가져감
-        accelerator.init_trackers(
-            project_name=os.environ.get("WANDB_PROJECT", "rdt"), 
-            config=config,
-            init_kwargs={"wandb": {"name": run_name}}
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "rdt"),
+            name=run_name,
+            config=config
         )
+        print(f"W&B initialized: {run_name}")
     
-    # Main Process에서만 출력
-    if accelerator.is_main_process:
-        print(f"Loading config from {args.config}")
-        print(f"Accelerator Device: {accelerator.device}, Distributed: {accelerator.num_processes > 1}")
-        print(f"Mixed Precision: {accelerator.mixed_precision}")
+    print(f"Loading config from {args.config}")
     
-    # Set seed (Accelerate가 모든 프로세스에 시드 동기화)
+    # Set seed
     set_seed(config['seed'])
     
     # Determine model type
@@ -99,7 +107,7 @@ def main():
             train_loader=train_loader,
             val_loader=val_loader,
             config=config,
-            accelerator=accelerator
+            device=device
         )
         
     elif model_type in ['mlm', 'cmlm', 'mdlm']:
@@ -136,7 +144,7 @@ def main():
             train_loader=train_loader,
             val_loader=val_loader,
             config=config,
-            accelerator=accelerator
+            device=device
         )
         
     else:
@@ -144,28 +152,27 @@ def main():
     
     # Resume from checkpoint or load pretrained weights
     if args.checkpoint:
-        if accelerator.is_main_process:
-            print(f"\nResuming from checkpoint: {args.checkpoint}")
+        print(f"\nResuming from checkpoint: {args.checkpoint}")
         if not args.checkpoint.endswith('.pt'):
             raise ValueError(f"Checkpoint must be a .pt file, got: {args.checkpoint}")
         trainer.resume_checkpoint = args.checkpoint
     
     elif args.pretrained:
-        if accelerator.is_main_process:
-            print(f"\nLoading pretrained weights: {args.pretrained}")
+        print(f"\nLoading pretrained weights: {args.pretrained}")
         if not args.pretrained.endswith('.pt'):
             raise ValueError(f"Pretrained weights must be a .pt file, got: {args.pretrained}")
         from rdt.utils import load_pretrained_weights
-        # unwrap model before loading
-        unwrapped_model = accelerator.unwrap_model(trainer.model)
-        load_pretrained_weights(args.pretrained, unwrapped_model)
-        if accelerator.is_main_process:
-            print("Starting training from epoch 0, step 0 with pretrained weights")
+        load_pretrained_weights(args.pretrained, trainer.model)
+        print("Starting training from epoch 0, step 0 with pretrained weights")
     
     # Train
     trainer.train()
 
-    accelerator.end_training()
+    # ============================================================================
+    # W&B Cleanup (Manual)
+    # ============================================================================
+    if use_wandb:
+        wandb.finish()
     
     print("\n" + "="*60)
     print("Training completed successfully!")
