@@ -892,6 +892,7 @@ class RDT(nn.Module):
         Returns:
             h_{i+1}: [B, L, D] next hidden states
         """
+        noise_level, _ = self.gate(hidden, attention_mask, None, None)
         # 1. Create noise embedding
         noise_vec = self.noise_emb(noise_level)
         
