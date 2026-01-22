@@ -909,6 +909,9 @@ class RDT(nn.Module):
             else:
                 noise_0 = gate_0.detach()
 
+            if gt_timestep is None:
+                gt_timestep = gate_0
+
             noise_0 = gt_timestep.detach() # TEMP: Disable scheduled sampling for stability
             
             # 4. Transform: h_0 → h_1
