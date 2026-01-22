@@ -6,7 +6,8 @@ class RDTPreprocessor:
     """
     RDT 데이터 생성 로직을 수행하는 Collator.
     DataLoader의 collate_fn으로 사용되어 배치 단위로 전처리를 수행.
-    TPU 최적화: CPU에서 동작하며 고정 크기 텐서를 생성.
+    
+    ⚠️ DEBUG VERSION: 2번 구현의 단순 로직 사용 (special token 처리 없음)
     """
     def __init__(self, tokenizer, config, device='cpu'):
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -15,9 +16,7 @@ class RDTPreprocessor:
         self.vocab_size = tokenizer.vocab_size
         self.device = device
         
-        # ✅ BEST PRACTICE: Store all special token IDs
-        self.all_special_ids = set(tokenizer.all_special_ids)
-        
+        # Config 파싱 (1번과 동일)
         self.min_chain_length = config['training'].get('min_chain_length', 1)
         self.max_chain_length = config['training']['max_chain_length']
         self.total_steps = config['training']['total_steps']
@@ -29,46 +28,13 @@ class RDTPreprocessor:
         self.mask_prob = bert_config.get('mask_prob', 0.8)
         self.random_prob = bert_config.get('random_prob', 0.1)
         
-        # Curriculum Learning Config
+        # Curriculum Learning Config (파싱만 하고 사용 안 함)
         curriculum_config = config['training'].get('curriculum', {})
         self.curriculum_enabled = curriculum_config.get('enabled', False)
         self.curriculum_start_step = curriculum_config.get('start_step', self.total_steps)
         
-        # Current progress (updated by trainer)
+        # Current progress (not used in this version)
         self.current_progress = 0.0
-    
-    def get_start_step_range(self, progress: float) -> tuple:
-        """
-        Get allowed start_step range based on curriculum progress.
-        
-        Args:
-            progress: Training progress in [0.0, 1.0]
-        
-        Returns:
-            (min_step, max_step): Allowed range for start_step sampling
-        
-        Examples (total_steps=20, start_step=5, max_chain_length=2):
-            progress=0.0 → (2, 5)    # Narrow range (20~25% mask)
-            progress=0.5 → (2, 12)   # Expanding range (10~90% mask)
-            progress=1.0 → (2, 20)   # Full range (0~90% mask)
-        
-        Critical: start_step MUST be >= max_chain_length for curriculum to work!
-        """
-        if not self.curriculum_enabled:
-            return (self.max_chain_length, self.total_steps)
-        
-        # Min: Always fixed at max_chain_length (ensures all chain lengths can be sampled)
-        min_step = self.max_chain_length
-        
-        # Max: Linear interpolation from start_step to total_steps
-        max_step = self.curriculum_start_step + progress * (
-            self.total_steps - self.curriculum_start_step
-        )
-        
-        # Clamp max_step to be at least min_step
-        max_step = max(min_step, int(max_step))
-        
-        return (min_step, max_step)
 
     @torch.no_grad()
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -79,48 +45,19 @@ class RDTPreprocessor:
         B, L = input_ids.shape
         
         # ========================================================================
-        # [FIX] Special Token Identification using all_special_ids
+        # 2번 스타일: Special Token 처리 없음
         # ========================================================================
-        # Create mask for ALL special tokens (more robust and standard)
-        special_token_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
-        for special_id in self.all_special_ids:
-            special_token_mask |= (input_ids == special_id)
         
-        # Non-special token mask for actual length calculation
-        non_special_mask = ~special_token_mask
-        
-        # 1. Chain Length (sample between min and max)
+        # 1. Chain Length (배치 내 가변)
         chain_lengths = torch.randint(self.min_chain_length, self.max_chain_length + 1, (B,), device=device)
         
-        # 2. Start Step Sampling with Curriculum
-        if self.curriculum_enabled:
-            curriculum_min, curriculum_max = self.get_start_step_range(self.current_progress)
-            
-            # Respect chain_length constraint
-            min_starts = torch.maximum(
-                chain_lengths,
-                torch.tensor(curriculum_min, device=device)
-            )
-            max_starts = torch.full((B,), curriculum_max, device=device)
-            max_starts = torch.maximum(max_starts, min_starts)  # Ensure min <= max
-            
-            # Uniform sampling in [min_starts, max_starts]
-            ranges = max_starts - min_starts + 1
-            start_steps = min_starts + torch.rand(B, device=device).mul(ranges).long()
-        else:
-            # Original logic: uniform sampling in [chain_length, total_steps]
-            min_starts = chain_lengths
-            ranges = self.total_steps - min_starts + 1
-            start_steps = min_starts + torch.rand(B, device=device).mul(ranges).long()
+        # 2. Start Step Sampling (Curriculum 없이 단순 샘플링)
+        min_starts = chain_lengths
+        ranges = self.total_steps - min_starts + 1
+        start_steps = min_starts + torch.rand(B, device=device).mul(ranges).long()
         
-        # 3. Random Permutation Logic
+        # 3. Random Permutation Logic (Special token 구분 없음)
         rand_scores = torch.rand(B, L, device=device)
-        # ✅ FIX: Exclude ALL special tokens from ranking
-        rand_scores = torch.where(
-            special_token_mask, 
-            torch.tensor(1e9, device=device), 
-            rand_scores
-        )
         restore_ranks = rand_scores.argsort(dim=1).argsort(dim=1)
         
         # 4. Init Tensors
@@ -130,17 +67,13 @@ class RDTPreprocessor:
         gate_targets = torch.zeros((B, self.max_chain_length + 1), dtype=torch.float, device=device)
         attention_mask = (input_ids != self.pad_token_id).long()
         
-        # ✅ FIX: Count only non-special tokens for actual length
-        actual_lengths = non_special_mask.sum(dim=1).float()
-        
         # 5. Input Generation (s_0)
         input_steps = start_steps
         visible_ratios = 1.0 - (input_steps.float() / self.total_steps)
-        visible_counts = (visible_ratios * actual_lengths).long()
+        # ⚠️ 2번 스타일: seq_len 전체 사용 (special token 구분 없음)
+        visible_counts = (visible_ratios * L).long()
         
         is_masked = restore_ranks >= visible_counts.unsqueeze(1)
-        # ✅ FIX: Only mask non-special tokens
-        is_masked = is_masked & non_special_mask
         
         inputs = input_ids.clone()
         if self.bert_masking_enabled:
@@ -163,8 +96,9 @@ class RDTPreprocessor:
             curr_visible_ratios = 1.0 - (start_steps - i).float() / self.total_steps
             target_visible_ratios = 1.0 - target_steps.float() / self.total_steps
             
-            curr_visible_counts = (curr_visible_ratios * actual_lengths).long()
-            target_visible_counts = (target_visible_ratios * actual_lengths).long()
+            # ⚠️ 2번 스타일: L 전체 사용
+            curr_visible_counts = (curr_visible_ratios * L).long()
+            target_visible_counts = (target_visible_ratios * L).long()
 
             target_visible_counts = torch.maximum(
                 curr_visible_counts + 1,
@@ -181,8 +115,7 @@ class RDTPreprocessor:
                 rehearsal_mask = (torch.rand(B, L, device=device) < self.visible_loss_ratio) & already_visible
                 step_loss_mask = step_loss_mask | rehearsal_mask
             
-            # ✅ FIX: Exclude special tokens from loss mask
-            step_loss_mask = step_loss_mask & non_special_mask
+            # ⚠️ 2번 스타일: Special token 제외 없음
             
             still_masked = restore_ranks >= upper_bound
             step_targets = torch.where(
