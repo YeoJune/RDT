@@ -206,7 +206,7 @@ class GateMLP(nn.Module):
         raw_output = self.mlp(pooled)
         gate_output = nn.functional.softplus(raw_output)
         
-        return gate_output
+        return gate_output, None
 
 class RDT(nn.Module):
     def __init__(
