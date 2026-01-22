@@ -62,7 +62,7 @@ training:
 
   # Loss weights
   loss_weight_recon: 1.0 # Reconstruction loss weight
-  loss_weight_gate: 0.1 # Gate prediction loss weight
+  loss_weight_gate: 0.5 # Gate prediction loss weight
   loss_weight_aux: 0.0
   aux_ratio: 0.0 # Auxiliary loss micro-batch ratio (0.0-1.0)
   aux_temp: 0.5
@@ -90,7 +90,7 @@ training:
 
 # Data
 data:
-  dataset_name: "wikitext-103" # 'wikitext-2' or 'wikitext-103'
+  dataset_name: "wikitext-2" # 'wikitext-2' or 'wikitext-103'
   streaming: false # true: buffer-based on-the-fly loading, false: download all at once
   max_seq_length: 128 # Maximum sequence length
   mask_token: "[MASK]"
