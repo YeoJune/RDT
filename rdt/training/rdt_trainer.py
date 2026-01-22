@@ -252,7 +252,7 @@ class RDTTrainer:
             src_key_padding_mask = (attention_mask == 0)
             h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
             h_0 = self.model.input_norm(h_0)
-            gate_pred_0 = self.model.gate(h_0, attention_mask)
+            gate_pred_0, _ = self.model.gate(h_0, attention_mask)
             
             # Gate Loss for h_0
             gate_target_0 = gate_targets[:, 0].unsqueeze(1)
@@ -424,7 +424,7 @@ class RDTTrainer:
                 src_key_padding_mask = (attention_mask == 0)
                 h_0 = self.model.input_encoder(init_emb, src_key_padding_mask=src_key_padding_mask)
                 h_0 = self.model.input_norm(h_0)
-                gate_pred_0 = self.model.gate(h_0, attention_mask)
+                gate_pred_0, _ = self.model.gate(h_0, attention_mask)
                 
                 # Gate Loss for h_0
                 gate_target_0 = gate_targets[:, 0].unsqueeze(1)
