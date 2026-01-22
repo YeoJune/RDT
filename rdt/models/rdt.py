@@ -660,6 +660,66 @@ class PositionalEncoding(nn.Module):
         pos_emb = self.pe[:seq_len, :].unsqueeze(0)
         return self.dropout(x + pos_emb)
 
+class DirectionalRecursiveBlockT(nn.Module):
+    """Self-Attention + Optional Cross-Attention Block with AdaLN"""
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        
+        # 1. Self-Attention (AdaLN 적용)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm1 = AdaptiveLayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        # 2. Cross-Attention (Conditional, AdaLN 적용)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm2 = AdaptiveLayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
+        
+        # 3. Feed-Forward (AdaLN 적용)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model)
+        )
+        self.norm3 = AdaptiveLayerNorm(d_model)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, x, noise_emb, context=None, src_key_padding_mask=None, context_key_padding_mask=None):
+        """
+        noise_emb: [B, 1, D] - 필수 입력 (Gate Embedding)
+        """
+        # Phase 1: Self-Attention
+        res = x
+        x_norm = self.norm1(x, noise_emb) # AdaLN
+        attn_out, _ = self.self_attn(
+            x_norm, x_norm, x_norm, 
+            key_padding_mask=src_key_padding_mask, 
+            need_weights=False
+        )
+        x = res + self.dropout1(attn_out)
+        
+        # Phase 2: Cross-Attention
+        if context is not None:
+            res = x
+            x_norm = self.norm2(x, noise_emb) # AdaLN
+            attn_out, _ = self.cross_attn(
+                query=x_norm, 
+                key=context, 
+                value=context, 
+                key_padding_mask=context_key_padding_mask, 
+                need_weights=False
+            )
+            x = res + self.dropout2(attn_out)
+        
+        # Phase 3: Feed-Forward
+        res = x
+        x_norm = self.norm3(x, noise_emb) # AdaLN
+        ffn_out = self.ffn(x_norm)
+        x = res + self.dropout3(ffn_out)
+        
+        return x
+    
 # ============================================================================
 # Main RDT Model (Refactored with RoPE & Transformer I/O)
 # ============================================================================
@@ -762,6 +822,11 @@ class RDT(nn.Module):
         )
         self.input_encoder = nn.TransformerEncoder(input_encoder_layer, num_layers=input_processor_layers)
         self.input_norm = nn.LayerNorm(d_model)
+
+        self.encoder_layers = nn.ModuleList([
+            DirectionalRecursiveBlockT(d_model, n_heads, d_ff, dropout)
+            for _ in range(n_encoder_layers)
+        ])
 
         output_decoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
