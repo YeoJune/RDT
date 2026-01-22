@@ -644,6 +644,22 @@ class GateMLP(nn.Module):
         return gate_output, pooled
 
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        seq_len = x.size(1)
+        pos_emb = self.pe[:seq_len, :].unsqueeze(0)
+        return self.dropout(x + pos_emb)
+
 # ============================================================================
 # Main RDT Model (Refactored with RoPE & Transformer I/O)
 # ============================================================================
@@ -737,6 +753,22 @@ class RDT(nn.Module):
             num_heads=gate_num_heads,
             dropout=gate_dropout
         )
+
+        # TEMP
+        self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
+        input_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, 
+            dropout=dropout, batch_first=True
+        )
+        self.input_encoder = nn.TransformerEncoder(input_encoder_layer, num_layers=input_processor_layers)
+        self.input_norm = nn.LayerNorm(d_model)
+
+        output_decoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            dropout=dropout, batch_first=True
+        )
+        self.output_decoder = nn.TransformerEncoder(output_decoder_layer, num_layers=output_processor_layers)
+        # TEMP
         
         # Weight Tying (conditional based on config)
         if self.weight_tying:
@@ -770,11 +802,14 @@ class RDT(nn.Module):
             h_0: [B, L, D] initial hidden states
         """
         # 1. Token embedding
-        x = self.token_embedding(tokens)
+        x = self.token_embedding(tokens) * math.sqrt(self.d_model)
+        x = self.pos_encoding(x)
         
         # 2. Input processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        h_0 = self.input_processor(x, key_padding_mask=key_padding_mask)
+        h_0 = self.input_encoder(x, src_key_padding_mask=key_padding_mask)
+
+        h_0 = self.input_norm(h_0)
         
         return h_0
 
@@ -840,10 +875,10 @@ class RDT(nn.Module):
     
         # 1. Output processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
-        processed = self.output_processor(hidden, key_padding_mask=key_padding_mask)
+        decoded = self.output_decoder(hidden, src_key_padding_mask=key_padding_mask)
         
         # 2. Project to vocabulary
-        logits = self.output_projection(processed)
+        logits = self.output_projection(decoded)
         
         return logits
 
