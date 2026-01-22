@@ -905,6 +905,8 @@ class RDT(nn.Module):
                 noise_0 = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * gate_0.detach()
             else:
                 noise_0 = gate_0.detach()
+
+            noise_0 = gt_timestep.detach() # TEMP: Disable scheduled sampling for stability
             
             # 4. Transform: h_0 → h_1
             h_1 = self.forward_step(h_0, noise_0, attention_mask)
@@ -932,6 +934,8 @@ class RDT(nn.Module):
                 noise_i = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * last_gate_score.detach()
             else:
                 noise_i = last_gate_score.detach()
+
+            noise_i = gt_timestep.detach() # TEMP: Disable scheduled sampling for stability
             
             # 2. Transform: h_i → h_{i+1}
             h_next = self.forward_step(h_i, noise_i, attention_mask)
