@@ -181,7 +181,7 @@ class GateMLP(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
     
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, prev_pooled=None, prev_gate=None):
         """
         x: [B, L, D]
         mask: [B, L] (1=valid, 0=padding)
