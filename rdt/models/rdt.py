@@ -1030,6 +1030,12 @@ class RDT(nn.Module):
             # 1. Scheduled sampling for noise level
             if self.training and gt_timestep is not None:
                 # XLA-safe soft mixing
+                last_gate_score, _ = self.gate(
+                    h_i,
+                    attention_mask,
+                    prev_pooled=last_pooled,
+                    prev_gate=last_gate_score
+                )
                 noise_i = sampling_prob * gt_timestep.detach() + (1.0 - sampling_prob) * last_gate_score.detach()
             else:
                 noise_i = last_gate_score.detach()
