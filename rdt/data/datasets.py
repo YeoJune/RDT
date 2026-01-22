@@ -158,9 +158,7 @@ class StreamingTextDataset(IterableDataset, DatasetLoaderMixin):
                 text,
                 max_length=self.max_seq_length,
                 truncation=True,
-                padding='max_length',
-                return_overflowing_tokens=True,
-                stride=0
+                padding=False
             )
             
             for input_ids in encoded['input_ids']:
@@ -236,9 +234,7 @@ class WikiTextDataset(Dataset, DatasetLoaderMixin):
                 text,
                 max_length=self.max_seq_length,
                 truncation=True,
-                padding='max_length',
-                return_overflowing_tokens=True,
-                stride=0
+                padding=False
             )
             
             for input_ids in encoded['input_ids']:
