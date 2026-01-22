@@ -809,23 +809,17 @@ class RDTTrainer:
                 train_iter = progress_bar
             
             for batch in train_iter:
-                # Accelerate의 gradient accumulation 자동 처리
-                with self.accelerator.accumulate(self.model):
-                    loss, recon, gate, aux, acc = self.train_step(batch)
+                loss, recon, gate, aux, acc = self.train_step(batch)
 
-                    # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
-                    self.accelerator.backward(loss)
-
-                    if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                        self.optimizer.step()
-                        if self.scheduler:
-                            self.scheduler.step()
-                        self.optimizer.zero_grad()
+                # Backward & Optimizer Step
+                self.accelerator.backward(loss)
                 
-                # [Standard Fix] 루프 내 불필요한 연산 및 동기화 제거
-                # epoch_loss += loss.item()  <-- 삭제 (매 스텝 Sync 유발)
-                # epoch_loss += loss.detach() <-- 삭제 (그래프 폭발 유발)
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
+                    if self.scheduler:
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
                 
                 self.global_step += 1
                 
@@ -1016,19 +1010,17 @@ class RDTTrainer:
                 if step >= self.max_training_steps:
                     break
                 
-                # Accelerate의 gradient accumulation 자동 처리
-                with self.accelerator.accumulate(self.model):
-                    loss, recon, gate, aux, acc = self.train_step(batch)
-                    
-                    # Backward & Optimizer Step (accumulate 컨텍스트가 자동 처리)
-                    self.accelerator.backward(loss)
-                    
-                    if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                        self.optimizer.step()
-                        if self.scheduler:
-                            self.scheduler.step()
-                        self.optimizer.zero_grad()
+                loss, recon, gate, aux, acc = self.train_step(batch)
+                
+                # Backward & Optimizer Step
+                self.accelerator.backward(loss)
+                
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
+                    if self.scheduler:
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
                 
                 step += 1
                 self.global_step = step
