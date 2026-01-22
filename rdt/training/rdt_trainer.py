@@ -315,7 +315,7 @@ class RDTTrainer:
                 # Next Step
                 if step_idx < actual_max_length - 1:
                     next_gt_timestep = gate_targets[:, step_idx + 2].unsqueeze(1)
-                    hidden, gate_pred = self.model.forward(
+                    hidden, gate_pred, _ = self.model.forward(
                         hidden,
                         attention_mask=attention_mask,
                         last_gate_score=gate_pred,
@@ -464,7 +464,7 @@ class RDTTrainer:
                     num_valid += 1
                     
                     if step_idx < actual_max_length - 1:
-                        hidden, gate_pred = self.model.forward(
+                        hidden, gate_pred, _ = self.model.forward(
                             hidden,
                             attention_mask=attention_mask,
                             last_gate_score=gate_pred,
