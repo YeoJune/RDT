@@ -814,7 +814,7 @@ class RDT(nn.Module):
             dropout=gate_dropout
         )
 
-        # TEMP
+        # TEMP -- for debuging
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
         input_encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff, 
@@ -833,7 +833,7 @@ class RDT(nn.Module):
             dropout=dropout, batch_first=True
         )
         self.output_decoder = nn.TransformerEncoder(output_decoder_layer, num_layers=output_processor_layers)
-        # TEMP
+        # TEMP -- for debuging
         
         # Weight Tying (conditional based on config)
         if self.weight_tying:
