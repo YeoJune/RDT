@@ -108,20 +108,22 @@ class DatasetLoaderMixin:
 
 class StreamingTextDataset(IterableDataset, DatasetLoaderMixin):
     """
-    Streaming dataset that yields raw token sequences.
-    No masking or chain generation here (done in Collator).
+    Streaming dataset that yields RDT-processed samples.
+    Preprocessing done in __iter__ (worker-parallel).
     """
     
     def __init__(self, dataset_name: Union[str, List[str]], tokenizer_name: str,
                  max_seq_length: int = 512, split='train', 
                  dataset_probabilities: Optional[List[float]] = None,
-                 max_val_samples: int = 5000, max_test_samples: int = 10000, **kwargs):
+                 max_val_samples: int = 5000, max_test_samples: int = 10000,
+                 preprocessor=None, **kwargs):
         
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.max_seq_length = max_seq_length
         self.split = split
         self.max_val_samples = max_val_samples
         self.max_test_samples = max_test_samples
+        self.preprocessor = preprocessor  # RDTPreprocessor for per-sample processing
         
         if isinstance(dataset_name, str):
             self.dataset_names = [dataset_name]
@@ -197,9 +199,13 @@ class StreamingTextDataset(IterableDataset, DatasetLoaderMixin):
             for input_ids in encoded['input_ids']:
                 if len(input_ids) < 10: continue
                 
-                yield {
-                    'input_ids': torch.tensor(input_ids, dtype=torch.long)
-                }
+                tokens = torch.tensor(input_ids, dtype=torch.long)
+                
+                # Process in worker (parallel!)
+                if self.preprocessor is not None:
+                    yield self.preprocessor.process_single_sample(tokens)
+                else:
+                    yield {'input_ids': tokens}
                 
                 yielded_samples += 1
                 if max_samples is not None and yielded_samples >= max_samples:
@@ -208,13 +214,14 @@ class StreamingTextDataset(IterableDataset, DatasetLoaderMixin):
 
 class WikiTextDataset(Dataset, DatasetLoaderMixin):
     """
-    Map-style dataset that returns raw token sequences.
-    No masking or chain generation here (done in Collator).
+    Map-style dataset that returns RDT-processed samples.
+    Preprocessing done in __getitem__ (worker-parallel).
     """
     
     def __init__(self, dataset_name: Union[str, List[str]], tokenizer_name: str,
                  max_seq_length: int = 512, split='train', samples_per_text=1,
-                 max_val_samples: int = 5000, max_test_samples: int = 10000, **kwargs):
+                 max_val_samples: int = 5000, max_test_samples: int = 10000,
+                 preprocessor=None, **kwargs):
         
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.max_seq_length = max_seq_length
@@ -222,6 +229,7 @@ class WikiTextDataset(Dataset, DatasetLoaderMixin):
         self.samples_per_text = samples_per_text
         self.max_val_samples = max_val_samples
         self.max_test_samples = max_test_samples
+        self.preprocessor = preprocessor  # RDTPreprocessor for per-sample processing
         
         if isinstance(dataset_name, str):
             self.dataset_names = [dataset_name]
@@ -285,15 +293,20 @@ class WikiTextDataset(Dataset, DatasetLoaderMixin):
 
     def __getitem__(self, idx):
         text_idx = idx // self.samples_per_text
-        return {
-            'input_ids': self.tokenized_data[text_idx]
-        }
+        tokens = self.tokenized_data[text_idx]
+        
+        # Process in worker (parallel!)
+        if self.preprocessor is not None:
+            return self.preprocessor.process_single_sample(tokens)
+        else:
+            return {'input_ids': tokens}
 
 
 def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     """
     Create dataloaders for RDT training.
-    Uses RDTPreprocessor (individual sample processing) + RDTCollator.
+    RDTPreprocessor is used in Dataset.__getitem__ (worker-parallel).
+    Collator only does padding/stacking.
     """
     from .rdt_preprocessor import RDTPreprocessor
     from .collators import RDTCollator
@@ -309,11 +322,11 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     
-    # Create RDT Preprocessor (v2 style: individual sample processing)
+    # Create RDT Preprocessor (used in __getitem__)
     rdt_preprocessor = RDTPreprocessor(tokenizer, config)
     
-    # Create RDT Collator (uses preprocessor)
-    rdt_collator = RDTCollator(preprocessor=rdt_preprocessor, pad_token_id=pad_token_id)
+    # Create simple RDT Collator (just padding)
+    rdt_collator = RDTCollator(pad_token_id=pad_token_id)
     
     common_kwargs = {
         'dataset_name': data_config['dataset_name'],
@@ -322,6 +335,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         'dataset_probabilities': data_config.get('dataset_probabilities', None),
         'max_val_samples': data_config.get('max_val_samples', 5000),
         'max_test_samples': data_config.get('max_test_samples', 10000),
+        'preprocessor': rdt_preprocessor,  # Pass to dataset
     }
 
     if streaming:
@@ -343,7 +357,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         shuffle=not streaming,
         num_workers=data_config['num_workers'],
         pin_memory=data_config['pin_memory'],
-        collate_fn=rdt_collator,
+        collate_fn=rdt_collator,  # Simple collator
         drop_last=True
     )
     
@@ -353,7 +367,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         shuffle=False,
         num_workers=data_config['num_workers'],
         pin_memory=data_config['pin_memory'],
-        collate_fn=rdt_collator,
+        collate_fn=rdt_collator,  # Simple collator
         drop_last=True
     )
     
