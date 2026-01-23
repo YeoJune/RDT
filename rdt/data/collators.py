@@ -2,33 +2,51 @@
 
 import torch
 from typing import Dict, List
-from dataclasses import dataclass
 from transformers import DataCollatorForLanguageModeling
 
 
 class RDTCollator:
     """
     Collator for RDT chain-based training.
-    Handles variable-length chains and padding.
+    Uses RDTPreprocessor to process individual samples (v2 style).
+    
+    Encapsulates preprocessing logic within collation step.
     """
     
-    def __init__(self, pad_token_id=0):
+    def __init__(self, preprocessor, pad_token_id=0):
+        """
+        Args:
+            preprocessor: RDTPreprocessor instance for sample processing
+            pad_token_id: Padding token ID
+        """
+        self.preprocessor = preprocessor
         self.pad_token_id = pad_token_id
     
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         """
-        Collate batch of RDT samples with variable chain lengths.
+        Collate batch by processing each sample individually, then padding.
         
         Args:
-            batch: List of dicts with keys: input, targets, loss_masks, gate_targets, chain_length
+            batch: List of dicts with 'input_ids' key (raw tokens)
             
         Returns:
-            Dict with padded tensors
+            Dict with padded tensors: input, targets, loss_masks, gate_targets, etc.
         """
-        # Find max chain length and sequence length in batch
-        max_chain_len = max(sample['chain_length'] for sample in batch)
-        max_seq_len = max(sample['input'].size(0) for sample in batch)
-        batch_size = len(batch)
+        # ========================================================================
+        # Step 1: Process each sample individually (v2 style)
+        # ========================================================================
+        processed_samples = []
+        for item in batch:
+            input_ids = item['input_ids']
+            processed = self.preprocessor.process_single_sample(input_ids)
+            processed_samples.append(processed)
+        
+        # ========================================================================
+        # Step 2: Collate (pad and stack)
+        # ========================================================================
+        max_seq_len = max(sample['input'].size(0) for sample in processed_samples)
+        max_chain_len = max(sample['chain_length'] for sample in processed_samples)
+        batch_size = len(processed_samples)
         
         # Initialize padded tensors
         inputs = torch.full((batch_size, max_seq_len), self.pad_token_id, dtype=torch.long)
@@ -39,7 +57,7 @@ class RDTCollator:
         chain_lengths = torch.zeros(batch_size, dtype=torch.long)
         
         # Fill tensors
-        for i, sample in enumerate(batch):
+        for i, sample in enumerate(processed_samples):
             seq_len = sample['input'].size(0)
             chain_len = sample['chain_length']
             
@@ -47,7 +65,7 @@ class RDTCollator:
             targets[i, :chain_len, :seq_len] = sample['targets']
             loss_masks[i, :chain_len, :seq_len] = sample['loss_masks']
             gate_targets[i, :chain_len + 1] = sample['gate_targets']
-            attention_mask[i, :seq_len] = 1
+            attention_mask[i, :seq_len] = (sample['input'] != self.pad_token_id).long()
             chain_lengths[i] = chain_len
         
         return {
@@ -182,7 +200,8 @@ class MDLMCollator(CMLMCollator):
     pass  # Inherits all functionality from CMLMCollator
 
 
-def get_collator(model_type: str, tokenizer=None, pad_token_id=0, mlm_probability=0.15):
+def get_collator(model_type: str, tokenizer=None, pad_token_id=0, mlm_probability=0.15, 
+                 preprocessor=None):
     """
     Factory function to get appropriate collator based on model type.
     
@@ -191,6 +210,7 @@ def get_collator(model_type: str, tokenizer=None, pad_token_id=0, mlm_probabilit
         tokenizer: Required for MLM collator
         pad_token_id: Padding token ID for RDT/CMLM/MDLM collator
         mlm_probability: Masking probability for MLM collator
+        preprocessor: RDTPreprocessor instance (required for RDT)
         
     Returns:
         Appropriate collator instance
@@ -198,7 +218,9 @@ def get_collator(model_type: str, tokenizer=None, pad_token_id=0, mlm_probabilit
     model_type = model_type.lower()
     
     if model_type == 'rdt':
-        return RDTCollator(pad_token_id=pad_token_id)
+        if preprocessor is None:
+            raise ValueError("RDTPreprocessor instance required for RDT collator")
+        return RDTCollator(preprocessor=preprocessor, pad_token_id=pad_token_id)
     elif model_type == 'mlm':
         if tokenizer is None:
             raise ValueError("Tokenizer required for MLM collator")

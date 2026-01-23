@@ -1,6 +1,6 @@
 """
 Data loading and preprocessing for RDT and Baselines.
-- RDT: Uses GPU Preprocessing (returns raw input_ids, preprocessing in Trainer).
+- RDT: Uses RDTPreprocessor (individual sample) + RDTCollator (v2 style)
 - Baselines (MLM, CMLM, MDLM): Uses standard Collators from collators.py.
 """
 
@@ -17,6 +17,37 @@ import random
 
 # Tokenizer parallelism disabled to prevent deadlocks in DataLoader
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def simple_collate_fn(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
+    """
+    Simple collate function for evaluation (no preprocessing).
+    Just pads input_ids and creates attention_mask.
+    
+    Args:
+        batch: List of dicts with 'input_ids' key
+        pad_token_id: Padding token ID
+        
+    Returns:
+        Dict with padded input_ids and attention_mask
+    """
+    input_ids = [item['input_ids'] for item in batch]
+    max_len = max(ids.size(0) for ids in input_ids)
+    
+    padded_input_ids = []
+    attention_masks = []
+    
+    for ids in input_ids:
+        pad_len = max_len - ids.size(0)
+        padded_input_ids.append(torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=torch.long)]))
+        attention_masks.append(torch.cat([torch.ones(ids.size(0), dtype=torch.long), 
+                                          torch.zeros(pad_len, dtype=torch.long)]))
+    
+    return {
+        'input_ids': torch.stack(padded_input_ids),
+        'attention_mask': torch.stack(attention_masks)
+    }
+
 
 class DatasetLoaderMixin:
     """Mixin for loading single or multiple datasets"""
@@ -78,7 +109,7 @@ class DatasetLoaderMixin:
 class StreamingTextDataset(IterableDataset, DatasetLoaderMixin):
     """
     Streaming dataset that yields raw token sequences.
-    No masking or chain generation here.
+    No masking or chain generation here (done in Collator).
     """
     
     def __init__(self, dataset_name: Union[str, List[str]], tokenizer_name: str,
@@ -178,6 +209,7 @@ class StreamingTextDataset(IterableDataset, DatasetLoaderMixin):
 class WikiTextDataset(Dataset, DatasetLoaderMixin):
     """
     Map-style dataset that returns raw token sequences.
+    No masking or chain generation here (done in Collator).
     """
     
     def __init__(self, dataset_name: Union[str, List[str]], tokenizer_name: str,
@@ -258,26 +290,13 @@ class WikiTextDataset(Dataset, DatasetLoaderMixin):
         }
 
 
-def simple_collate_fn(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
-    """
-    Simple collate function for baseline models (not RDT).
-    TPU-optimized: Uses torch.stack for fixed-length tensors.
-    """
-    # 모든 input_ids가 이미 max_seq_length로 고정되어 있으므로 stack만 수행
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    
-    # Attention mask는 pad_token이 아닌 곳만 1
-    attention_mask = (input_ids != pad_token_id).long()
-    
-    return {
-        'input_ids': input_ids,
-        'attention_mask': attention_mask
-    }
-
-
 def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
-    """Create dataloaders for RDT training with preprocessing in collator"""
+    """
+    Create dataloaders for RDT training.
+    Uses RDTPreprocessor (individual sample processing) + RDTCollator.
+    """
     from .rdt_preprocessor import RDTPreprocessor
+    from .collators import RDTCollator
     from transformers import AutoTokenizer
     
     data_config = config['data']
@@ -290,8 +309,11 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     
-    # Create RDT Preprocessor as collator
-    rdt_collator = RDTPreprocessor(tokenizer, config, device='cpu')
+    # Create RDT Preprocessor (v2 style: individual sample processing)
+    rdt_preprocessor = RDTPreprocessor(tokenizer, config)
+    
+    # Create RDT Collator (uses preprocessor)
+    rdt_collator = RDTCollator(preprocessor=rdt_preprocessor, pad_token_id=pad_token_id)
     
     common_kwargs = {
         'dataset_name': data_config['dataset_name'],

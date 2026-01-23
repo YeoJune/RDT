@@ -29,18 +29,6 @@ class RDTTrainer:
         self.accelerator = accelerator
         self.config = config
         self.resume_checkpoint = None
-        
-        # ============================================================================
-        # ✅ STANDARD PATTERN: Save collate_fn reference BEFORE prepare()
-        # ============================================================================
-        # This is the standard way to maintain access to dataloader components
-        # that need to be modified during training (e.g., curriculum learning)
-        self.train_collate_fn = train_loader.collate_fn if hasattr(train_loader, 'collate_fn') else None
-        self.val_collate_fn = val_loader.collate_fn if hasattr(val_loader, 'collate_fn') else None
-        
-        # Store original dataloaders for reference if needed
-        self.original_train_loader = train_loader
-        self.original_val_loader = val_loader
 
         tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -715,38 +703,6 @@ class RDTTrainer:
             
             return final_avg_total, final_avg_recon, final_avg_gate, final_avg_accuracy
 
-    def _update_curriculum_progress(self, progress: float):
-        """
-        Update curriculum progress in collate_fn.
-        
-        This is the standard pattern for dynamic training parameters:
-        1. Save reference to collate_fn before prepare()
-        2. Update it directly during training
-        
-        This works across all backends (GPU/TPU/CPU) because we're
-        modifying the original object, not trying to access it through wrappers.
-        """
-        if self.train_collate_fn is not None and hasattr(self.train_collate_fn, 'current_progress'):
-            self.train_collate_fn.current_progress = progress
-    
-    def get_curriculum_progress(self) -> float:
-        """
-        Calculate current curriculum progress.
-        
-        Returns:
-            progress: Float in [0.0, 1.0]
-                     0.0 = training start
-                     1.0 = training end
-        """
-        if self.training_mode == 'epoch':
-            if self.num_epochs <= 1:
-                return 1.0
-            return min(1.0, self.current_epoch / (self.num_epochs - 1))
-        else:  # step mode
-            if self.max_training_steps <= 1:
-                return 1.0
-            return min(1.0, self.global_step / self.max_training_steps)
-        
     def train(self):
         if self.training_mode == 'epoch':
             self._train_by_epoch()
@@ -782,22 +738,8 @@ class RDTTrainer:
             self.current_epoch = epoch
             sampling_prob = self.get_sampling_prob(epoch=epoch)
             
-            # ✅ STANDARD PATTERN: Update curriculum using saved reference
-            curriculum_progress = self.get_curriculum_progress()
-            self._update_curriculum_progress(curriculum_progress)
-            
             if self.accelerator.is_main_process:
-                log_msg = f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}"
-                
-                # Add curriculum info if enabled
-                if self.train_collate_fn and hasattr(self.train_collate_fn, 'curriculum_enabled'):
-                    if self.train_collate_fn.curriculum_enabled:
-                        min_step, max_step = self.train_collate_fn.get_start_step_range(curriculum_progress)
-                        avg_start_step = (min_step + max_step) / 2
-                        avg_mask_ratio = avg_start_step / self.train_collate_fn.total_steps
-                        log_msg += f" | Curriculum: [{min_step}, {max_step}] (~{avg_mask_ratio:.1%} mask)"
-                
-                print(log_msg)
+                print(f"\nEpoch {epoch + 1}/{self.num_epochs} | Sampling Prob: {sampling_prob:.3f}")
             
             # Accelerate가 준비한 DataLoader 그대로 사용
             train_iter = self.train_loader
@@ -983,22 +925,8 @@ class RDTTrainer:
             self.current_epoch = epoch
             sampling_prob = self.get_sampling_prob(step=step)
             
-            # ✅ STANDARD PATTERN: Update curriculum using saved reference
-            curriculum_progress = self.get_curriculum_progress()
-            self._update_curriculum_progress(curriculum_progress)
-            
             if self.accelerator.is_main_process:
-                log_msg = f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}"
-                
-                # Add curriculum info if enabled
-                if self.train_collate_fn and hasattr(self.train_collate_fn, 'curriculum_enabled'):
-                    if self.train_collate_fn.curriculum_enabled:
-                        min_step, max_step = self.train_collate_fn.get_start_step_range(curriculum_progress)
-                        avg_start_step = (min_step + max_step) / 2
-                        avg_mask_ratio = avg_start_step / self.train_collate_fn.total_steps
-                        log_msg += f" | Curriculum: [{min_step}, {max_step}] (~{avg_mask_ratio:.1%} mask)"
-                
-                print(log_msg)
+                print(f"\nEpoch {epoch + 1} | Step {step}/{self.max_training_steps} | Sampling Prob: {sampling_prob:.3f}")
                 
             # Accelerate가 준비한 DataLoader 그대로 사용
             train_iter = self.train_loader
