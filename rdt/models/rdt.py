@@ -706,7 +706,6 @@ class RDT(nn.Module):
             rope_layer=self.rope,
             dropout=dropout
         )
-        self.norm = nn.LayerNorm(d_model)
         
         # Noise Level Embedding
         self.noise_emb = TimestepEmbedder(d_model, frequency_embedding_size=d_model, scale_factor=total_steps)
@@ -776,7 +775,6 @@ class RDT(nn.Module):
         # 2. Input processing (Transformer Encoder with RoPE)
         key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         h_0 = self.input_processor(x, key_padding_mask=key_padding_mask)
-        h_0 = self.norm(h_0)
         
         return h_0
 
@@ -824,8 +822,6 @@ class RDT(nn.Module):
                     src_key_padding_mask=src_key_padding_mask,
                     context_key_padding_mask=None
                 )
-        
-        h_next = self.norm(h_next)
         
         return h_next
 
