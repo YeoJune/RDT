@@ -357,9 +357,11 @@ class RoPESelfAttention(nn.Module):
         # 5. Scaled Dot Product Attention (Flash Attention applied automatically if available)
         attn_mask = None
         if key_padding_mask is not None:
-            # key_padding_mask: [B, L] -> [B, 1, 1, L] for broadcasting
-            # SDPA supports boolean mask where True = masked out (ignore)
-            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            # [B, L] -> [B, 1, 1, L]
+            # 마스킹할 위치(True)에 -inf를 채워넣음
+            attn_mask = torch.zeros_like(key_padding_mask, dtype=q.dtype) # Base는 0.0
+            attn_mask.masked_fill_(key_padding_mask, float("-inf"))       # Ignore 위치는 -inf
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
 
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
@@ -442,7 +444,9 @@ class RoPECrossAttention(nn.Module):
         attn_mask = None
         if key_padding_mask is not None:
             # key_padding_mask: [B, L_kv] -> [B, 1, 1, L_kv]
-            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_mask = torch.zeros_like(key_padding_mask, dtype=q.dtype)
+            attn_mask.masked_fill_(key_padding_mask, float("-inf"))
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
         
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
@@ -769,7 +773,6 @@ class RDT(nn.Module):
         Returns:
             h_0: [B, L, D] initial hidden states
         """
-        attention_mask = None
         # 1. Token embedding
         x = self.token_embedding(tokens) * math.sqrt(self.d_model)
         
