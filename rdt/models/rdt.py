@@ -769,6 +769,7 @@ class RDT(nn.Module):
         Returns:
             h_0: [B, L, D] initial hidden states
         """
+        attention_mask = None
         # 1. Token embedding
         x = self.token_embedding(tokens) * math.sqrt(self.d_model)
         
