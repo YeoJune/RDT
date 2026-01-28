@@ -8,6 +8,9 @@ model:
   architecture: "bert-base-uncased" # Model architecture for config and tokenizer
   pretrained: null # Pretrained weights to load (null/empty for from-scratch)
 
+  # RoPE Configuration
+  rope_base: 10000.0 # RoPE frequency base
+
   # Optional: Override architecture parameters (for fair comparison with custom models)
   config_overrides:
     num_hidden_layers: 6 # Match RDT's layer count
@@ -17,10 +20,10 @@ model:
 
 # Training Strategy
 training:
-  batch_size: 32
-  gradient_accumulation_steps: 8 # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 64
+  gradient_accumulation_steps: 1 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch"
-  num_epochs: 3
+  num_epochs: 10
   max_training_steps: 100000
 
   learning_rate: 0.0001 # 1e-4
@@ -45,9 +48,9 @@ training:
 
 # Data
 data:
-  dataset_name: "wikitext-103"
+  dataset_name: "wikitext-2"
   streaming: false
-  max_seq_length: 512
+  max_seq_length: 128
   mlm_probability: 0.15
 
   tokenizer_name: "bert-base-uncased"
