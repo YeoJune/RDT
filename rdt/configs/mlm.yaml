@@ -1,57 +1,63 @@
-# BERT Baseline Configuration (Unified Format)
+# MLM (Masked Language Model) Configuration with RoPE
+# Standard BERT-style MLM using shared transformer backbone
 
 # Model Type
 model_type: "mlm"
 
 # Model Architecture
 model:
-  architecture: "bert-base-uncased" # Model architecture for config and tokenizer
-  pretrained: null # Pretrained weights to load (null/empty for from-scratch)
+  # Architecture dimensions (defaults to BERT-base, override for custom size)
+  d_model: 512 # Hidden dimension (BERT-base: 768)
+  n_layers: 6 # Number of transformer layers (BERT-base: 12)
+  n_heads: 8 # Number of attention heads (BERT-base: 12)
+  d_ff: 2048 # Feed-forward dimension (default: 4 * d_model)
 
-  # RoPE Configuration
+  # Sequence and regularization
+  max_seq_len: 512 # Maximum sequence length
+  dropout: 0.1 # Dropout probability
+
+  # Special tokens
+  mask_token_id: 103 # [MASK] token ID (BERT default: 103)
+  pad_token_id: 0 # [PAD] token ID (BERT default: 0)
+
+  # RoPE configuration
   rope_base: 10000.0 # RoPE frequency base
 
-  # Optional: Override architecture parameters (for fair comparison with custom models)
-  config_overrides:
-    num_hidden_layers: 6 # Match RDT's layer count
-    hidden_size: 512 # Match RDT's hidden dimension
-    num_attention_heads: 8 # Must divide hidden_size evenly
-    intermediate_size: 2048 # FFN dimension (typically 4x hidden_size)
+  # Weight tying
+  tie_weights: true # Tie input/output embeddings (recommended)
 
 # Training Strategy
 training:
+  # Batch and optimization
   batch_size: 64
-  gradient_accumulation_steps: 1 # Effective batch size = batch_size * gradient_accumulation_steps
-  training_mode: "epoch"
+  gradient_accumulation_steps: 1 # Effective batch = batch_size * gradient_accumulation_steps
+  training_mode: "epoch" # "epoch" or "steps"
   num_epochs: 10
   max_training_steps: 100000
 
+  # Learning rate and scheduling
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
-
   scheduler: "cosine"
   max_grad_norm: 1.0
 
+  # Checkpointing
   save_every_n_epochs: 1
   save_every_n_steps: 1000
   keep_last_n_checkpoints: 3
 
   # BERT-style masking (80% [MASK], 10% random, 10% keep)
-  # Default: true (MLM uses BERT-style by default via HuggingFace DataCollatorForLanguageModeling)
-  # Set to false to use 100% [MASK] for consistency with baseline CMLM/MDLM
+  # Set enabled: false to use 100% [MASK] for consistency with other baselines
   bert_masking:
     enabled: false
-    mask_prob: 0.8 # Probability of [MASK] token
-    random_prob: 0.1 # Probability of random token
-    keep_prob: 0.1 # Probability of keeping original
 
 # Data
 data:
   dataset_name: "wikitext-2"
   streaming: false
   max_seq_length: 128
-  mlm_probability: 0.15
+  mlm_probability: 0.15 # Standard BERT masking ratio
 
   tokenizer_name: "bert-base-uncased"
   num_workers: 4
@@ -64,7 +70,7 @@ output:
   log_every_n_steps: 100
   eval_every_n_epochs: 1
   eval_every_n_steps: 1000
-  use_tqdm: false # Enable/disable tqdm progress bars (if false, print logs at log_every_n_steps)
+  use_tqdm: false
 
 # Hardware
 device: "cuda"

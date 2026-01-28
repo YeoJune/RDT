@@ -1,4 +1,4 @@
-# MDLM (Masked Diffusion Language Model) Configuration
+# MDLM (Masked Diffusion Language Model) Configuration with RoPE
 # Paper: "Simple and Effective Masked Diffusion Language Models" (Sahoo et al., NeurIPS 2024)
 
 # Model Type
@@ -6,18 +6,25 @@ model_type: "mdlm"
 
 # Model Architecture
 model:
-  architecture: "bert-base-uncased" # Model architecture for config and tokenizer
-  pretrained: null # Pretrained weights to load (null/empty for from-scratch)
+  # Architecture dimensions (defaults to BERT-base, override for custom size)
+  d_model: 512 # Hidden dimension (BERT-base: 768)
+  n_layers: 6 # Number of transformer layers (BERT-base: 12)
+  n_heads: 8 # Number of attention heads (BERT-base: 12)
+  d_ff: 2048 # Feed-forward dimension (default: 4 * d_model)
 
-  # RoPE Configuration
+  # Sequence and regularization
+  max_seq_len: 512 # Maximum sequence length
+  dropout: 0.1 # Dropout probability
+
+  # Special tokens
+  mask_token_id: 103 # [MASK] token ID (BERT default: 103)
+  pad_token_id: 0 # [PAD] token ID (BERT default: 0)
+
+  # RoPE configuration
   rope_base: 10000.0 # RoPE frequency base
 
-  # Optional: Override architecture parameters (for fair comparison with custom models)
-  config_overrides:
-    num_hidden_layers: 6 # Match RDT's layer count
-    hidden_size: 512 # Match RDT's hidden dimension
-    num_attention_heads: 8 # Must divide hidden_size evenly
-    intermediate_size: 2048 # FFN dimension (typically 4x hidden_size)
+  # Weight tying
+  tie_weights: true # Tie input/output embeddings (recommended)
 
   # MDLM-specific parameters
   noise_schedule: "cosine" # Noise schedule: 'cosine' (α(t)=cos²(πt/2)) or 'linear' (α(t)=1-t)
@@ -25,45 +32,42 @@ model:
 
 # Training Strategy
 training:
+  # Batch and optimization
   batch_size: 64
-  gradient_accumulation_steps: 1 # Effective batch size = batch_size * gradient_accumulation_steps
-  training_mode: "epoch"
+  gradient_accumulation_steps: 1 # Effective batch = batch_size * gradient_accumulation_steps
+  training_mode: "epoch" # "epoch" or "steps"
   num_epochs: 3
   max_training_steps: 100000
 
+  # Learning rate and scheduling
   learning_rate: 0.0001 # 1e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
-
   scheduler: "cosine"
   max_grad_norm: 1.0
 
+  # Checkpointing
   save_every_n_epochs: 1
   save_every_n_steps: 1000
   keep_last_n_checkpoints: 3
 
   # BERT-style masking (80% [MASK], 10% random, 10% keep)
-  # Default: false (use 100% [MASK] as in MDLM paper)
-  # Set to true for consistency experiments with RDT
+  # Set enabled: false to use 100% [MASK] as in MDLM paper
   bert_masking:
     enabled: false
-    mask_prob: 0.8 # Probability of [MASK] token
-    random_prob: 0.1 # Probability of random token
-    keep_prob: 0.1 # Probability of keeping original
 
 # MDLM-specific Training
 mdlm:
   # Continuous-time masking: sample t ~ Uniform[0,1], mask with probability p_mask(t) = 1 - α(t)
-  # Rao-Blackwellized objective: time-weighted cross-entropy loss with weight α'(t)/(1-α(t))
-  low_discrepancy_sampling: true # Use low-discrepancy sampler for variance reduction
+  # Rao-Blackwellized objective: time-weighted cross-entropy loss with weight |α'(t)|/(1-α(t))
+  low_discrepancy_sampling: true # Use stratified sampling for variance reduction
 
   # Inference settings
   num_steps: 1000 # Number of denoising steps for generation
-  sampler: "ddpm_cache" # Sampling strategy: 'ddpm_cache' (fast), 'ddpm' (standard), 'analytic' (placeholder)
+  sampler: "ddpm_cache" # Sampling strategy: 'ddpm_cache' (fast), 'ddpm' (standard)
   temperature: 1.0 # Sampling temperature
 
-  # Key difference from CMLM: MDLM uses RANDOM unmasking (not confidence-based)
-  # This makes MDLM a simple baseline compared to smart methods like CMLM and RDT
+  # Monte Carlo samples (if applicable)
   mc_samples: 10
 
 # Data
@@ -86,7 +90,7 @@ output:
   log_every_n_steps: 100
   eval_every_n_epochs: 1
   eval_every_n_steps: 1000
-  use_tqdm: false # Enable/disable tqdm progress bars (if false, print logs at log_every_n_steps)
+  use_tqdm: false
 
 # Hardware
 device: "cuda"

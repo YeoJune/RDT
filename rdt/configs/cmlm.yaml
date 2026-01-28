@@ -1,22 +1,66 @@
-# CMLM (Conditional Masked Language Model) Configuration
+# CMLM (Conditional Masked Language Model) Configuration with RoPE
+# Mask-Predict: Parallel decoding with iterative refinement
 
 # Model Type
 model_type: "cmlm"
 
 # Model Architecture
 model:
-  architecture: "bert-base-uncased" # Model architecture for config and tokenizer
-  pretrained: null # Pretrained weights to load (null/empty for from-scratch)
+  # Architecture dimensions (defaults to BERT-base, override for custom size)
+  d_model: 512 # Hidden dimension (BERT-base: 768)
+  n_layers: 6 # Number of transformer layers (BERT-base: 12)
+  n_heads: 8 # Number of attention heads (BERT-base: 12)
+  d_ff: 2048 # Feed-forward dimension (default: 4 * d_model)
 
-  # RoPE Configuration
+  # Sequence and regularization
+  max_seq_len: 512 # Maximum sequence length
+  dropout: 0.1 # Dropout probability
+
+  # Special tokens
+  mask_token_id: 103 # [MASK] token ID (BERT default: 103)
+  pad_token_id: 0 # [PAD] token ID (BERT default: 0)
+
+  # RoPE configuration
   rope_base: 10000.0 # RoPE frequency base
 
-  # Optional: Override architecture parameters (for fair comparison with custom models)
-  config_overrides:
-    num_hidden_layers: 6 # Match RDT's layer count
-    hidden_size: 512 # Match RDT's hidden dimension
-    num_attention_heads: 8 # Must divide hidden_size evenly
-    intermediate_size: 2048 # FFN dimension (typically 4x hidden_size)
+  # Weight tying
+  tie_weights: true # Tie input/output embeddings (recommended)
+
+# Training Strategy
+training:
+  # Batch and optimization
+  batch_size: 64
+  gradient_accumulation_steps: 1 # Effective batch = batch_size * gradient_accumulation_steps
+  training_mode: "epoch" # "epoch" or "steps"
+  num_epochs: 3
+  max_training_steps: 100000
+
+  # Learning rate and scheduling
+  learning_rate: 0.0001 # 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  scheduler: "cosine"
+  max_grad_norm: 1.0
+
+  # Checkpointing
+  save_every_n_epochs: 1
+  save_every_n_steps: 1000
+  keep_last_n_checkpoints: 3
+
+  # BERT-style masking (80% [MASK], 10% random, 10% keep)
+  # Set enabled: false to use 100% [MASK] as in CMLM paper
+  bert_masking:
+    enabled: false
+
+# CMLM-specific Training
+cmlm:
+  # Uniform masking: masking ratio sampled uniformly from [0, 1]
+  # Trains model on both easy (single mask) and difficult (fully masked) examples
+  uniform_masking: true
+
+  # Mask-Predict inference settings
+  max_iterations: 10 # Number of mask-predict refinement iterations
+  mask_decay: "linear" # How mask ratio decreases: 'linear' (1.0 → 0.0)
 
 # Data
 data:
@@ -25,49 +69,11 @@ data:
   max_seq_length: 128
 
   # CMLM uses uniform masking during training
-  # masking ratio is dynamically sampled per batch
+  # No fixed masking ratio - dynamically sampled per batch
 
   tokenizer_name: "bert-base-uncased"
   num_workers: 4
   pin_memory: true
-
-# CMLM-specific Training
-cmlm:
-  # Uniform masking: masking ratio sampled uniformly from [0, 1]
-  # This trains the model on both easy (single mask) and difficult (fully masked) examples
-  uniform_masking: true
-
-  # Mask-Predict inference settings
-  max_iterations: 10 # Number of mask-predict refinement iterations
-  mask_decay: "linear" # How mask ratio decreases: 'linear' (1.0 → 0.0)
-
-# BERT-style Masking (for consistency experiments)
-training:
-  batch_size: 64
-  gradient_accumulation_steps: 1 # Effective batch size = batch_size * gradient_accumulation_steps
-  training_mode: "epoch"
-  num_epochs: 3
-  max_training_steps: 100000
-
-  learning_rate: 0.0001 # 1e-4
-  weight_decay: 0.01
-  warmup_ratio: 0.05
-
-  scheduler: "cosine"
-  max_grad_norm: 1.0
-
-  save_every_n_epochs: 1
-  save_every_n_steps: 1000
-  keep_last_n_checkpoints: 3
-
-  # BERT-style masking (80% [MASK], 10% random, 10% keep)
-  # Default: false (use 100% [MASK] as in CMLM paper)
-  # Set to true for consistency experiments with RDT
-  bert_masking:
-    enabled: false
-    mask_prob: 0.8 # Probability of [MASK] token
-    random_prob: 0.1 # Probability of random token
-    keep_prob: 0.1 # Probability of keeping original
 
 # Logging & Checkpoints
 output:
@@ -76,7 +82,7 @@ output:
   log_every_n_steps: 100
   eval_every_n_epochs: 1
   eval_every_n_steps: 1000
-  use_tqdm: false # Enable/disable tqdm progress bars (if false, print logs at log_every_n_steps)
+  use_tqdm: false
 
 # Hardware
 device: "cuda"
