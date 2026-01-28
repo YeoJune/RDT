@@ -1,145 +1,125 @@
-"""MDLM (Masked Diffusion Language Model) - SUBS Parameterization"""
+"""
+Masked Diffusion Language Model (MDLM) with RoPE
+
+MDLM extends MLM with continuous-time diffusion training and sampling.
+Uses SUBS (SUBStitution) parameterization for efficient masked diffusion.
+
+References:
+- MDLM: Sahoo et al., "Simple and Effective Masked Diffusion Language Models" (NeurIPS 2024)
+"""
 
 import torch
 import torch.nn.functional as F
-from .mlm import MLM
-from typing import Dict, Optional
 import math
+from .mlm_rope import MLM
+from typing import Dict, Optional, Tuple
 
 
 class MDLM(MLM):
     """
     Masked Diffusion Language Model (MDLM) with SUBS parameterization.
     
-    As described in:
-    "Simple and Effective Masked Diffusion Language Models" 
-    (Sahoo et al., NeurIPS 2024)
+    MDLM extends MLM with:
+    1. Continuous-time formulation: Sample masking from α(t) schedule
+    2. Time-weighted loss: Rao-Blackwellized NELBO objective
+    3. Efficient sampling: Cached diffusion with 3-4x speedup
     
     Key features:
-    1. SUBS (SUBStitution) parameterization - copies unmasked tokens
-    2. Continuous-time formulation (T → ∞)
-    3. Cosine noise schedule: α(t) = cos²(πt/2)
-    4. Rao-Blackwellized objective (mixture of weighted MLM losses)
-    5. Efficient sampling with caching (3-4x speedup)
+    - Cosine or linear noise schedule
+    - Time derivative weighting for stable training
+    - Low-discrepancy sampling for variance reduction
+    - RoPE positional encoding (inherited from MLM)
+    - FlashAttention optimization (inherited from MLM)
     
     Training:
-    - Sample time t ~ Uniform[0, 1]
-    - Mask tokens with probability p_mask(t) = 1 - α(t)
-    - Apply time-weighted cross-entropy loss
+        Use continuous_time_masking() instead of standard_masking()
+        Apply time-weighted loss for proper diffusion training
     
     Inference:
-    - Start from fully masked sequence
-    - Iteratively denoise over T steps
-    - Supports 3 samplers: ddpm_cache, ddpm, analytic
+        Use inference() for iterative denoising
+        Supports different samplers: ddpm_cache, ddpm, analytic
+    
+    Usage:
+        # Initialize with cosine schedule
+        model = MDLM(
+            vocab_size=30522,
+            d_model=768,
+            n_layers=12,
+            n_heads=12,
+            noise_schedule='cosine'
+        )
+        
+        # Training with continuous-time masking
+        masked_ids, labels, t, weights = model.continuous_time_masking(input_ids)
+        loss, logits = model.forward_with_time_weighting(
+            masked_ids, attention_mask, labels, weights
+        )
+        
+        # Sampling
+        output = model.inference(length=50, num_steps=1000, sampler='ddpm_cache')
     """
     
     def __init__(
         self,
-        architecture: str = 'bert-base-uncased',
-        pretrained: Optional[str] = None,
-        vocab_size: Optional[int] = None,
-        mask_token_id: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        config_overrides: Optional[Dict] = None,
-        noise_schedule: str = 'cosine',
-        time_conditioning: bool = False,
+        vocab_size: int,
+        d_model: int = 768,
+        n_layers: int = 12,
+        n_heads: int = 12,
+        d_ff: Optional[int] = None,
+        max_seq_len: int = 512,
+        dropout: float = 0.1,
+        mask_token_id: int = 103,
+        pad_token_id: int = 0,
+        rope_base: float = 10000.0,
         bert_masking_enabled: bool = False,
-        mask_prob: float = 0.8,
-        random_prob: float = 0.1,
-        keep_prob: float = 0.1
+        tie_weights: bool = True,
+        noise_schedule: str = 'cosine',
+        time_conditioning: bool = False
     ):
         """
-        Initialize MDLM by extending MLM.
+        Initialize MDLM.
         
         Args:
-            architecture: Model architecture identifier (e.g., 'bert-base-uncased')
-            pretrained: Model name/path to load pretrained weights from (None = from scratch)
-            vocab_size: Vocabulary size (required for from-scratch training)
-            mask_token_id: ID of [MASK] token (auto-detected if None)
-            pad_token_id: ID of [PAD] token (auto-detected if None)
-            config_overrides: Dict of config parameters to override
+            (See MLM for base parameters)
             noise_schedule: Noise schedule type ('cosine' or 'linear')
-            time_conditioning: Whether to condition model on timestep (default: False for MDLM)
-            bert_masking_enabled: Enable BERT-style masking (80% [MASK], 10% random, 10% keep)
-            mask_prob: Probability of replacing with [MASK] token (default: 0.8)
-            random_prob: Probability of replacing with random token (default: 0.1)
-            keep_prob: Probability of keeping original token (default: 0.1)
+            time_conditioning: Whether to condition model on timestep
+                             (Default: False, as MDLM paper doesn't use this)
         """
         super().__init__(
-            architecture=architecture,
-            pretrained=pretrained,
             vocab_size=vocab_size,
+            d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            max_seq_len=max_seq_len,
+            dropout=dropout,
             mask_token_id=mask_token_id,
             pad_token_id=pad_token_id,
-            config_overrides=config_overrides,
+            rope_base=rope_base,
             bert_masking_enabled=bert_masking_enabled,
-            mask_prob=mask_prob,
-            random_prob=random_prob,
-            keep_prob=keep_prob
+            tie_weights=tie_weights
         )
         
         self.noise_schedule = noise_schedule
         self.time_conditioning = time_conditioning
         
+        # Log MDLM-specific info
+        print(f"✓ MDLM extensions enabled:")
+        print(f"  - Noise schedule: {noise_schedule}")
+        print(f"  - Time conditioning: {time_conditioning}")
         if time_conditioning:
-            print("  ⚠️  Warning: MDLM paper uses time_conditioning=False")
-    
-    @classmethod
-    def from_config(cls, config: Dict):
-        """
-        Create MDLM model from config dictionary.
-        
-        Config format:
-            model:
-              architecture: "bert-base-uncased"  # Required
-              pretrained: "bert-base-uncased"    # Optional: None for from-scratch
-              vocab_size: 50000                   # Optional
-              mask_token_id: 103                  # Optional
-              pad_token_id: 0                     # Optional
-              noise_schedule: "cosine"            # Optional: 'cosine' or 'linear'
-              time_conditioning: false            # Optional: default False for MDLM
-              config_overrides:                   # Optional
-                num_hidden_layers: 6
-                hidden_size: 512
-            training:
-              bert_masking:                       # Optional: BERT-style masking
-                enabled: false
-                mask_prob: 0.8
-                random_prob: 0.1
-                keep_prob: 0.1
-        
-        Args:
-            config: Configuration dictionary
-            
-        Returns:
-            MDLM instance
-        """
-        model_cfg = config['model']
-        training_cfg = config.get('training', {})
-        bert_cfg = training_cfg.get('bert_masking', {})
-        
-        return cls(
-            architecture=model_cfg['architecture'],
-            pretrained=model_cfg.get('pretrained'),
-            vocab_size=model_cfg.get('vocab_size'),
-            mask_token_id=model_cfg.get('mask_token_id'),
-            pad_token_id=model_cfg.get('pad_token_id'),
-            config_overrides=model_cfg.get('config_overrides'),
-            noise_schedule=model_cfg.get('noise_schedule', 'cosine'),
-            time_conditioning=model_cfg.get('time_conditioning', False),
-            bert_masking_enabled=bert_cfg.get('enabled', False),
-            mask_prob=bert_cfg.get('mask_prob', 0.8),
-            random_prob=bert_cfg.get('random_prob', 0.1),
-            keep_prob=bert_cfg.get('keep_prob', 0.1)
-        )
+            print(f"  ⚠️  Warning: MDLM paper uses time_conditioning=False")
     
     def _cosine_schedule(self, t: torch.Tensor) -> torch.Tensor:
         """
         Cosine noise schedule: α(t) = cos²(πt/2)
         
+        This is the recommended schedule in the MDLM paper.
+        Provides smooth transition from clean to noisy data.
+        
         Args:
-            t: Time steps in [0, 1], shape [..., ]
-            
+            t: Time steps in [0, 1], shape [...]
+        
         Returns:
             α(t): Non-masking probability, same shape as t
         """
@@ -149,9 +129,11 @@ class MDLM(MLM):
         """
         Linear noise schedule: α(t) = 1 - t
         
+        Simpler than cosine but can be less stable at boundaries.
+        
         Args:
-            t: Time steps in [0, 1], shape [..., ]
-            
+            t: Time steps in [0, 1], shape [...]
+        
         Returns:
             α(t): Non-masking probability, same shape as t
         """
@@ -161,9 +143,12 @@ class MDLM(MLM):
         """
         Get α(t) based on noise schedule.
         
+        α(t) represents the probability that a token is NOT masked at time t.
+        α(0) = 1 (fully visible), α(1) = 0 (fully masked)
+        
         Args:
             t: Time steps in [0, 1]
-            
+        
         Returns:
             α(t): Non-masking probability at time t
         """
@@ -180,21 +165,28 @@ class MDLM(MLM):
         
         Args:
             t: Time steps in [0, 1]
-            
+        
         Returns:
             p_mask(t): Masking probability at time t
         """
         return 1.0 - self.get_alpha(t)
     
     def continuous_time_masking(
-        self, 
+        self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         low_discrepancy_sampling: bool = True
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         MDLM continuous-time masking for training.
         
+        Algorithm:
+        1. Sample time t ~ Uniform[ε, 1] per sample
+        2. Calculate mask probability p(t) = 1 - α(t)
+        3. Mask each token with probability p(t)
+        4. Compute loss weight w(t) = |α'(t)| / (1 - α(t))
+        
+        Key insight from paper:
         "We train with a continuous-time formulation where the number of masked
         tokens is sampled from a noise schedule α(t), presenting the model with
         varying levels of corruption from t=0 (fully visible) to t=1 (fully masked)."
@@ -202,34 +194,38 @@ class MDLM(MLM):
         Args:
             input_ids: [B, L] original token indices
             attention_mask: [B, L] attention mask (1=valid, 0=padding)
-            low_discrepancy_sampling: Use low-discrepancy sampler for variance reduction
+            low_discrepancy_sampling: Use stratified sampling for variance reduction
         
         Returns:
             masked_input_ids: [B, L] input with masks applied
             labels: [B, L] labels for loss (-100 for non-masked tokens)
             t: [B] sampled time steps
             loss_weight: [B] weight for loss (time derivative α'(t))
+        
+        Example:
+            masked, labels, t, weights = model.continuous_time_masking(input_ids)
+            # t might be [0.23, 0.67, 0.91, ...] for different samples
+            # weights account for importance of different time steps
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # 1. Sample time steps t ~ Uniform[eps, 1]
-        # FIX: Avoid t=0 strictly to prevent loss weight singularity
+        # 1. Sample time steps t ~ Uniform[ε, 1]
+        # Avoid t=0 to prevent singularity in loss weight
         eps = 1e-5
+        
         if low_discrepancy_sampling:
-            # Low-discrepancy sampler: partition interval [eps, 1] evenly
-            # Reduces variance during training (Appendix G in paper)
+            # Low-discrepancy (stratified) sampler
+            # Partition [ε, 1] into B equal intervals and sample from each
+            # This reduces variance in gradient estimation
             t = torch.linspace(eps, 1.0, batch_size + 1, device=device)[:-1]
             noise = torch.rand(batch_size, device=device) * (1 - eps) / batch_size
-            t = t + noise
-            t = t.clamp(eps, 1.0)  # Double safety
+            t = (t + noise).clamp(eps, 1.0)
         else:
-            t = torch.rand(batch_size, device=device) * (1 - eps) + eps
-            t = t.clamp(eps, 1.0)  # Ensure t ∈ [eps, 1]
+            # Standard uniform sampling
+            t = (torch.rand(batch_size, device=device) * (1 - eps) + eps).clamp(eps, 1.0)
         
         # 2. Calculate masking probability from noise schedule
-        # α(t): probability of NOT masking
-        # p_mask(t) = 1 - α(t): probability of masking
         alpha_t = self.get_alpha(t)  # [B]
         mask_prob = 1.0 - alpha_t  # [B]
         
@@ -242,40 +238,42 @@ class MDLM(MLM):
         maskable = maskable & (input_ids != self.pad_token_id)
         
         # 4. Sample masking decisions for each token
-        # Use vectorized sampling: compare uniform[0,1] with mask_prob
+        # Each token is masked with probability mask_prob[batch_idx]
         rand = torch.rand(batch_size, seq_len, device=device)  # [B, L]
         mask_prob_expanded = mask_prob.unsqueeze(1)  # [B, 1]
         
         mask_decision = (rand < mask_prob_expanded) & maskable  # [B, L]
         
-        # 5. Apply masking (BERT-style if enabled, otherwise simple SUBS parameterization)
-        masked_input_ids = self._apply_bert_masking(input_ids, mask_decision)
+        # 5. Apply masking strategy (inherited from MLM)
+        masked_input_ids = self._apply_masking_strategy(input_ids, mask_decision)
         
         # 6. Create labels (-100 for non-masked tokens)
         labels = input_ids.clone()
         labels = labels.masked_fill(~mask_decision, -100)
         
-        # 7. Calculate loss weight: α'(t) / (1 - α(t))
-        # From Eq. 3 in paper: weighted by time derivative of noise schedule
+        # 7. Calculate loss weight: |α'(t)| / (1 - α(t))
+        # This comes from the Rao-Blackwellized NELBO (Eq. 3 in paper)
         loss_weight = self._compute_loss_weight(t)  # [B]
         
         return masked_input_ids, labels, t, loss_weight
     
     def _compute_loss_weight(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Compute loss weight: α'(t) / (1 - α(t)) using analytic gradients.
-        Prevents singularity at t=0 by clamping the weight.
+        Compute loss weight: |α'(t)| / (1 - α(t))
         
-        This comes from the Rao-Blackwellized NELBO objective (Eq. 3 in paper):
+        This weight comes from the continuous-time NELBO:
         L = E_t ∫ [α'(t) / (1 - α(t))] * CrossEntropy(x_θ(z_t), x) dt
+        
+        The weight ensures that all time steps contribute equally to training,
+        despite having different amounts of corruption.
         
         Args:
             t: [B] time steps in [0, 1]
-            
+        
         Returns:
             weight: [B] loss weight for each sample
         """
-        # 1. Analytic derivatives for stability (avoids numerical errors)
+        # Compute analytic derivative for stability
         if self.noise_schedule == 'cosine':
             # α(t) = cos²(πt/2)
             # α'(t) = -π * cos(πt/2) * sin(πt/2) = -(π/2) * sin(πt)
@@ -285,54 +283,18 @@ class MDLM(MLM):
             # α'(t) = -1
             alpha_prime = torch.full_like(t, -1.0)
         else:
-            # Fallback to numerical differentiation for unknown schedules
-            return self._compute_loss_weight_numerical(t)
-        
-        # 2. Compute 1 - α(t)
-        alpha_t = self.get_alpha(t)
-        one_minus_alpha = 1.0 - alpha_t
-        
-        # 3. Compute Weight: |α'(t)| / (1 - α(t))
-        # Add epsilon to denominator for numerical stability
-        weight = torch.abs(alpha_prime) / (one_minus_alpha + 1e-8)
-        
-        # 4. CRITICAL FIX: Clamp large weights at t≈0
-        # The theoretical weight → ∞ as t → 0, but gradients shouldn't explode.
-        # Standard MDLM implementations clamp this to prevent loss spikes.
-        weight = torch.clamp(weight, max=100.0)
-        
-        return weight
-    
-    def _compute_loss_weight_numerical(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Fallback numerical differentiation for unknown noise schedules.
-        
-        Args:
-            t: [B] time steps in [0, 1]
-            
-        Returns:
-            weight: [B] loss weight for each sample
-        """
-        # Compute α'(t) numerically with small epsilon
-        eps = 1e-5
-        t_plus = torch.clamp(t + eps, 0, 1)
-        t_minus = torch.clamp(t - eps, 0, 1)
-        
-        alpha_plus = self.get_alpha(t_plus)
-        alpha_minus = self.get_alpha(t_minus)
-        alpha_prime = (alpha_plus - alpha_minus) / (2 * eps)
+            raise ValueError(f"Unknown schedule: {self.noise_schedule}")
         
         # Compute 1 - α(t)
         alpha_t = self.get_alpha(t)
         one_minus_alpha = 1.0 - alpha_t
         
-        # Prevent division by zero
-        one_minus_alpha = torch.clamp(one_minus_alpha, min=1e-8)
-        
         # Weight = |α'(t)| / (1 - α(t))
-        weight = torch.abs(alpha_prime) / one_minus_alpha
+        # Add epsilon for numerical stability
+        weight = torch.abs(alpha_prime) / (one_minus_alpha + 1e-8)
         
-        # Clamp to prevent explosion
+        # Clamp to prevent explosion near t=0
+        # Theory: weight → ∞ as t → 0, but we clamp for stable training
         weight = torch.clamp(weight, max=100.0)
         
         return weight
@@ -343,258 +305,82 @@ class MDLM(MLM):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         loss_weight: Optional[torch.Tensor] = None
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        [Standard Implementation Fix]
-        Computes weighted loss properly by applying weights PER SAMPLE before reduction.
-        Prevents the scalar-product bug where E[W*L] != E[W] * E[L].
-        """
-        # 1. Forward pass to get logits (don't use internal loss)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
+        Forward pass with time-weighted loss for MDLM training.
         
-        loss = None
+        Important: Weights must be applied PER SAMPLE before reduction.
+        Standard PyTorch reduction doesn't support sample-wise weights correctly.
+        
+        Args:
+            input_ids: [B, L] token indices
+            attention_mask: [B, L] attention mask (1=valid, 0=padding)
+            labels: [B, L] target token indices (-100 for non-masked)
+            loss_weight: [B] loss weight per sample (from continuous_time_masking)
+        
+        Returns:
+            loss: weighted scalar loss
+            logits: [B, L, vocab_size] prediction logits
+        """
+        # Get logits from base MLM
         if labels is not None:
-            # 2. Compute per-token loss (reduction='none')
-            # shape: [B*L] -> [B, L]
-            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-            vocab_size = logits.size(-1)
+            # We'll compute loss manually with weights
+            logits = self.forward(input_ids, attention_mask)
             
-            raw_loss = loss_fct(logits.view(-1, vocab_size), labels.view(-1))
-            raw_loss = raw_loss.view(labels.size(0), -1) # [B, L]
+            # Compute per-sample loss
+            # CrossEntropy with reduction='none' gives [B, L]
+            loss_per_token = F.cross_entropy(
+                logits.view(-1, self.vocab_size),
+                labels.view(-1),
+                ignore_index=-100,
+                reduction='none'
+            ).view(labels.shape)  # [B, L]
             
-            # 3. Apply mask (ignore -100 labels)
-            # CE loss returns 0 for -100, but being explicit is safer
-            valid_mask = (labels != -100).float()
-            masked_loss = raw_loss * valid_mask
+            # Average over sequence (only non-ignored tokens)
+            mask = (labels != -100)
+            loss_per_sample = (loss_per_token * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)  # [B]
             
-            # 4. Apply Time Weighting per sample
+            # Apply time weights
             if loss_weight is not None:
-                # loss_weight: [B] -> [B, 1] for broadcasting
-                weighted_loss = masked_loss * loss_weight.unsqueeze(-1)
-            else:
-                weighted_loss = masked_loss
-                
-            # 5. Correct Reduction (Sum / Total Valid Tokens)
-            # This computes the weighted mean over the batch
-            num_valid_tokens = valid_mask.sum()
+                loss_per_sample = loss_per_sample * loss_weight  # [B]
             
-            if num_valid_tokens > 0:
-                loss = weighted_loss.sum() / num_valid_tokens
-            else:
-                loss = torch.tensor(0.0, device=input_ids.device)
-                
-        return loss, logits
+            # Final reduction over batch
+            loss = loss_per_sample.mean()
+            
+            return loss, logits
+        else:
+            return self.forward(input_ids, attention_mask)
     
     def inference(
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        num_steps: int = 1000,
-        sampler: str = 'ddpm',
         length: Optional[int] = None,
-        return_intermediate: bool = False,
-        temperature: float = 1.0
-    ):
+        num_steps: int = 1000,
+        return_steps: bool = False
+    ) -> Tuple[torch.Tensor, ...]:
         """
-        MDLM inference with iterative denoising.
+        DDPM-style sampling for MDLM.
         
-        "Decoding starts with a completely masked sequence, and iteratively
-        unmasks tokens based on model predictions over T steps."
-        
-        IMPORTANT: MDLM uses RANDOM unmasking (not confidence-based).
-        This is what makes it a simple baseline compared to:
-        - CMLM: confidence-based unmasking (smart)
-        - RDT: chain-based unmasking (smarter)
+        Algorithm:
+        1. Start with fully masked sequence (t=1)
+        2. For each timestep from T to 1:
+           a. Predict all tokens
+           b. Probabilistically accept predictions based on α(t)
+        3. Return final sequence
         
         Args:
             input_ids: [B, L] initial tokens (if None, starts fully masked)
             attention_mask: [B, L] attention mask
-            num_steps: Number of denoising steps (T)
-            sampler: Sampling strategy ('ddpm', 'ddpm_cache', 'analytic')
-                    'ddpm' - Standard random unmasking (recommended for MDLM)
-                    'ddpm_cache' - Cached random unmasking (faster but still random)
-                    'analytic' - Placeholder
             length: Sequence length (required if input_ids is None)
-            return_intermediate: Return intermediate predictions
-            temperature: Sampling temperature
+            num_steps: Number of denoising steps (more = better quality)
+            return_steps: If True, return intermediate predictions
         
         Returns:
-            final_tokens: [B, L] final predictions
-            intermediates: Optional list of intermediate states
+            final_tokens: [B, L] generated tokens
+            steps_info: intermediate states if return_steps=True
         """
         self.eval()
-        device = next(self.parameters()).device
-        
-        # Select sampler
-        if sampler == 'ddpm_cache':
-            return self._sample_ddpm_cache(
-                input_ids, attention_mask, num_steps, length, 
-                return_intermediate, temperature
-            )
-        elif sampler == 'ddpm':
-            return self._sample_ddpm(
-                input_ids, attention_mask, num_steps, length,
-                return_intermediate, temperature
-            )
-        elif sampler == 'analytic':
-            return self._sample_analytic(
-                input_ids, attention_mask, num_steps, length,
-                return_intermediate, temperature
-            )
-        else:
-            raise ValueError(f"Unknown sampler: {sampler}. Choose 'ddpm_cache', 'ddpm', or 'analytic'")
-    
-    def _sample_ddpm_cache(
-        self,
-        input_ids: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        num_steps: int,
-        length: Optional[int],
-        return_intermediate: bool,
-        temperature: float
-    ):
-        """
-        MDLM sampling with caching optimization.
-        
-        Key characteristic: RANDOM remasking (NOT confidence-based).
-        This distinguishes MDLM from CMLM (Mask-Predict) which uses confidence.
-        
-        MDLM is a simple baseline that randomly unmasks tokens,
-        while CMLM intelligently unmasks based on model confidence.
-        
-        Optimization: Reuse predictions from previous iteration,
-        but remask tokens RANDOMLY (not based on confidence).
-        
-        Args:
-            (same as inference)
-            
-        Returns:
-            final_tokens: [B, L] denoised sequence
-            intermediates: Optional[List[Tensor]]
-        """
-        device = next(self.parameters()).device
-        
-        with torch.no_grad():
-            # 1. Initialize
-            if input_ids is None:
-                if length is None:
-                    raise ValueError("Must provide either input_ids or length")
-                batch_size = 1
-                current_ids = torch.full(
-                    (batch_size, length), 
-                    self.mask_token_id, 
-                    dtype=torch.long, 
-                    device=device
-                )
-                if attention_mask is None:
-                    attention_mask = torch.ones_like(current_ids)
-            else:
-                current_ids = input_ids.clone()
-                batch_size, length = input_ids.shape
-                if attention_mask is None:
-                    attention_mask = (input_ids != self.pad_token_id).long()
-            
-            # Track intermediate states
-            intermediates = [] if return_intermediate else None
-            
-            # Initialize confidence scores (0 for masked positions)
-            current_confidences = torch.zeros(batch_size, length, device=device)
-            
-            # 2. Iterative denoising: t = 1 → 0
-            for step in range(num_steps):
-                if return_intermediate:
-                    intermediates.append(current_ids.clone())
-                
-                # Current time: t = 1 - step/T
-                t = 1.0 - step / num_steps
-                
-                # Skip if fully denoised
-                if t <= 0:
-                    break
-                
-                # --- Step A: Predict all tokens ---
-                logits = self.forward(current_ids, attention_mask)  # [B, L, V]
-                
-                # Apply temperature
-                if temperature != 1.0:
-                    logits = logits / temperature
-                
-                probs = F.softmax(logits, dim=-1)  # [B, L, V]
-                
-                # Get predictions and confidences
-                predicted_ids = logits.argmax(dim=-1)  # [B, L]
-                predicted_confidences = probs.max(dim=-1).values  # [B, L]
-                
-                # --- Step B: Selective remasking (except first iteration) ---
-                if step < num_steps - 1:
-                    # Calculate number of tokens to keep masked at next step
-                    next_t = 1.0 - (step + 1) / num_steps
-                    mask_prob_next = self.get_mask_prob(torch.tensor(next_t, device=device))
-                    
-                    num_total = attention_mask.sum(dim=1, keepdim=True).float()  # [B, 1]
-                    num_to_mask = (num_total * mask_prob_next).long()  # [B, 1]
-                    
-                    # MDLM: Random selection (NOT confidence-based like CMLM)
-                    # This is the key difference that makes MDLM a simple baseline
-                    # for comparing against smart methods like CMLM and RDT
-                    random_scores = torch.rand(batch_size, length, device=device)
-                    
-                    # Prevent remasking padding
-                    random_scores = random_scores.masked_fill(
-                        attention_mask == 0, -1e9
-                    )
-                    
-                    # Vectorized random selection (highest random scores = randomly selected)
-                    sorted_indices = torch.argsort(random_scores, dim=1, descending=True)
-                    ranks = torch.argsort(sorted_indices, dim=1)  # [B, L]
-                    
-                    # Remask tokens randomly (not based on confidence)
-                    remask_decision = ranks < num_to_mask  # [B, L]
-                    
-                    # Update current state
-                    current_ids = torch.where(
-                        remask_decision,
-                        torch.full_like(current_ids, self.mask_token_id),
-                        predicted_ids
-                    )
-                    current_confidences = torch.where(
-                        remask_decision,
-                        torch.zeros_like(predicted_confidences),
-                        predicted_confidences
-                    )
-                else:
-                    # Final step: unmask everything
-                    current_ids = predicted_ids
-            
-            final_tokens = current_ids
-        
-        if return_intermediate:
-            return final_tokens, intermediates
-        else:
-            return final_tokens, num_steps
-    
-    def _sample_ddpm(
-        self,
-        input_ids: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        num_steps: int,
-        length: Optional[int],
-        return_intermediate: bool,
-        temperature: float
-    ):
-        """
-        Standard DDPM ancestral sampling (D3PM style).
-        
-        Uses transition probabilities q(x_{t-1} | x_t, x_0).
-        
-        Args:
-            (same as inference)
-            
-        Returns:
-            final_tokens: [B, L] denoised sequence
-            intermediates: Optional[List[Tensor]]
-        """
         device = next(self.parameters()).device
         
         with torch.no_grad():
@@ -617,93 +403,78 @@ class MDLM(MLM):
                 if attention_mask is None:
                     attention_mask = (input_ids != self.pad_token_id).long()
             
-            intermediates = [] if return_intermediate else None
+            intermediate_steps = [] if return_steps else None
             
-            # Iterative denoising
-            for step in range(num_steps):
-                if return_intermediate:
-                    intermediates.append(current_ids.clone())
+            # Iterative denoising from t=1 to t=0
+            for step in range(num_steps, 0, -1):
+                if return_steps:
+                    intermediate_steps.append(current_ids.clone())
                 
-                # Current and next time
-                t = torch.tensor(1.0 - step / num_steps, device=device)
-                t_next = torch.tensor(1.0 - (step + 1) / num_steps, device=device)
+                # Current time
+                t = step / num_steps
+                t_tensor = torch.full((batch_size,), t, device=device)
                 
-                if t <= 0:
-                    break
+                # Predict
+                logits = self.forward(current_ids, attention_mask)
+                predicted_ids = logits.argmax(dim=-1)
                 
-                # Predict x_0
-                logits = self.forward(current_ids, attention_mask)  # [B, L, V]
+                # Probabilistic acceptance based on α(t)
+                alpha_t = self.get_alpha(t_tensor)
+                accept_prob = 1.0 - alpha_t  # Unmask probability
                 
-                if temperature != 1.0:
-                    logits = logits / temperature
+                rand = torch.rand(batch_size, length, device=device)
+                should_unmask = rand < accept_prob.unsqueeze(1)
                 
-                probs_x0 = F.softmax(logits, dim=-1)  # [B, L, V]
-                
-                # Calculate transition probabilities
-                alpha_t = self.get_alpha(t)
-                alpha_t_next = self.get_alpha(t_next)
-                
-                # q(x_{t-1} | x_t, x_0) for SUBS parameterization
-                # If x_t is [MASK]: sample from p(x_0)
-                # If x_t is not [MASK]: keep it (copy flag)
+                # Update: unmask some positions
                 is_masked = (current_ids == self.mask_token_id)
-                
-                if step < num_steps - 1:
-                    # Not final step: stochastic sampling
-                    # Probability of staying masked: (α_t - α_{t-1}) / α_t
-                    stay_masked_prob = (alpha_t - alpha_t_next) / (alpha_t + 1e-8)
-                    
-                    # Sample from x_0 predictions
-                    sampled_x0 = torch.multinomial(
-                        probs_x0.view(-1, self.vocab_size),
-                        num_samples=1
-                    ).view(batch_size, length)
-                    
-                    # Decide which positions stay masked
-                    stay_masked = torch.rand(batch_size, length, device=device) < stay_masked_prob
-                    stay_masked = stay_masked & is_masked & (attention_mask == 1)
-                    
-                    # Update: unmask or keep masked
-                    current_ids = torch.where(
-                        stay_masked,
-                        torch.full_like(current_ids, self.mask_token_id),
-                        torch.where(is_masked, sampled_x0, current_ids)
-                    )
-                else:
-                    # Final step: deterministic unmasking
-                    predicted_ids = probs_x0.argmax(dim=-1)
-                    current_ids = torch.where(is_masked, predicted_ids, current_ids)
+                should_update = is_masked & should_unmask
+                current_ids = torch.where(should_update, predicted_ids, current_ids)
             
             final_tokens = current_ids
         
-        if return_intermediate:
-            return final_tokens, intermediates
+        if return_steps:
+            return final_tokens, intermediate_steps
         else:
             return final_tokens, num_steps
     
-    def _sample_analytic(
-        self,
-        input_ids: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        num_steps: int,
-        length: Optional[int],
-        return_intermediate: bool,
-        temperature: float
-    ):
+    @classmethod
+    def from_config(cls, config: Dict):
         """
-        Analytic sampler (SEDD style) - uses score-based formulation.
+        Create MDLM model from configuration dictionary.
+        
+        Config format (extends MLM config):
+            model:
+              vocab_size: 30522
+              d_model: 768
+              n_layers: 12
+              n_heads: 12
+              noise_schedule: "cosine"        # 'cosine' or 'linear'
+              time_conditioning: false        # Usually false for MDLM
+              ... (other MLM parameters)
         
         Args:
-            (same as inference)
-            
+            config: Configuration dictionary
+        
         Returns:
-            final_tokens: [B, L] denoised sequence
-            intermediates: Optional[List[Tensor]]
+            MDLM instance
         """
-        # Placeholder for analytic sampler
-        # Full implementation requires score computation
-        print("⚠️  Analytic sampler not yet implemented, falling back to ddpm_cache")
-        return self._sample_ddpm_cache(
-            input_ids, attention_mask, num_steps, length,
-            return_intermediate, temperature
+        model_cfg = config['model']
+        training_cfg = config.get('training', {})
+        bert_cfg = training_cfg.get('bert_masking', {})
+        
+        return cls(
+            vocab_size=model_cfg['vocab_size'],
+            d_model=model_cfg.get('d_model', 768),
+            n_layers=model_cfg.get('n_layers', 12),
+            n_heads=model_cfg.get('n_heads', 12),
+            d_ff=model_cfg.get('d_ff'),
+            max_seq_len=model_cfg.get('max_seq_len', 512),
+            dropout=model_cfg.get('dropout', 0.1),
+            mask_token_id=model_cfg.get('mask_token_id', 103),
+            pad_token_id=model_cfg.get('pad_token_id', 0),
+            rope_base=model_cfg.get('rope_base', 10000.0),
+            bert_masking_enabled=bert_cfg.get('enabled', False),
+            tie_weights=model_cfg.get('tie_weights', True),
+            noise_schedule=model_cfg.get('noise_schedule', 'cosine'),
+            time_conditioning=model_cfg.get('time_conditioning', False)
         )
