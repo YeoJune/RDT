@@ -11,7 +11,7 @@ References:
 import torch
 import torch.nn.functional as F
 import math
-from .mlm_rope import MLM
+from .mlm import MLM
 from typing import Dict, Optional, Tuple
 
 
