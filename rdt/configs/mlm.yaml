@@ -38,7 +38,7 @@ training:
   # Learning rate and scheduling
   learning_rate: 0.0002 # 2e-4
   weight_decay: 0.01
-  warmup_ratio: 0.03
+  warmup_ratio: 0.1
   scheduler: "cosine"
   max_grad_norm: 1.0
 

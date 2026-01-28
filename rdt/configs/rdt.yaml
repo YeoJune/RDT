@@ -70,7 +70,7 @@ training:
   max_training_steps: 100000 # Used when training_mode is 'step'
   learning_rate: 0.0002 # 2e-4
   weight_decay: 0.01
-  warmup_ratio: 0.03 # 5% of total steps
+  warmup_ratio: 0.1 # 10% of total steps
 
   # Scheduler
   scheduler: "cosine" # 'cosine' or 'linear'
