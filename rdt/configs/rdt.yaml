@@ -63,14 +63,14 @@ training:
   aux_temp: 0.5
 
   # Optimization
-  batch_size: 64
+  batch_size: 128
   gradient_accumulation_steps: 1 # Effective batch size = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # 'epoch' or 'step'
-  num_epochs: 10 # Used when training_mode is 'epoch'
+  num_epochs: 50 # Used when training_mode is 'epoch'
   max_training_steps: 100000 # Used when training_mode is 'step'
-  learning_rate: 0.0001 # 1e-4
+  learning_rate: 0.0002 # 2e-4
   weight_decay: 0.01
-  warmup_ratio: 0.05 # 5% of total steps
+  warmup_ratio: 0.03 # 5% of total steps
 
   # Scheduler
   scheduler: "cosine" # 'cosine' or 'linear'

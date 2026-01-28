@@ -13,7 +13,7 @@ model:
   d_ff: 2048 # Feed-forward dimension (default: 4 * d_model)
 
   # Sequence and regularization
-  max_seq_len: 512 # Maximum sequence length
+  max_seq_len: 128 # Maximum sequence length
   dropout: 0.1 # Dropout probability
 
   # Special tokens
@@ -29,16 +29,16 @@ model:
 # Training Strategy
 training:
   # Batch and optimization
-  batch_size: 64
+  batch_size: 128
   gradient_accumulation_steps: 1 # Effective batch = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # "epoch" or "steps"
-  num_epochs: 10
+  num_epochs: 50
   max_training_steps: 100000
 
   # Learning rate and scheduling
-  learning_rate: 0.0001 # 1e-4
+  learning_rate: 0.0002 # 2e-4
   weight_decay: 0.01
-  warmup_ratio: 0.05
+  warmup_ratio: 0.03
   scheduler: "cosine"
   max_grad_norm: 1.0
 
@@ -56,7 +56,6 @@ training:
 data:
   dataset_name: "wikitext-2"
   streaming: false
-  max_seq_length: 128
   mlm_probability: 0.15 # Standard BERT masking ratio
 
   tokenizer_name: "bert-base-uncased"
