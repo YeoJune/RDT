@@ -328,7 +328,7 @@ class MLM(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     @classmethod
-    def from_config(cls, config: Dict):
+    def from_config(cls, config: Dict, vocab_size: int):
         """
         Create MLM model from configuration dictionary.
         
@@ -358,9 +358,9 @@ class MLM(nn.Module):
         model_cfg = config['model']
         training_cfg = config.get('training', {})
         bert_cfg = training_cfg.get('bert_masking', {})
-        
+
         return cls(
-            vocab_size=model_cfg['vocab_size'],
+            vocab_size=vocab_size,
             d_model=model_cfg.get('d_model', 768),
             n_layers=model_cfg.get('n_layers', 12),
             n_heads=model_cfg.get('n_heads', 12),

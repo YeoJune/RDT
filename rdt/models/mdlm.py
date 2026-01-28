@@ -438,7 +438,7 @@ class MDLM(MLM):
             return final_tokens, num_steps
     
     @classmethod
-    def from_config(cls, config: Dict):
+    def from_config(cls, config: Dict, vocab_size: int):
         """
         Create MDLM model from configuration dictionary.
         
@@ -463,7 +463,7 @@ class MDLM(MLM):
         bert_cfg = training_cfg.get('bert_masking', {})
         
         return cls(
-            vocab_size=model_cfg['vocab_size'],
+            vocab_size=vocab_size,
             d_model=model_cfg.get('d_model', 768),
             n_layers=model_cfg.get('n_layers', 12),
             n_heads=model_cfg.get('n_heads', 12),

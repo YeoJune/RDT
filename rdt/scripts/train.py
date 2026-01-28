@@ -72,6 +72,11 @@ def main():
     # Determine model type
     model_type = config.get('model_type', 'rdt').lower()
     print(f"\nModel type: {model_type.upper()}")
+
+    # Get vocab size
+    tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
+    vocab_size = tokenizer.vocab_size
+    print(f"Vocabulary size: {vocab_size}")
     
     # Create model and dataloaders based on type
     if model_type == 'rdt':
@@ -84,10 +89,6 @@ def main():
         print("\nPreparing RDT data...")
         train_loader, val_loader = create_dataloaders(config)
         
-        # Get vocab size
-        tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
-        vocab_size = tokenizer.vocab_size
-        print(f"Vocabulary size: {vocab_size}")
         
         # Create model
         print("\nInitializing RDT model...")
@@ -112,12 +113,12 @@ def main():
         print(f"\nInitializing {model_type.upper()} model...")
         
         if model_type == 'mlm':
-            model = MLM.from_config(config)
+            model = MLM.from_config(config, vocab_size=vocab_size)
         elif model_type == 'cmlm':
-            model = CMLM.from_config(config)
+            model = CMLM.from_config(config, vocab_size=vocab_size)
         elif model_type == 'mdlm':
             from rdt.models.mdlm import MDLM
-            model = MDLM.from_config(config)
+            model = MDLM.from_config(config, vocab_size=vocab_size)
         
         print(f"\nModel parameters: {model.count_parameters()/1e6:.1f}M")
         
