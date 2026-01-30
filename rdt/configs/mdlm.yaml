@@ -33,16 +33,16 @@ model:
 # Training Strategy
 training:
   # Batch and optimization
-  batch_size: 128
+  batch_size: 64
   gradient_accumulation_steps: 1 # Effective batch = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # "epoch" or "steps"
-  num_epochs: 50
+  num_epochs: 30
   max_training_steps: 100000
 
   # Learning rate and scheduling
   learning_rate: 0.0002 # 2e-4
   weight_decay: 0.01
-  warmup_ratio: 0.1
+  warmup_ratio: 0.05
   scheduler: "cosine"
   max_grad_norm: 1.0
 
@@ -72,7 +72,7 @@ mdlm:
 
 # Data
 data:
-  dataset_name: "wikitext-2"
+  dataset_name: "wikitext-103"
   streaming: false
   max_seq_length: 128
 
