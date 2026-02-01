@@ -1119,7 +1119,6 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
     
     tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
     vocab_size = tokenizer.vocab_size
-    config.vocab_size = vocab_size
     
     if model_type == 'rdt':
         # Load RDT model
@@ -1212,7 +1211,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
         
     elif model_type == 'mlm':
         # Load MLM model (BERT-based baseline) using wrapper class
-        model = MLM.from_config(config)
+        model = MLM.from_config(config, vocab_size=vocab_size)
         tokenizer = AutoTokenizer.from_pretrained(config['model'].get('architecture', config['model'].get('name', 'bert-base-uncased')))
         
         checkpoint_path = Path(checkpoint_path)
@@ -1254,7 +1253,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
     
     elif model_type == 'cmlm':
         # Load CMLM model
-        model = CMLM.from_config(config)
+        model = CMLM.from_config(config, vocab_size=vocab_size)
         tokenizer = AutoTokenizer.from_pretrained(config['model'].get('architecture', 'bert-base-uncased'))
         
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -1286,7 +1285,7 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
     
     elif model_type == 'mdlm':
         # Load MDLM model
-        model = MDLM.from_config(config)
+        model = MDLM.from_config(config, vocab_size=vocab_size)
         tokenizer = AutoTokenizer.from_pretrained(config['model'].get('architecture', 'bert-base-uncased'))
         
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
