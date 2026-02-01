@@ -1117,11 +1117,13 @@ def run_single_model_test(config_path, checkpoint_path, device, num_samples,
     # Define masking ratios
     mask_ratios = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     
+    tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
+    vocab_size = tokenizer.vocab_size
+    config.vocab_size = vocab_size
+    
     if model_type == 'rdt':
         # Load RDT model
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        tokenizer = AutoTokenizer.from_pretrained(config['data']['tokenizer_name'])
-        vocab_size = tokenizer.vocab_size
         
         model = RDT(
             vocab_size=vocab_size,
