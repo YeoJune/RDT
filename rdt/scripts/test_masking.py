@@ -608,8 +608,7 @@ def test_mdlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_l
                 pred_tokens_batch, actual_steps = model.inference(
                     batch_input_ids_tensor,
                     attention_mask=batch_attention_masks_tensor,
-                    num_steps=num_steps,
-                    sampler=sampler
+                    num_steps=num_steps
                 )
                 pred_tokens_batch = pred_tokens_batch.cpu()
             
