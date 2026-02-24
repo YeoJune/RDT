@@ -87,7 +87,7 @@ class AdaptiveLayerNorm(nn.Module):
 
 
 class DirectionalRecursiveBlock(nn.Module):
-    """Self-Attention + Optional Cross-Attention Block with AdaLN and RoPE"""
+    """Self-Attention Block with AdaLN and RoPE"""
     def __init__(
         self, 
         d_model: int, 
@@ -103,11 +103,6 @@ class DirectionalRecursiveBlock(nn.Module):
         self.norm1 = AdaptiveLayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         
-        # Cross-Attention with RoPE and AdaLN
-        self.cross_attn = RoPECrossAttention(d_model, n_heads, rope_layer, dropout)
-        self.norm2 = AdaptiveLayerNorm(d_model)
-        self.dropout2 = nn.Dropout(dropout)
-        
         # Feed-Forward with AdaLN
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -115,17 +110,15 @@ class DirectionalRecursiveBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_ff, d_model)
         )
-        self.norm3 = AdaptiveLayerNorm(d_model)
-        self.dropout3 = nn.Dropout(dropout)
+        self.norm2 = AdaptiveLayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, noise_emb, context=None, src_key_padding_mask=None, context_key_padding_mask=None):
+    def forward(self, x, noise_emb, src_key_padding_mask=None):
         """
         Args:
             x: [B, L, D] - input hidden states
             noise_emb: [B, 1, D] - noise level embedding for AdaLN
-            context: [B, L_ctx, D] - optional context for cross-attention
             src_key_padding_mask: [B, L] - self-attention mask (True = ignore)
-            context_key_padding_mask: [B, L_ctx] - cross-attention mask (True = ignore)
         
         Returns:
             [B, L, D] - output hidden states
@@ -138,25 +131,11 @@ class DirectionalRecursiveBlock(nn.Module):
         attn_out = self.self_attn(x_norm, key_padding_mask=src_key_padding_mask)
         x = res + self.dropout1(attn_out)
         
-        # Cross-Attention with AdaLN (if context provided)
-        if context is not None:
-            res = x
-            x_norm = self.norm2(x, noise_emb)
-            
-            # RoPE is applied inside cross_attn to Q and K only
-            attn_out = self.cross_attn(
-                query=x_norm,
-                key=context,
-                value=context,
-                key_padding_mask=context_key_padding_mask
-            )
-            x = res + self.dropout2(attn_out)
-        
         # Feed-Forward with AdaLN
         res = x
-        x_norm = self.norm3(x, noise_emb)
+        x_norm = self.norm2(x, noise_emb)
         ffn_out = self.ffn(x_norm)
-        x = res + self.dropout3(ffn_out)
+        x = res + self.dropout2(ffn_out)
         
         return x
 
@@ -427,9 +406,7 @@ class RDT(nn.Module):
             if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
                     def custom_forward(h, n_emb, sm):
-                        return module(h, noise_emb=n_emb, context=None,
-                                    src_key_padding_mask=sm,
-                                    context_key_padding_mask=None)
+                        return module(h, noise_emb=n_emb, src_key_padding_mask=sm)
                     return custom_forward
                 
                 h_next = torch.utils.checkpoint.checkpoint(
@@ -441,9 +418,7 @@ class RDT(nn.Module):
                 h_next = layer(
                     h_next,
                     noise_emb=noise_vec,
-                    context=None,
-                    src_key_padding_mask=src_key_padding_mask,
-                    context_key_padding_mask=None
+                    src_key_padding_mask=src_key_padding_mask
                 )
         
         return h_next

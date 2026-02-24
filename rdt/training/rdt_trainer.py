@@ -12,7 +12,7 @@ from typing import Dict, Tuple, Optional
 import math
 
 from ..models.rdt import RDT
-from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters, count_parameters_without_context, CSVLogger
+from ..utils import save_checkpoint, cleanup_checkpoints, count_parameters, CSVLogger
 
 
 class RDTTrainer:
@@ -150,9 +150,7 @@ class RDTTrainer:
             # unwrap해서 파라미터 계산
             unwrapped_model = self.accelerator.unwrap_model(self.model)
             num_params = count_parameters(unwrapped_model)
-            num_params_no_context = count_parameters_without_context(unwrapped_model)
             print(f"Model parameters: {num_params:,}")
-            print(f"Model parameters (without context): {num_params_no_context:,}")
             
             # ========================================================================
             # [VERIFICATION] Weight Tying Status Check

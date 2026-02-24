@@ -285,18 +285,6 @@ def count_parameters(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def count_parameters_without_context(model: torch.nn.Module) -> int:
-    """Count trainable parameters excluding context-related components in DirectionalRecursiveBlock"""
-    total = 0
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            # Exclude cross_attn, norm2, and dropout2 from encoder_layers (only used when context is provided)
-            if 'encoder_layers' in name and ('cross_attn' in name or 'norm2' in name or 'dropout2' in name):
-                continue
-            total += param.numel()
-    return total
-
-
 # Note: get_device() removed - Accelerate handles device management
 # Use accelerator.device instead
 
