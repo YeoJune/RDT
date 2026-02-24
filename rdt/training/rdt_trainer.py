@@ -134,6 +134,13 @@ class RDTTrainer:
             self.save_every_n_epochs = None
         self.keep_last_n_checkpoints = config['training']['keep_last_n_checkpoints']
         
+        # Early stopping
+        early_stopping_config = config['training'].get('early_stopping', {})
+        self.early_stopping_enabled = early_stopping_config.get('enabled', False)
+        self.early_stopping_patience = early_stopping_config.get('patience', 5)
+        self.early_stopping_min_delta = early_stopping_config.get('min_delta', 0.0001)
+        self.early_stopping_counter = 0
+        
         # State
         self.global_step = 0
         self.current_epoch = 0
@@ -839,8 +846,9 @@ class RDTTrainer:
                             'epoch': epoch
                         }, step=self.global_step)
                     
-                    if val_loss < best_val_loss:
+                    if val_loss < best_val_loss - self.early_stopping_min_delta:
                         best_val_loss = val_loss
+                        self.early_stopping_counter = 0
                         # torch.save 사용 (torch.compile + accelerator.save_state 문제 해결)
                         self.accelerator.wait_for_everyone()
                         if self.accelerator.is_main_process:
@@ -862,6 +870,18 @@ class RDTTrainer:
                                 filename="best_model.pt"
                             )
                             print(f"Best checkpoint saved at epoch {epoch+1}, step {self.global_step}")
+                    else:
+                        self.early_stopping_counter += 1
+                        if self.accelerator.is_main_process:
+                            print(f"Early stopping counter: {self.early_stopping_counter}/{self.early_stopping_patience}")
+                
+                # Check early stopping
+                if self.early_stopping_enabled and self.early_stopping_counter >= self.early_stopping_patience:
+                    if self.accelerator.is_main_process:
+                        print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                        print(f"Best validation loss: {best_val_loss:.4f}")
+                        self.csv_logger.close()
+                    return
             
             # Checkpoint
             if (epoch + 1) % self.save_every_n_epochs == 0:
@@ -1025,8 +1045,9 @@ class RDTTrainer:
                                 'step': step
                             }, step=step)
                         
-                        if val_loss < best_val_loss:
+                        if val_loss < best_val_loss - self.early_stopping_min_delta:
                             best_val_loss = val_loss
+                            self.early_stopping_counter = 0
                             # torch.save 사용 (torch.compile + accelerator.save_state 문제 해결)
                             self.accelerator.wait_for_everyone()
                             if self.accelerator.is_main_process:
@@ -1048,6 +1069,18 @@ class RDTTrainer:
                                     filename="best_model.pt"
                                 )
                                 print(f"Best checkpoint saved at step {step}")
+                        else:
+                            self.early_stopping_counter += 1
+                            if self.accelerator.is_main_process:
+                                print(f"Early stopping counter: {self.early_stopping_counter}/{self.early_stopping_patience}")
+                    
+                    # Check early stopping
+                    if self.early_stopping_enabled and self.early_stopping_counter >= self.early_stopping_patience:
+                        if self.accelerator.is_main_process:
+                            print(f"\nEarly stopping triggered at step {step}")
+                            print(f"Best validation loss: {best_val_loss:.4f}")
+                            self.csv_logger.close()
+                        return
                 
                 # Checkpoint
                 if step % self.save_every_n_steps == 0:

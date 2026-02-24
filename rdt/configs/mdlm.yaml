@@ -7,13 +7,13 @@ model_type: "mdlm"
 # Model Architecture
 model:
   # Architecture dimensions (defaults to BERT-base, override for custom size)
-  d_model: 512 # Hidden dimension (BERT-base: 768)
-  n_layers: 6 # Number of transformer layers (BERT-base: 12)
-  n_heads: 8 # Number of attention heads (BERT-base: 12)
-  d_ff: 2048 # Feed-forward dimension (default: 4 * d_model)
+  d_model: 768 # Hidden dimension (BERT-base: 768)
+  n_layers: 12 # Number of transformer layers (BERT-base: 12)
+  n_heads: 12 # Number of attention heads (BERT-base: 12)
+  d_ff: 3072 # Feed-forward dimension (default: 4 * d_model)
 
   # Sequence and regularization
-  max_seq_len: 128 # Maximum sequence length
+  max_seq_len: 512 # Maximum sequence length
   dropout: 0.1 # Dropout probability
 
   # Special tokens
@@ -33,7 +33,7 @@ model:
 # Training Strategy
 training:
   # Batch and optimization
-  batch_size: 64
+  batch_size: 32
   gradient_accumulation_steps: 1 # Effective batch = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # "epoch" or "steps"
   num_epochs: 30
@@ -50,6 +50,12 @@ training:
   save_every_n_epochs: 1
   save_every_n_steps: 1000
   keep_last_n_checkpoints: 3
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 5 # Number of evaluations without improvement before stopping
+    min_delta: 0.0001 # Minimum change to qualify as improvement
 
   # BERT-style masking (80% [MASK], 10% random, 10% keep)
   # Set enabled: false to use 100% [MASK] as in MDLM paper
@@ -72,9 +78,9 @@ mdlm:
 
 # Data
 data:
-  dataset_name: "wikitext-103"
+  dataset_name: "wikitext-2"
   streaming: false
-  max_seq_length: 128
+  max_seq_length: 512
 
   # MDLM uses continuous-time masking during training
   # No fixed masking ratio - dynamically sampled per batch based on noise schedule

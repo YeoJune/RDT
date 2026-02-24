@@ -8,8 +8,7 @@ from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
 import os
 
-from rdt.models import RDT, MLM
-from rdt.models.cmlm import CMLM
+from rdt.models import RDT, MLM, CMLM, MDLM
 from rdt.data import create_dataloaders, create_mlm_dataloaders, create_cmlm_dataloaders, create_mdlm_dataloaders
 from rdt.training import RDTTrainer, MLMTrainer
 from rdt.utils import load_config, merge_configs, set_seed, create_model_from_config
@@ -117,7 +116,6 @@ def main():
         elif model_type == 'cmlm':
             model = CMLM.from_config(config, vocab_size=vocab_size)
         elif model_type == 'mdlm':
-            from rdt.models.mdlm import MDLM
             model = MDLM.from_config(config, vocab_size=vocab_size)
         
         print(f"\nModel parameters: {model.count_parameters()/1e6:.1f}M")

@@ -101,6 +101,13 @@ class MLMTrainer:
             self.save_every_n_epochs = None
         self.keep_last_n_checkpoints = config['training']['keep_last_n_checkpoints']
         
+        # Early stopping
+        early_stopping_config = config['training'].get('early_stopping', {})
+        self.early_stopping_enabled = early_stopping_config.get('enabled', False)
+        self.early_stopping_patience = early_stopping_config.get('patience', 5)
+        self.early_stopping_min_delta = early_stopping_config.get('min_delta', 0.0001)
+        self.early_stopping_counter = 0
+        
         # State
         self.global_step = 0
         self.current_epoch = 0
@@ -697,8 +704,9 @@ class MLMTrainer:
                 # All processes must reach wait_for_everyone
                 self.accelerator.wait_for_everyone()
                 if self.accelerator.is_main_process:
-                    if val_metrics['val_loss'] < self.best_val_loss:
+                    if val_metrics['val_loss'] < self.best_val_loss - self.early_stopping_min_delta:
                         self.best_val_loss = val_metrics['val_loss']
+                        self.early_stopping_counter = 0
                         # Direct save without internal wait (already waited above)
                         unwrapped_model = self.accelerator.unwrap_model(self.model)
                         checkpoint_path = self.checkpoint_dir / 'best_model.pt'
@@ -712,6 +720,16 @@ class MLMTrainer:
                             'best_val_loss': self.best_val_loss
                         }, checkpoint_path)
                         print(f"Best model saved: {checkpoint_path}")
+                    else:
+                        self.early_stopping_counter += 1
+                        print(f"Early stopping counter: {self.early_stopping_counter}/{self.early_stopping_patience}")
+                
+                # Check early stopping
+                if self.early_stopping_enabled and self.early_stopping_counter >= self.early_stopping_patience:
+                    if self.accelerator.is_main_process:
+                        print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                        print(f"Best validation loss: {self.best_val_loss:.4f}")
+                    return
             
             # Save checkpoint
             if (epoch + 1) % self.save_every_n_epochs == 0:
@@ -793,8 +811,9 @@ class MLMTrainer:
                     # All processes must reach wait_for_everyone
                     self.accelerator.wait_for_everyone()
                     if self.accelerator.is_main_process:
-                        if val_metrics['val_loss'] < self.best_val_loss:
+                        if val_metrics['val_loss'] < self.best_val_loss - self.early_stopping_min_delta:
                             self.best_val_loss = val_metrics['val_loss']
+                            self.early_stopping_counter = 0
                             # Direct save without internal wait (already waited above)
                             unwrapped_model = self.accelerator.unwrap_model(self.model)
                             checkpoint_path = self.checkpoint_dir / 'best_model.pt'
@@ -808,6 +827,18 @@ class MLMTrainer:
                                 'best_val_loss': self.best_val_loss
                             }, checkpoint_path)
                             print(f"Best model saved: {checkpoint_path}")
+                        else:
+                            self.early_stopping_counter += 1
+                            print(f"Early stopping counter: {self.early_stopping_counter}/{self.early_stopping_patience}")
+                    
+                    # Check early stopping
+                    if self.early_stopping_enabled and self.early_stopping_counter >= self.early_stopping_patience:
+                        if self.accelerator.is_main_process:
+                            print(f"\nEarly stopping triggered at step {self.global_step}")
+                            print(f"Best validation loss: {self.best_val_loss:.4f}")
+                        if self.use_tqdm:
+                            pbar.close()
+                        return
                 
                 # Save checkpoint
                 if self.global_step % self.save_every_n_steps == 0:
