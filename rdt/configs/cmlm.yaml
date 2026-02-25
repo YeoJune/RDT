@@ -13,7 +13,7 @@ model:
   d_ff: 3072 # Feed-forward dimension (default: 4 * d_model)
 
   # Sequence and regularization
-  max_seq_len: 512 # Maximum sequence length
+  max_seq_len: 256 # Maximum sequence length
   dropout: 0.1 # Dropout probability
 
   # Special tokens
@@ -29,7 +29,7 @@ model:
 # Training Strategy
 training:
   # Batch and optimization
-  batch_size: 32
+  batch_size: 64
   gradient_accumulation_steps: 1 # Effective batch = batch_size * gradient_accumulation_steps
   training_mode: "epoch" # "epoch" or "steps"
   num_epochs: 30
@@ -70,9 +70,9 @@ cmlm:
 
 # Data
 data:
-  dataset_name: "wikitext-2"
+  dataset_name: "wikitext-103"
   streaming: false
-  max_seq_length: 512
+  max_seq_length: 256
 
   # CMLM uses uniform masking during training
   # No fixed masking ratio - dynamically sampled per batch
