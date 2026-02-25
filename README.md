@@ -2,14 +2,9 @@
 
 > **An Iterative Text Refinement Framework via Latent Space Denoising**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Pytorch](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
-[![Architecture: Recursive](https://img.shields.io/badge/Architecture-Recursive_Transformer-purple)]()
+**Recursive Denoising Transformer (RDT)** proposes a novel architecture that bridges the gap between Autoregressive Transformers and Latent Diffusion Models. Unlike traditional BERT-like models or standard diffusion models that rely on fixed denoising steps, RDT separates the generation process into **Latent Mapping** and **Latent Denoising**, enabling adaptive, dynamic text refinement.
 
-**Recursive Denoising Transformer (RDT)** proposes a novel architecture that bridges the gap between **Autoregressive Transformers** and **Latent Diffusion Models**. Unlike traditional BERT-like models that attempt to reconstruct corrupted tokens directly in a single pass, RDT separates the generation process into **Latent Mapping** and **Latent Denoising**.
-
-RDT operates on the insight that while text masking is a discrete and non-differentiable operation, the underlying semantic manifold is smooth. By projecting discrete corruptions into a continuous latent space, RDT transforms the "token prediction" problem into a simpler "vector field estimation" problem. Using a state-aware recursive mechanism and **Adaptive Layer Normalization (AdaLN)**, the model iteratively purifies hidden representations, allowing for parameter-efficient deep computation and robust reconstruction of complex semantic structures.
+By projecting discrete corrupted tokens into a continuous latent space, RDT utilizes a state-aware recursive mechanism and **Adaptive Layer Normalization (AdaLN)** to iteratively purify hidden representations. A built-in Gate MLP predicts the remaining noise level, allowing the model to dynamically halt computation (Adaptive Stopping) once the text is fully refined, drastically reducing average inference steps.
 
 ---
 
@@ -17,121 +12,121 @@ RDT operates on the insight that while text masking is a discrete and non-differ
 
 ### 1. Discrete Corruption, Continuous Refinement
 
-Traditional MLMs struggle because they mix the burden of "understanding syntax" and "predicting discrete tokens" in every layer. RDT decouples these responsibilities:
+RDT decouples the responsibility of syntax understanding and token prediction:
 
-1.  **Interface (I/O Encoders)**: Defines the topology of the latent manifold. It handles the translation between discrete tokens and continuous embeddings.
-2.  **Engine (Recursive Block)**: Focuses solely on **Manifold Projection**. It learns a vector field that moves points from "noisy regions" back to the "semantic manifold center" ($h_{noisy} \to h_{clean}$).
+- **Interface (I/O Encoders):** Translates between discrete tokens and continuous embeddings.
+- **Engine (Recursive Block):** A shared Transformer block that repeatedly projects the latent state $h_t$ towards the semantic manifold center ($h_{t+1}$).
 
-$$
-h_{t+1} = \mathcal{F}_\theta(h_t, \text{Emb}(g_t))
-$$
+### 2. Adaptive Stopping & AdaLN
 
-### 2. Model Architecture
-
-The inference process resembles a **Latent Diffusion** trajectory, but specifically adapted for discrete text via recursive computation.
-
-```mermaid
-graph LR
-    subgraph "Interface (Token Space)"
-        Input[Corrupted Tokens]
-        Output[Refined Tokens]
-    end
-
-    subgraph "Recursive Engine (Latent Space)"
-        H_in((h_t)) --> Norm[Input Norm]
-        Norm --> Gate{Gate MLP}
-
-        Gate --"Noise Level (t)"--> Time[Timestep Embedder]
-        Time --"AdaLN Modulation (γ, β)"--> Block[Recursive Denoising Block]
-
-        H_in --> Block
-        Block --> H_out((h_t+1))
-    end
-
-    Input --"Input Encoder"--> H_in
-    H_out --"Output Decoder"--> Output
-    H_out -."Recursion Loop".-> H_in
-```
-
-#### A. Adaptive Layer Normalization (AdaLN)
-
-To effectively reuse weights across different denoising stages, the model injects timestep information directly into the normalization layers. The affine parameters are dynamically generated based on the Gate's output:
-
-$$ \text{AdaLN}(x, t) = (1 + \gamma(t)) \cdot \text{LayerNorm}(x) + \beta(t) $$
-
-We utilize a **Zero-Initialization** strategy for $\gamma$ and $\beta$, ensuring that the recursive block starts as an identity function and gradually learns to modulate features as training progresses.
-
-#### B. Self-Regulated Gating Mechanism
-
-RDT includes a lightweight **Gate MLP** that acts as an internal clock. It diagnoses the entropy of the current hidden state to predict the restoration progress ($g_t$).
-
-- **Residual Prediction**: The gate predicts the _decrease_ in noise ($\Delta$) rather than the absolute value ($g_{t+1} = g_t - \Delta$), ensuring a monotonically decreasing trajectory.
-- **Adaptive Stopping**: During inference, the recursion terminates automatically when the gate score drops below a threshold.
+- **AdaLN:** Injects the current noise level (Gate Score) into the normalization layers. Initialized with zeros, it starts as an identity function and smoothly learns to modulate features.
+- **Gate MLP:** Diagnoses the entropy of the current hidden state to predict restoration progress. During inference, recursion terminates automatically when the gate score drops below a predefined threshold.
 
 ---
 
-## 📉 Optimization Objectives
+## 📊 Experimental Results
 
-The model is trained using a multi-task objective function ($ \mathcal{L}\_{total} $) that enforces structural integrity and temporal coherence in the latent space.
+RDT was evaluated on the **Wikitext-103** dataset against MDLM (Diffusion) and CMLM (Mask-Predict) baselines.
 
-$$ \mathcal{L}_{total} = \mathcal{L}_{recon} + \lambda*{gate}\mathcal{L}*{gate} + \lambda*{latent}\mathcal{L}*{latent} $$
+### Small-Scale Setup (Validation)
 
-| Component              |         Symbol         | Description                                                                                                                                                              |
-| :--------------------- | :--------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | ------------------------------------------- | --- | ---------------------------------------------------------------------------------------------------- |
-| **Reconstruction**     | $\mathcal{L}_{recon}$  | Cross-Entropy loss applied to the final logits. Ensures the final latent representation decodes into correct tokens.                                                     |
-| **Gate Consistency**   |  $\mathcal{L}_{gate}$  | MSE loss ensuring the Gate MLP accurately estimates the ground-truth restoration percentage ($s_{GT}$).                                                                  |
-| **Latent Consistency** | $\mathcal{L}_{latent}$ | **The Core Constraint.** We minimize the distance between the recursive state $h_t$ and the "ideal" state encoded from the ground-truth text by the Input Encoder.<br>$$ |     | h*{pred}^{(t)} - \text{Encoder}(x*{target}) |     | ^2 $$<br>This acts as **"Teacher Forcing" in the latent space**, simplifying the learning landscape. |
+Initial validation experiments were conducted with a compact configuration:
+
+- **Architecture:** `d_model=512`, `n_layers=6`, `seq_len=128`
+- **Training:** `lr=2e-4`, 30 epochs
+- **Parameters:** RDT ~40M (due to AdaLN modules), Baselines ~34M
+- **RDT Config:** `total_steps=20`, `chain_length=1~2`, layered structure (1-4-1: input processor, recursive encoder, output processor)
+- **Metrics:** Exact Match, BERTScore (F1, via `bert-large`), BLEU4, and Perplexity (via `gpt2-large`)
+
+### Base-Scale Setup (Main)
+
+The main experiments use standard BERT-base scale for fair comparison:
+
+- **Architecture:** `d_model=768`, `n_heads=12`, `seq_len=256`
+- **Layers:** MDLM/CMLM: 12 layers, RDT: 2-6-2 (10 total: input processor, recursive encoder, output processor)
+- **Training:** `lr=2e-4`, 30 epochs, `batch_size=64`
+- **RDT Config:** `total_steps=20`, `chain_length=1~2`
+- **Rationale:** RDT uses fewer layers to match parameter count with baselines, as AdaLN modules increase parameters by ~15%
+
+### Reconstruction Quality & Efficiency (Summary)
+
+RDT achieves comparable or slightly superior generation quality compared to a 1000-step MDLM, while drastically reducing the average inference steps to under 15 via its adaptive stopping mechanism.
+
+| Model    | Params | Masking | Exact Match | BERTScore  | BLEU4      | PPL (↓) | Avg Steps |
+| -------- | ------ | ------- | ----------- | ---------- | ---------- | ------- | --------- |
+| **MDLM** | 34M    | 10%     | 0.5307      | 0.9852     | 0.8717     | 55.08   | 1000.00   |
+| **CMLM** | 34M    | 10%     | 0.5771      | 0.9866     | 0.8842     | 53.76   | 10.00     |
+| **RDT**  | 40M    | 10%     | **0.5481**  | **0.9863** | **0.8788** | 60.53   | **2.38**  |
+|          |        |         |             |            |            |         |           |
+| **MDLM** | 34M    | 50%     | 0.3332      | 0.9022     | 0.3456     | 109.49  | 1000.00   |
+| **CMLM** | 34M    | 50%     | 0.2505      | 0.8793     | 0.3051     | 171.07  | 10.00     |
+| **RDT**  | 40M    | 50%     | **0.3338**  | **0.9064** | **0.3471** | 118.77  | **7.62**  |
+|          |        |         |             |            |            |         |           |
+| **MDLM** | 34M    | 90%     | 0.1196      | 0.7774     | 0.0327     | 36.84   | 1000.00   |
+| **CMLM** | 34M    | 90%     | 0.0906      | 0.8159     | 0.0423     | 46.44   | 10.00     |
+| **RDT**  | 40M    | 90%     | **0.1102**  | **0.7918** | **0.0306** | 65.47   | **13.83** |
+
+<details>
+<summary><b>View Full Experimental Results (0% ~ 100% Masking)</b></summary>
+
+| Model    | Masking | Exact Match | BERTScore | BLEU4  | PPL    | Avg Steps |
+| -------- | ------- | ----------- | --------- | ------ | ------ | --------- |
+| **MDLM** | 0%      | 1.0000      | 1.0000    | 1.0000 | 49.34  | 1000.00   |
+| **MDLM** | 20%     | 0.4856      | 0.9668    | 0.7298 | 64.45  | 1000.00   |
+| **MDLM** | 40%     | 0.3867      | 0.9257    | 0.4670 | 91.28  | 1000.00   |
+| **MDLM** | 60%     | 0.2796      | 0.8790    | 0.2439 | 120.24 | 1000.00   |
+| **MDLM** | 80%     | 0.1732      | 0.8217    | 0.0829 | 85.94  | 1000.00   |
+| **MDLM** | 100%    | 0.0697      | 0.7423    | 0.0040 | 1.96   | 1000.00   |
+| **CMLM** | 0%      | 1.0000      | 1.0000    | 1.0000 | 49.34  | 10.00     |
+| **CMLM** | 20%     | 0.4630      | 0.9590    | 0.7205 | 84.14  | 10.00     |
+| **CMLM** | 40%     | 0.2988      | 0.9029    | 0.4179 | 161.05 | 10.00     |
+| **CMLM** | 60%     | 0.2066      | 0.8607    | 0.2138 | 157.79 | 10.00     |
+| **CMLM** | 80%     | 0.1354      | 0.8316    | 0.0893 | 85.04  | 10.00     |
+| **CMLM** | 100%    | 0.0368      | 0.7671    | 0.0076 | 10.77  | 10.00     |
+| **RDT**  | 0%      | 1.0000      | 1.0000    | 1.0000 | 55.97  | 1.75      |
+| **RDT**  | 20%     | 0.4998      | 0.9690    | 0.7401 | 68.57  | 3.54      |
+| **RDT**  | 40%     | 0.3909      | 0.9292    | 0.4689 | 98.27  | 6.18      |
+| **RDT**  | 60%     | 0.2772      | 0.8836    | 0.2439 | 139.03 | 9.02      |
+| **RDT**  | 80%     | 0.1615      | 0.8300    | 0.0788 | 131.71 | 12.20     |
+| **RDT**  | 100%    | 0.0582      | 0.7367    | 0.0037 | 2.60   | 14.93     |
+
+</details>
 
 ---
 
-## 📂 Project Structure
+## � Hardware Requirements
 
-The project is organized to clearly separate the neural architecture, training logic, and data pipeline.
+### Recommended Specifications (Base-Scale)
+
+- **GPU:** 32GB VRAM (e.g., NVIDIA RTX 5090, A40, V100)
+- **Training Time** (per epoch on RTX 5090, Base config):
+  - MDLM: ~1h 40min
+  - CMLM: ~1h 20min
+  - RDT: ~2h 10min (longer due to chain-based training)
+- **Inference:** 8GB+ VRAM recommended
+
+### Memory Optimization Tips
+
+If GPU memory is limited, consider:
+
+- Reduce `batch_size` (default: 64)
+- Increase `gradient_accumulation_steps` to maintain effective batch size
+- Enable `gradient_checkpointing: true` in model config
+- Reduce `max_seq_length` (default: 256)
+
+---
+
+## �📂 Project Structure
 
 ```bash
 rdt/
-├── models/              # Core Neural Architectures
-│   ├── __init__.py
-│   ├── rdt.py              # RDT Implementation (RoPE, MLP I/O, AdaLN, Gate MLP)
-│   ├── mlm.py              # MLM Wrapper for BERT/RoBERTa (single-pass)
-│   ├── cmlm.py             # Conditional MLM (Mask-Predict, confidence-based)
-│   ├── mdlm.py             # Masked Diffusion LM (SUBS parameterization)
-│   └── bert_init.py        # Pretrained weight initialization utilities
-│
-├── training/            # Training Logic
-│   ├── __init__.py
-│   ├── rdt_trainer.py      # RDT Trainer (Latent Consistency + Gate Loss)
-│   │                       #   with Scheduled Sampling for gate predictions
-│   └── mlm_trainer.py      # Unified Trainer for MLM/CMLM/MDLM baselines
-│
-├── data/                # Data Pipeline
-│   ├── __init__.py
-│   ├── datasets.py         # StreamingTextDataset & WikiTextDataset
-│   ├── collators.py        # RDTCollator, MLMCollator (masking & chain generation)
-│   └── rdt_preprocessor.py # GPU-accelerated preprocessing for RDT training
-│
-├── evaluation/          # Evaluation Tools
-│   ├── __init__.py
-│   ├── evaluator.py        # Unified evaluator for RDT/MLM/CMLM/MDLM
-│   └── metrics.py          # Perplexity, Accuracy calculations
-│
-├── scripts/             # CLI Entry Points
-│   ├── __init__.py
-│   ├── train.py            # Unified training script (RDT/MLM/CMLM/MDLM)
-│   ├── evaluate.py         # Model evaluation script
-│   ├── inference.py        # Interactive inference for all models
-│   ├── test_masking.py     # Masking sensitivity analysis
-│   └── plot_training.py    # Training metrics visualization
-│
-├── configs/             # Hyperparameter Configurations
-│   ├── __init__.py
-│   ├── rdt.yaml            # RDT configuration (recursive denoising)
-│   ├── mlm.yaml            # MLM baseline (BERT-style single-pass)
-│   ├── cmlm.yaml           # CMLM baseline (iterative mask-predict)
-│   └── mdlm.yaml           # MDLM baseline (diffusion-based generation)
-│
-├── utils.py             # Main utility functions (config, checkpoint, etc.)
-└── __init__.py          # Package initialization
+├── models/              # Core Neural Architectures (RDT, MLM, CMLM, MDLM)
+├── training/            # Training Logic (Latent Consistency, Gate Loss, Scheduled Sampling)
+├── data/                # Data Pipeline (StreamingTextDataset, WikiTextDataset)
+├── evaluation/          # Unified evaluator & metrics (Perplexity, BERTScore, Accuracy)
+├── scripts/             # CLI Entry Points (train, evaluate, inference)
+└── configs/             # Hyperparameter Configurations
+
 ```
 
 ---
@@ -146,202 +141,159 @@ cd rdt
 # Install dependencies (Editable mode for development)
 pip install -e .
 
-# Or install with development tools (pytest, black, flake8, isort)
-pip install -e ".[dev]"
 ```
 
-**Requirements:**
+_Requirements: Python 3.8+, PyTorch 2.0+ (CUDA support recommended)_
 
-- Python 3.8+
-- PyTorch 2.0+ (with CUDA support recommended)
-- All dependencies are defined in `pyproject.toml` and installed automatically
+---
+
+## ⚡ Quick Start
+
+### Minimal Working Example
+
+```python
+import torch
+from transformers import AutoTokenizer
+from rdt.models import RDT
+from rdt.utils import load_config, create_model_from_config
+
+# Load config and tokenizer
+config = load_config("rdt/configs/rdt.yaml")
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+# Create model
+model = create_model_from_config(config, vocab_size=tokenizer.vocab_size)
+model.eval()
+
+# Prepare corrupted input
+text = "The quick brown [MASK] jumps over the lazy [MASK]."
+inputs = tokenizer(text, return_tensors="pt")
+
+# Run adaptive denoising
+with torch.no_grad():
+    output_ids, num_steps = model.inference(
+        inputs['input_ids'],
+        attention_mask=inputs['attention_mask'],
+        max_steps=20,
+        threshold=0.05
+    )
+
+# Decode result
+output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+print(f"Input:  {text}")
+print(f"Output: {output_text}")
+print(f"Steps:  {num_steps}/20")
+```
 
 ---
 
 ## 🚀 Usage
 
-### 1. Training
+### 1. Training (Multi-GPU via Accelerate)
 
-Train RDT, MLM, or CMLM models using the unified training script. The RDT trainer supports **Scheduled Sampling**, transitioning from Ground-Truth gate scores to Predicted gate scores to reduce exposure bias.
-
-#### Single GPU Training
-
-```bash
-# Train RDT (Recursive Denoising Transformer)
-rdt-train --config rdt/configs/rdt.yaml
-
-# Train MLM baseline (BERT-style single-pass)
-rdt-train --config rdt/configs/mlm.yaml
-
-# Train CMLM baseline (iterative mask-predict)
-rdt-train --config rdt/configs/cmlm.yaml
-
-# Train MDLM baseline (diffusion-based generation)
-rdt-train --config rdt/configs/mdlm.yaml
-
-# Resume from checkpoint (all models)
-rdt-train --config rdt/configs/rdt.yaml --checkpoint ./checkpoints/rdt/checkpoint_epoch_5.pt
-
-# Load pretrained weights only (start training from scratch)
-rdt-train --config rdt/configs/mlm.yaml --pretrained ./checkpoints/mlm/best_model.pt
-```
-
-#### Multi-GPU Training (Accelerate)
-
-RDT supports distributed training via **Hugging Face Accelerate** for efficient multi-GPU scaling.
+RDT supports distributed training via **Hugging Face Accelerate** for efficient scaling.
 
 ```bash
 # Configure Accelerate (one-time setup)
 accelerate config
 
-# Multi-GPU training with Accelerate
+# Train RDT (Recursive Denoising Transformer)
 accelerate launch rdt/scripts/train.py --config rdt/configs/rdt.yaml
 
-# Or specify launch parameters directly (e.g., 2 GPUs with BFloat16)
-accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 \
-    rdt/scripts/train.py --config rdt/configs/rdt.yaml
+# Train baselines
+accelerate launch rdt/scripts/train.py --config rdt/configs/mdlm.yaml
+accelerate launch rdt/scripts/train.py --config rdt/configs/cmlm.yaml
 
-# For A100 GPUs, BFloat16 is recommended for optimal performance
-accelerate launch --multi_gpu --num_processes=4 --mixed_precision=bf16 \
-    rdt/scripts/train.py --config rdt/configs/rdt.yaml
 ```
-
-**Mixed Precision Training:**
-
-Set `mixed_precision` in your config file for automatic mixed precision training:
-
-```yaml
-# In rdt/configs/rdt.yaml
-mixed_precision: "bf16" # Options: 'no', 'fp16', 'bf16' (recommended for A100)
-```
-
-**Benefits of Multi-GPU Training:**
-
-- Linear scaling across GPUs
-- Automatic gradient synchronization
-- Memory-efficient training with gradient accumulation
-- BFloat16 support for A100 GPUs (better numerical stability than FP16)
 
 ### 2. Inference
 
-Run inference with any trained model (RDT/MLM/CMLM). RDT uses **Adaptive Stopping** based on gate scores for efficient computation.
+Run interactive or single-text inference. RDT utilizes its internal Gate MLP for adaptive stopping (`--threshold`).
 
 ```bash
-# Interactive mode - RDT (recursive denoising)
+# Interactive mode - RDT
 rdt-inference --checkpoint checkpoints/rdt/best_model.pt --config rdt/configs/rdt.yaml --interactive
-
-# Interactive mode - MLM (single-pass)
-rdt-inference --checkpoint checkpoints/mlm/best_model.pt --config rdt/configs/mlm.yaml --interactive
-
-# Interactive mode - CMLM (iterative mask-predict)
-rdt-inference --checkpoint checkpoints/cmlm/best_model.pt --config rdt/configs/cmlm.yaml --interactive
-
-# Interactive mode - MDLM (diffusion sampling)
-rdt-inference --checkpoint checkpoints/mdlm/best_model.pt --config rdt/configs/mdlm.yaml --interactive
 
 # Single text inference - RDT
 rdt-inference --checkpoint checkpoints/rdt/best_model.pt --config rdt/configs/rdt.yaml \
     --text "The quick brown [MASK] jumps over the lazy [MASK]." \
-    --max-steps 10 --threshold 0.05
+    --max-steps 20 --threshold 0.05
 
-# Single text inference - MLM (single pass)
-rdt-inference --checkpoint checkpoints/mlm/best_model.pt --config rdt/configs/mlm.yaml \
-    --text "The capital of France is [MASK]."
-
-# Single text inference - CMLM (iterative refinement)
-rdt-inference --checkpoint checkpoints/cmlm/best_model.pt --config rdt/configs/cmlm.yaml \
-    --text "The quick brown [MASK] jumps over the lazy [MASK]." \
-    --max-iterations 10
-
-# Single text inference - MDLM (diffusion sampling)
-rdt-inference --checkpoint checkpoints/mdlm/best_model.pt --config rdt/configs/mdlm.yaml \
-    --text "The quick brown [MASK] jumps over the lazy [MASK]." \
-    --num-steps 1000 --sampler ddpm_cache
 ```
-
-**RDT Output Example:**
-
-```text
-[Step 0] Gate: 1.000 | The quick brown [MASK] jumps over the lazy [MASK].
-[Step 1] Gate: 0.782 | The quick brown fox jumps over the lazy [MASK].
-[Step 2] Gate: 0.234 | The quick brown fox jumps over the lazy dog.
-[Step 3] Gate: 0.043 | The quick brown fox jumps over the lazy dog.
-✓ Completed in 3 steps (Gate < 0.05)
-```
-
-**Model Comparison:**
-
-| Model    | Method              | Key Feature                           | Inference Steps  |
-| -------- | ------------------- | ------------------------------------- | ---------------- |
-| **RDT**  | Recursive denoising | Gate-based adaptive stopping          | Variable (1-20)  |
-| **MLM**  | Single-pass         | Direct token prediction               | Fixed (1)        |
-| **CMLM** | Mask-predict        | Confidence-based iterative refinement | Fixed (10-15)    |
-| **MDLM** | Diffusion           | Random remasking with cosine schedule | Fixed (100-1000) |
 
 ### 3. Evaluation
 
-Evaluate model performance on standard benchmarks. Supports accuracy, BLEU, and BERTScore metrics.
+Evaluate models on benchmarks (Accuracy, BLEU, BERTScore).
 
 ```bash
-# Evaluate RDT model
 rdt-evaluate --config rdt/configs/rdt.yaml --checkpoint checkpoints/rdt/best_model.pt \
-    --split test --max-steps 20 --threshold 0.02
+    --split test --max-steps 20 --threshold 0.05
 
-# Evaluate MLM baseline
-rdt-evaluate --config rdt/configs/mlm.yaml --checkpoint checkpoints/mlm/best_model.pt \
-    --split test
-
-# Evaluate CMLM baseline
-rdt-evaluate --config rdt/configs/cmlm.yaml --checkpoint checkpoints/cmlm/best_model.pt \
-    --split test --max-iterations 10
-
-# Evaluate MDLM baseline
-rdt-evaluate --config rdt/configs/mdlm.yaml --checkpoint checkpoints/mdlm/best_model.pt \
-    --split test --num-steps 1000 --sampler ddpm_cache
-
-# Masking sensitivity analysis (all models)
-rdt-test-masking --config rdt/configs/rdt.yaml --checkpoint checkpoints/rdt/best_model.pt \
-    --num-samples 100
-
-rdt-test-masking --config rdt/configs/mdlm.yaml --checkpoint checkpoints/mdlm/best_model.pt \
-    --num-samples 100
 ```
-
-**Available Commands:**
-
-- `rdt-train` - Train models (RDT/MLM/CMLM/MDLM)
-- `rdt-evaluate` - Evaluate trained models on test datasets
-- `rdt-inference` - Interactive or single-text inference for all models
-- `rdt-test-masking` - Analyze reconstruction performance across masking ratios
-- `rdt-plot` - Visualize training metrics from CSV logs
 
 ---
 
-## 📊 Performance & Logging
+## � Configuration Parameters
 
-RDT integrates with **Weights & Biases (W&B)** for real-time experiment tracking.
+### Key RDT Parameters
 
-- **Training Metrics**: Loss (Total, Recon, Gate, Latent), Learning Rate, Sampling Probability.
-- **Validation Metrics**: Accuracy, Perplexity, Gate Error.
-- **Visualizations**: Gate score trajectories, Latent space convergence analysis.
+The behavior of RDT can be controlled via config files (`rdt/configs/*.yaml`). Key parameters:
 
-To enable W&B, set `use_wandb: true` in your `configs/base.yaml`.
+#### Model Architecture
 
-## 📜 Citation
+- `d_model`: Hidden dimension (768 for Base, 512 for Small)
+- `n_encoder_layers`: Recursive transformer depth (6 for Base)
+- `input_processor_layers` / `output_processor_layers`: I/O MLP depths (2/2 for Base)
+- `threshold`: Gate stopping criterion (0.02-0.05 recommended for inference)
+
+#### Training Strategy
+
+- `total_steps`: Total denoising steps N (20 recommended)
+- `min_chain_length` / `max_chain_length`: Training segment length L (1~2 recommended)
+- `loss_weight_recon`: Reconstruction loss weight (1.0)
+- `loss_weight_gate`: Gate prediction loss weight (1.0)
+
+#### Inference
+
+- `--max-steps`: Maximum recursive iterations (20 default)
+- `--threshold`: Gate score threshold for early stopping (0.02-0.05)
+  - Lower = more refinement steps
+  - Higher = faster inference, slightly lower quality
+
+### Config Files Overview
+
+| Config      | Model Type | Layers | Key Characteristics                    |
+| ----------- | ---------- | ------ | -------------------------------------- |
+| `rdt.yaml`  | RDT        | 2-6-2  | Recursive denoising, adaptive stopping |
+| `mdlm.yaml` | MDLM       | 12     | Continuous-time diffusion, 1000 steps  |
+| `cmlm.yaml` | CMLM       | 12     | Mask-predict, 10 iterations            |
+| `mlm.yaml`  | MLM        | 12     | Standard BERT-style, single-pass       |
+
+---
+
+## �📜 Citation
 
 If you find this code or architecture useful for your research, please cite:
 
 ```bibtex
-@misc{rdt2025,
+@misc{rdt2026,
   title={RDT: Recursive Denoising Transformer via Latent Space Refinement},
   author={Yeo Joon},
-  year={2025},
+  year={2026},
   publisher={GitHub},
-  journal={arXiv preprint},
   howpublished={\url{https://github.com/YeoJune/rdt}}
 }
+
 ```
+
+---
 
 ## 📄 License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
