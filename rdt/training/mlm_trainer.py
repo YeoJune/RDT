@@ -560,7 +560,8 @@ class MLMTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'config': self.config,
-            'best_val_loss': self.best_val_loss
+            'best_val_loss': self.best_val_loss,
+            'early_stopping_counter': self.early_stopping_counter
         }, checkpoint_path)
         
         print(f"Checkpoint saved: {checkpoint_path}")
@@ -613,8 +614,11 @@ class MLMTrainer:
             self.current_epoch = checkpoint.get('epoch', 0)
             self.global_step = checkpoint.get('step', 0)
             self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            self.early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
             if self.accelerator.is_main_process:
                 print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+                if self.early_stopping_enabled:
+                    print(f"Early stopping counter: {self.early_stopping_counter}/{self.early_stopping_patience}")
         
         if self.training_mode == 'epoch':
             self._train_by_epoch()
@@ -711,13 +715,14 @@ class MLMTrainer:
                         unwrapped_model = self.accelerator.unwrap_model(self.model)
                         checkpoint_path = self.checkpoint_dir / 'best_model.pt'
                         torch.save({
-                            'epoch': epoch,
+                            'epoch': epoch + 1,
                             'step': self.global_step,
                             'model_state_dict': unwrapped_model.state_dict(),
                             'optimizer_state_dict': self.optimizer.state_dict(),
                             'scheduler_state_dict': self.scheduler.state_dict(),
                             'config': self.config,
-                            'best_val_loss': self.best_val_loss
+                            'best_val_loss': self.best_val_loss,
+                            'early_stopping_counter': self.early_stopping_counter
                         }, checkpoint_path)
                         print(f"Best model saved: {checkpoint_path}")
                     else:
@@ -745,7 +750,8 @@ class MLMTrainer:
             )
             pbar.update(self.global_step)
         
-        epoch = 0
+        # Start from current epoch (0 if starting fresh, or loaded from checkpoint)
+        epoch = self.current_epoch
         while self.global_step < self.max_training_steps:
             for batch in self.train_loader:
                 if self.global_step >= self.max_training_steps:
@@ -824,7 +830,8 @@ class MLMTrainer:
                                 'optimizer_state_dict': self.optimizer.state_dict(),
                                 'scheduler_state_dict': self.scheduler.state_dict(),
                                 'config': self.config,
-                                'best_val_loss': self.best_val_loss
+                                'best_val_loss': self.best_val_loss,
+                                'early_stopping_counter': self.early_stopping_counter
                             }, checkpoint_path)
                             print(f"Best model saved: {checkpoint_path}")
                         else:

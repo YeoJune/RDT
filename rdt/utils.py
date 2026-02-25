@@ -124,7 +124,8 @@ def save_checkpoint(
     loss: float,
     config: Dict,
     checkpoint_dir: str,
-    filename: str = None
+    filename: str = None,
+    **extra_data
 ):
     """Save training checkpoint in .pt format
     
@@ -141,6 +142,7 @@ def save_checkpoint(
         config: Training configuration dictionary
         checkpoint_dir: Directory to save checkpoint
         filename: Checkpoint filename (default: checkpoint_epoch_{epoch}_step_{step}.pt)
+        **extra_data: Additional data to save in checkpoint (e.g., best_val_loss, early_stopping_counter)
     """
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -166,6 +168,9 @@ def save_checkpoint(
     # Add best_val_loss if it's a best model checkpoint
     if 'best' in filename:
         checkpoint_data['best_val_loss'] = loss
+    
+    # Add any extra data
+    checkpoint_data.update(extra_data)
     
     torch.save(checkpoint_data, checkpoint_path)
     

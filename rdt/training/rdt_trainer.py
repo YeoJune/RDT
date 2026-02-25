@@ -732,12 +732,15 @@ class RDTTrainer:
             self.current_epoch = checkpoint.get('epoch', 0)
             self.global_step = checkpoint.get('step', 0)
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            self.early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
             if self.accelerator.is_main_process:
                 print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+                if self.early_stopping_enabled:
+                    print(f"Early stopping counter: {self.early_stopping_counter}/{self.early_stopping_patience}")
         else:
             best_val_loss = float('inf')
         
-        for epoch in range(self.num_epochs):
+        for epoch in range(self.current_epoch, self.num_epochs):
             self.current_epoch = epoch
             sampling_prob = self.get_sampling_prob(epoch=epoch)
             
@@ -860,12 +863,14 @@ class RDTTrainer:
                                 model=unwrapped_model,
                                 optimizer=self.optimizer,
                                 scheduler=self.scheduler,
-                                epoch=epoch,
+                                epoch=epoch + 1,
                                 step=self.global_step,
                                 loss=val_loss,
                                 config=self.config,
                                 checkpoint_dir=self.checkpoint_dir,
-                                filename="best_model.pt"
+                                filename="best_model.pt",
+                                best_val_loss=best_val_loss,
+                                early_stopping_counter=self.early_stopping_counter
                             )
                             print(f"Best checkpoint saved at epoch {epoch+1}, step {self.global_step}")
                     else:
@@ -900,7 +905,9 @@ class RDTTrainer:
                         loss=0.0,  # Not applicable for regular checkpoints
                         config=self.config,
                         checkpoint_dir=self.checkpoint_dir,
-                        filename=f"checkpoint_epoch_{epoch+1}_step_{self.global_step}.pt"
+                        filename=f"checkpoint_epoch_{epoch+1}_step_{self.global_step}.pt",
+                        best_val_loss=best_val_loss,
+                        early_stopping_counter=self.early_stopping_counter
                     )
                     cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
         
@@ -928,10 +935,13 @@ class RDTTrainer:
             epoch = checkpoint.get('epoch', 0)
             step = checkpoint.get('step', 0)
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            self.early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
             self.current_epoch = epoch
             self.global_step = step
             if self.accelerator.is_main_process:
                 print(f"Resumed from epoch {epoch}, step {step}")
+                if self.early_stopping_enabled:
+                    print(f"Early stopping counter: {self.early_stopping_counter}/{self.early_stopping_patience}")
         else:
             best_val_loss = float('inf')
             step = 0
@@ -1064,7 +1074,9 @@ class RDTTrainer:
                                     loss=val_loss,
                                     config=self.config,
                                     checkpoint_dir=self.checkpoint_dir,
-                                    filename="best_model.pt"
+                                    filename="best_model.pt",
+                                    best_val_loss=best_val_loss,
+                                    early_stopping_counter=self.early_stopping_counter
                                 )
                                 print(f"Best checkpoint saved at step {step}")
                         else:
@@ -1099,7 +1111,9 @@ class RDTTrainer:
                             loss=0.0,  # Not applicable for regular checkpoints
                             config=self.config,
                             checkpoint_dir=self.checkpoint_dir,
-                            filename=f"checkpoint_epoch_{epoch}_step_{step}.pt"
+                            filename=f"checkpoint_epoch_{epoch}_step_{step}.pt",
+                            best_val_loss=best_val_loss,
+                            early_stopping_counter=self.early_stopping_counter
                         )
                         cleanup_checkpoints(self.checkpoint_dir, self.keep_last_n_checkpoints)
             
