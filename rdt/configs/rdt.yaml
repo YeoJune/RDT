@@ -7,7 +7,7 @@ model_type: "rdt" # 'rdt' or 'mlm'
 model:
   d_model: 768 # Hidden dimension (auto-set from BERT if use_bert_init=true)
   n_heads: 12 # Attention heads (d_model / 64)
-  n_encoder_layers: 8 # Main encoder depth (recursive)
+  n_encoder_layers: 6 # Main encoder depth (recursive)
   d_ff: 3072 # FFN dimension (4x d_model)
   dropout: 0.1
 
