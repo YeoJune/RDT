@@ -49,9 +49,21 @@ class MetricCalculator:
         if len(references) == 0:
             return 0.0
         
+        # Filter out empty strings to avoid BERTScore tokenization errors
+        filtered_refs = []
+        filtered_preds = []
+        for ref, pred in zip(references, predictions):
+            if ref.strip() and pred.strip():  # Only include non-empty strings
+                filtered_refs.append(ref)
+                filtered_preds.append(pred)
+        
+        # If all strings were empty, return 0.0
+        if len(filtered_refs) == 0:
+            return 0.0
+        
         P, R, F1 = bert_score(
-            predictions, 
-            references, 
+            filtered_preds, 
+            filtered_refs, 
             lang='en', 
             model_type='roberta-large',
             device=self.device,
@@ -317,11 +329,13 @@ def test_rdt_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                 original_text = batch_texts[j]
                 
-                results['bertscore'][ratio]['refs'].append(original_text)
-                results['bertscore'][ratio]['preds'].append(reconstructed_text)
-                results['perplexity'][ratio].append(reconstructed_text)
-                results['bleu4'][ratio]['refs'].append(original_text)
-                results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                # Only add non-empty strings to avoid metric calculation errors
+                if original_text.strip() and reconstructed_text.strip():
+                    results['bertscore'][ratio]['refs'].append(original_text)
+                    results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                    results['perplexity'][ratio].append(reconstructed_text)
+                    results['bleu4'][ratio]['refs'].append(original_text)
+                    results['bleu4'][ratio]['preds'].append(reconstructed_text)
                 
                 # 3. Steps taken
                 results['steps'][ratio].append(num_steps)
@@ -489,11 +503,13 @@ def test_cmlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_l
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                 original_text = batch_texts[j]
                 
-                results['bertscore'][ratio]['refs'].append(original_text)
-                results['bertscore'][ratio]['preds'].append(reconstructed_text)
-                results['perplexity'][ratio].append(reconstructed_text)
-                results['bleu4'][ratio]['refs'].append(original_text)
-                results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                # Only add non-empty strings to avoid metric calculation errors
+                if original_text.strip() and reconstructed_text.strip():
+                    results['bertscore'][ratio]['refs'].append(original_text)
+                    results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                    results['perplexity'][ratio].append(reconstructed_text)
+                    results['bleu4'][ratio]['refs'].append(original_text)
+                    results['bleu4'][ratio]['preds'].append(reconstructed_text)
                 results['steps'][ratio].append(max_iterations)
     
     # Aggregate results
@@ -635,11 +651,13 @@ def test_mdlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_l
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                 original_text = batch_texts[j]
                 
-                results['bertscore'][ratio]['refs'].append(original_text)
-                results['bertscore'][ratio]['preds'].append(reconstructed_text)
-                results['perplexity'][ratio].append(reconstructed_text)
-                results['bleu4'][ratio]['refs'].append(original_text)
-                results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                # Only add non-empty strings to avoid metric calculation errors
+                if original_text.strip() and reconstructed_text.strip():
+                    results['bertscore'][ratio]['refs'].append(original_text)
+                    results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                    results['perplexity'][ratio].append(reconstructed_text)
+                    results['bleu4'][ratio]['refs'].append(original_text)
+                    results['bleu4'][ratio]['preds'].append(reconstructed_text)
                 results['steps'][ratio].append(actual_steps)
     
     # Aggregate results
@@ -780,11 +798,13 @@ def test_mlm_model(model, tokenizer, test_texts, mask_ratios, device, max_seq_le
                 reconstructed_text = tokenizer.decode(reconstructed_tokens, skip_special_tokens=True)
                 original_text = batch_texts[j]
                 
-                results['bertscore'][ratio]['refs'].append(original_text)
-                results['bertscore'][ratio]['preds'].append(reconstructed_text)
-                results['perplexity'][ratio].append(reconstructed_text)
-                results['bleu4'][ratio]['refs'].append(original_text)
-                results['bleu4'][ratio]['preds'].append(reconstructed_text)
+                # Only add non-empty strings to avoid metric calculation errors
+                if original_text.strip() and reconstructed_text.strip():
+                    results['bertscore'][ratio]['refs'].append(original_text)
+                    results['bertscore'][ratio]['preds'].append(reconstructed_text)
+                    results['perplexity'][ratio].append(reconstructed_text)
+                    results['bleu4'][ratio]['refs'].append(original_text)
+                    results['bleu4'][ratio]['preds'].append(reconstructed_text)
                 
                 # 3. Steps (always 1 for single-pass)
                 results['steps'][ratio].append(1)
